@@ -866,6 +866,7 @@ namespace config {
     0,  // max_bitrate
     20,  // minimum_fps_target (0 = framerate)
     true,  // wgc_pacing_smoothing
+    true,  // wire_capture_timestamps
     "1920x1080x60",  // fallback_mode
     false,  // ignore_encoder_probe_failure
   };
@@ -1670,6 +1671,7 @@ namespace config {
 
     string_f(vars, "capture", video.capture);
     bool_f(vars, "wgc_pacing_smoothing", video.wgc_pacing_smoothing);
+    bool_f(vars, "wire_capture_timestamps", video.wire_capture_timestamps);
     string_f(vars, "encoder", video.encoder);
     string_f(vars, "adapter_name", video.adapter_name);
     string_f(vars, "output_name", video.output_name);

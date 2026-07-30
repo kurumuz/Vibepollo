@@ -228,6 +228,7 @@ namespace config {
     int max_bitrate;  // Maximum bitrate, sets ceiling in kbps for bitrate requested from client
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
     bool wgc_pacing_smoothing;  ///< Smooth WGC delivered frame cadence under low-latency (Reflex) source caps by snapping the pacing-group re-anchor back onto the prior grid instead of the jittery arrival phase. Disable for byte-for-byte legacy pacing.
+    bool wire_capture_timestamps;  ///< Send true capture timestamps in the RTP video timestamp instead of snapping them onto the encode grid, and mark host-generated duplicate frames in the packet header. Enables timestamp-aware pacing in clients; older clients ignore both. Disable for legacy grid-quantized timestamps.
     std::string fallback_mode;
     bool ignore_encoder_probe_failure;
   };

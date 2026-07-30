@@ -3089,10 +3089,16 @@ namespace video {
             const auto time_diff = (*frame_timestamp > *encode_frame_timestamp)
               ? (*frame_timestamp - *encode_frame_timestamp)
               : (*encode_frame_timestamp - *frame_timestamp);
-            if (time_diff < frame_variation_threshold) {
-              *frame_timestamp = *encode_frame_timestamp;
-            } else {
+            if (time_diff >= frame_variation_threshold) {
               *encode_frame_timestamp = *frame_timestamp;
+            } else if (!config::video.wire_capture_timestamps) {
+              // Legacy behavior: quantize small capture-time deviations onto the
+              // encode grid. This erases the true frame timing that a
+              // timestamp-aware client needs for pacing, so the default
+              // (wire_capture_timestamps) skips the snap and lets the capture
+              // timestamp flow to the RTP layer intact. The grid prediction
+              // still advances either way.
+              *frame_timestamp = *encode_frame_timestamp;
             }
 
             *encode_frame_timestamp += encode_frame_threshold;

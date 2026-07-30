@@ -1832,6 +1832,15 @@ namespace stream {
     }
   }
 
+  // Marks a host-generated duplicate frame (minimum-FPS keepalive re-encode of
+  // the previous image) in NV_VIDEO_PACKET::extraFlags. Duplicates carry no new
+  // source timing, so timestamp-aware clients must exclude them from clock
+  // estimation and may decode without presenting them. extraFlags is the safe
+  // channel for this: moonlight-common-c only ever bit-tests it, while unknown
+  // bits in `flags` break isFirstPacket()'s equality checks on older clients.
+  // 0x1 is NV_VIDEO_PACKET_EXTRA_FLAG_LTR_FRAME upstream.
+  constexpr uint8_t VIDEO_PACKET_EXTRA_FLAG_HOST_DUPLICATE = 0x2;
+
   void videoBroadcastThread(udp::socket &sock) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
@@ -2050,6 +2059,14 @@ namespace stream {
         size_t ratecontrol_frame_packets_sent = 0;
         size_t ratecontrol_group_packets_sent = 0;
 
+        // When a timestamp isn't available (duplicate frames), the timestamp from
+        // rate control is used instead. Determined before the per-block loop so
+        // every block of a multi-block frame sees the same answer.
+        const bool frame_is_dupe = !packet->frame_timestamp;
+        if (frame_is_dupe) {
+          packet->frame_timestamp = ratecontrol_next_frame_start;
+        }
+
         auto blockIndex = 0;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
@@ -2070,6 +2087,13 @@ namespace stream {
             }
             if (x == packets - 1) {
               inspect->packet.flags |= FLAG_EOF;
+            }
+
+            // Written before FEC encoding, like `flags`, so parity recovery
+            // reproduces it on reconstructed packets.
+            inspect->packet.extraFlags = 0;
+            if (frame_is_dupe && config::video.wire_capture_timestamps) {
+              inspect->packet.extraFlags |= VIDEO_PACKET_EXTRA_FLAG_HOST_DUPLICATE;
             }
           }
 
@@ -2094,14 +2118,10 @@ namespace stream {
 
           size_t next_shard_to_send = 0;
 
-          // RTP video timestamps use a 90 KHz clock and the paced/scheduled frame timestamp.
-          // Raw capture timing is tracked separately for frame_processing_latency.
-          // When a timestamp isn't available (duplicate frames), the timestamp from rate control is used instead.
-          bool frame_is_dupe = false;
-          if (!packet->frame_timestamp) {
-            packet->frame_timestamp = ratecontrol_next_frame_start;
-            frame_is_dupe = true;
-          }
+          // RTP video timestamps use a 90 KHz clock and the frame timestamp: the
+          // true capture time with wire_capture_timestamps (the default), or the
+          // legacy grid-snapped time when that is disabled. Raw capture timing is
+          // tracked separately for frame_processing_latency.
           using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
           uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
 
