@@ -118,7 +118,7 @@ namespace framegen {
     const auto capture_mode = normalize_capture_mode(input.capture_mode);
     const bool hard_wgc_capture = policy.uses_virtual_display && game_provided_framegen;
     const bool explicit_dxgi_capture = capture_mode == "ddx" && !hard_wgc_capture;
-    const bool explicit_wgc_capture = capture_mode == "wgc" || capture_mode == "wgcc";
+    const bool explicit_wgc_capture = capture_mode == "wgc" || capture_mode == "wgcc" || capture_mode == "wgce";
     const bool auto_wgc_capture = capture_mode.empty() && input.auto_capture_uses_wgc;
     policy.effective_wgc_capture =
       policy.uses_virtual_display && !explicit_dxgi_capture && (explicit_wgc_capture || auto_wgc_capture || hard_wgc_capture);

@@ -187,6 +187,7 @@ export function getConfigSelectOptions(
         options.push(
           { label: t('config.capture_wgc_auto'), value: 'wgc' },
           { label: t('config.capture_wgc_constant'), value: 'wgcc' },
+          { label: t('config.capture_wgc_event'), value: 'wgce' },
           { label: t('config.capture_ddx_legacy'), value: 'ddx' },
         );
       } else if (platform === 'linux') {

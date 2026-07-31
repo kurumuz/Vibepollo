@@ -1003,6 +1003,7 @@
     "display_devices_load_failed": "Failed to load display devices",
     "dd_snapshot_restore_hotkey_placeholder": "Click and press a combo",
     "capture_wgc_constant": "Windows Graphics Capture (constant)",
+    "capture_wgc_event": "Windows Graphics Capture (event-driven)",
     "amd_section_title": "AMD AMF Encoder",
     "qsv_section_title": "Intel Quick Sync Encoder",
     "vt_section_title": "VideoToolbox Encoder",

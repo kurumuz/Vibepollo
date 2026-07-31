@@ -2434,7 +2434,7 @@ async function refreshFrameGenHealth(options: FrameGenHealthOptions = {}): Promi
       let captureStatus: FrameGenHealth['capture']['status'];
       let captureMessage: string;
       const autoTreatsAsWgc = captureValue === '' && autoCaptureUsesWgc.value;
-      if (captureValue === 'wgc' || captureValue === 'wgcc' || autoTreatsAsWgc) {
+      if (captureValue === 'wgc' || captureValue === 'wgcc' || captureValue === 'wgce' || autoTreatsAsWgc) {
         captureStatus = 'pass';
         captureMessage = autoTreatsAsWgc
           ? t('apps.framegen.health_capture_wgc_auto')

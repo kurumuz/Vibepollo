@@ -386,6 +386,18 @@ namespace platf::dxgi {
     };
 
     DXGI_RATIONAL client_frame_rate_adjusted = adjust_client_frame_rate();
+
+    // Event-driven capture (capture = "wgce"): no metronome. The WGC helper
+    // publishes on the compositor's FrameArrived and signals an event; we wake
+    // on it, stamp the honest capture timestamp, and hand the frame to the
+    // encoder immediately. The client owns presentation timing (it schedules
+    // against the capture timestamps), so the only pacing left on the host is
+    // decimation when the source publishes faster than the client's rate.
+    const bool event_driven_capture = config::video.capture == "wgce";
+    std::optional<std::chrono::steady_clock::time_point> event_last_pushed;
+    std::optional<std::chrono::steady_clock::time_point> event_last_arrival;
+    std::chrono::nanoseconds event_arrival_ema {0};
+
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
     uint32_t frame_pacing_group_frames = 0;
 
@@ -462,6 +474,41 @@ namespace platf::dxgi {
       platf::capture_e status = capture_e::ok;
       std::shared_ptr<img_t> img_out;
 
+      if (event_driven_capture) {
+        status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
+
+        if (status == capture_e::ok && img_out && client_frame_rate_adjusted.Numerator > 0) {
+          const auto arrival = img_out->frame_timestamp ? *img_out->frame_timestamp : std::chrono::steady_clock::now();
+          const auto interval = std::chrono::nanoseconds(1s) * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
+
+          if (event_last_arrival && arrival > *event_last_arrival) {
+            const auto delta = std::chrono::duration_cast<std::chrono::nanoseconds>(arrival - *event_last_arrival);
+            event_arrival_ema = event_arrival_ema.count() != 0 ? (event_arrival_ema * 7 + delta) / 8 : delta;
+          }
+          event_last_arrival = arrival;
+
+          // Decimate only when the source clearly outruns the client rate. At
+          // matched rates jitter must pass through untouched -- dropping a
+          // unique frame on one short gap is real content loss the client can
+          // never recover -- while a faster source (a 240 Hz desktop into a
+          // 120 fps stream) must not overrun the encoder. The arrival-rate EMA
+          // distinguishes the regimes; the spacing floor then thins a faster
+          // source to the closest achievable uniform cadence, and the honest
+          // capture timestamps let the client present that cadence exactly.
+          const auto keep_spacing = interval - interval / 8;
+          const bool source_faster = event_arrival_ema.count() != 0 && event_arrival_ema < keep_spacing;
+          if (source_faster && event_last_pushed && arrival > *event_last_pushed &&
+              arrival - *event_last_pushed < keep_spacing) {
+            status = release_snapshot();
+            if (status != platf::capture_e::ok) {
+              return status;
+            }
+            continue;
+          }
+
+          event_last_pushed = arrival;
+        }
+      } else {
       // Try to continue frame pacing group, snapshot() is called with zero timeout after waiting for client frame interval
       if (frame_pacing_group_start) {
         if (client_frame_rate_adjusted.Numerator == 0) {
@@ -576,6 +623,7 @@ namespace platf::dxgi {
           std::this_thread::sleep_for(10ms);
         }
       }
+      }  // !event_driven_capture
 
       switch (status) {
         case platf::capture_e::reinit:

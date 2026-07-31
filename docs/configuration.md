@@ -2602,6 +2602,11 @@ editing the `conf` file in a text editor. Use the examples as reference.
             @note{NVIDIA Ultra Low Latency Mode (ULLM) can hurt performance; avoid this by either using a monitor whose refresh rate exceeds the stream and capping FPS to stop ULLM from engaging, or simply disable Low Latency Mode in the driver.}
             @tip{On NVIDIA cards, selecting this option will resolve stream freezes caused by high VRAM utilization.}</td>
     </tr>
+    <tr>
+        <td>wgce</td>
+        <td>Use Windows.Graphics.Capture to capture the display, event-driven: each frame is forwarded to the encoder the moment the compositor publishes it, with its true capture timestamp, instead of being sampled on a fixed pacing grid. Lowest capture latency; pairs best with clients that schedule presentation from capture timestamps. If the source renders faster than the streamed frame rate, frames are thinned to the closest uniform cadence.
+            @note{Windows only.}</td>
+    </tr>
 </table>
 
 ### lossless_scaling_path
