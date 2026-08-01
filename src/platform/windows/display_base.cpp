@@ -397,6 +397,10 @@ namespace platf::dxgi {
     std::optional<std::chrono::steady_clock::time_point> event_last_pushed;
     std::optional<std::chrono::steady_clock::time_point> event_last_arrival;
     std::chrono::nanoseconds event_arrival_ema {0};
+    uint64_t event_frames_received = 0;
+    uint64_t event_frames_decimated = 0;
+    uint64_t event_timeouts = 0;
+    auto event_diag_last_log = std::chrono::steady_clock::now();
 
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
     uint32_t frame_pacing_group_frames = 0;
@@ -477,6 +481,26 @@ namespace platf::dxgi {
       if (event_driven_capture) {
         status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
 
+        // Delivery accounting: the decimator drops frames permanently, and a
+        // dropped frame is indistinguishable on the client from a frame the
+        // compositor never delivered. Ten-second counters make the two
+        // separable when the received stream rate falls below the game rate.
+        if (status == capture_e::ok && img_out) {
+          ++event_frames_received;
+        } else if (status == capture_e::timeout) {
+          ++event_timeouts;
+        }
+        if (auto diag_now = std::chrono::steady_clock::now(); diag_now - event_diag_last_log >= 10s) {
+          BOOST_LOG(info) << "wgce delivery: received=" << event_frames_received
+                          << " decimated=" << event_frames_decimated
+                          << " timeouts=" << event_timeouts
+                          << " arrival_ema_us=" << std::chrono::duration_cast<std::chrono::microseconds>(event_arrival_ema).count();
+          event_frames_received = 0;
+          event_frames_decimated = 0;
+          event_timeouts = 0;
+          event_diag_last_log = diag_now;
+        }
+
         if (status == capture_e::ok && img_out && client_frame_rate_adjusted.Numerator > 0) {
           const auto arrival = img_out->frame_timestamp ? *img_out->frame_timestamp : std::chrono::steady_clock::now();
           const auto interval = std::chrono::nanoseconds(1s) * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
@@ -499,6 +523,7 @@ namespace platf::dxgi {
           const bool source_faster = event_arrival_ema.count() != 0 && event_arrival_ema < keep_spacing;
           if (source_faster && event_last_pushed && arrival > *event_last_pushed &&
               arrival - *event_last_pushed < keep_spacing) {
+            ++event_frames_decimated;
             status = release_snapshot();
             if (status != platf::capture_e::ok) {
               return status;
