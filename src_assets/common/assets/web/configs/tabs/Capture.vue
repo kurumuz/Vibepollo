@@ -476,7 +476,22 @@ const shouldShowSoftware = computed(() => showAll() || props.currentTab === 'sw'
               v-model="config.rtx_hdr_saturation"
               :desc="t('config.rtx_hdr_saturation_desc')"
             />
+            <ConfigFieldRenderer
+              setting-key="rtx_hdr_sdr_gamut_wideness"
+              v-model="config.rtx_hdr_sdr_gamut_wideness"
+              :desc="t('config.rtx_hdr_sdr_gamut_wideness_desc')"
+            />
+            <ConfigFieldRenderer
+              setting-key="rtx_hdr_sdr_gamma"
+              v-model="config.rtx_hdr_sdr_gamma"
+              :desc="t('config.rtx_hdr_sdr_gamma_desc')"
+            />
           </div>
+          <ConfigFieldRenderer
+            setting-key="rtx_hdr_fullscreen_match"
+            v-model="config.rtx_hdr_fullscreen_match"
+            :desc="t('config.rtx_hdr_fullscreen_match_desc')"
+          />
         </div>
       </section>
 

@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -160,17 +161,61 @@ namespace platf::dxgi {
       return r;
     }
 
+    // Parses "Rx,Ry,Gx,Gy,Bx,By,Wx,Wy" (CIE xy in millionths, as reported by
+    // the client's compositor from its EDID/ICC state). Only the RGB
+    // chromaticities are used; the white point stays pinned to D65 like the
+    // compositor gamut-stretch sliders this emulates, which deliberately never
+    // move grays. Returns false when the string is absent or implausible.
+    bool parse_client_primaries(const std::string &str, xy_t out[3]) {
+      if (str.empty()) {
+        return false;
+      }
+      double v[8];
+      int fields = 0;
+      size_t pos = 0;
+      while (fields < 8 && pos < str.size()) {
+        char *end = nullptr;
+        const long value = std::strtol(str.c_str() + pos, &end, 10);
+        if (end == str.c_str() + pos || value <= 0 || value >= 1000000) {
+          return false;
+        }
+        v[fields++] = value / 1000000.0;
+        pos = end - str.c_str();
+        if (pos < str.size()) {
+          if (str[pos] != ',') {
+            return false;
+          }
+          pos++;
+        }
+      }
+      if (fields != 8) {
+        return false;
+      }
+      for (int i = 0; i < 3; i++) {
+        out[i] = {v[i * 2], v[i * 2 + 1]};
+      }
+      return true;
+    }
+
     // Source-primaries -> BT.2020 for a given wideness. 0 assumes the content
-    // really is Rec.709 (colorimetric); 100 pretends the values are Display P3,
-    // which is what a wide-gamut monitor's unmanaged SDR mode does and what
-    // KDE's "sRGB color intensity" slider at 100% reproduces. Interpolation is
-    // in chromaticity space, matching that slider's behaviour.
-    mat3_t source_to_2020(int wideness) {
+    // really is Rec.709 (colorimetric); 100 pretends the values are the client
+    // panel's native primaries -- what a wide-gamut monitor's unmanaged SDR
+    // mode does and what KDE's "sRGB color intensity" slider at 100%
+    // reproduces. Display P3 stands in when the client didn't report its
+    // panel. Interpolation is in chromaticity space, matching that slider.
+    mat3_t source_to_2020(int wideness, const std::string &client_primaries) {
+      xy_t wide[3];
+      if (!parse_client_primaries(client_primaries, wide)) {
+        for (int i = 0; i < 3; i++) {
+          wide[i] = kDisplayP3[i];
+        }
+      }
+
       const double t = std::clamp(wideness, 0, 100) / 100.0;
       xy_t src[3];
       for (int i = 0; i < 3; i++) {
-        src[i].x = kRec709[i].x + (kDisplayP3[i].x - kRec709[i].x) * t;
-        src[i].y = kRec709[i].y + (kDisplayP3[i].y - kRec709[i].y) * t;
+        src[i].x = kRec709[i].x + (wide[i].x - kRec709[i].x) * t;
+        src[i].y = kRec709[i].y + (wide[i].y - kRec709[i].y) * t;
       }
       return mul(inverse(rgb_to_xyz(kRec2020, kD65)), rgb_to_xyz(src, kD65));
     }
@@ -891,17 +936,19 @@ namespace platf::dxgi {
     void ensure_sdr_to_pq_params(float sdr_white_nits) {
       const float gamma = (float) config::video.rtx_hdr.sdr_gamma;
       const int wideness = config::video.rtx_hdr.sdr_gamut_wideness;
+      const std::string &primaries = config::video.rtx_hdr.sdr_gamut_primaries;
       if (sdr_to_pq_params &&
           std::abs(sdr_to_pq_white_nits - sdr_white_nits) < 0.5f &&
           std::abs(sdr_to_pq_gamma - gamma) < 0.005f &&
-          sdr_to_pq_wideness == wideness) {
+          sdr_to_pq_wideness == wideness &&
+          sdr_to_pq_primaries == primaries) {
         return;
       }
 
       sdr_to_pq_params_t params {};
       params.sdr_white_nits = sdr_white_nits;
       params.sdr_gamma = gamma;
-      const auto m = gamut::source_to_2020(wideness);
+      const auto m = gamut::source_to_2020(wideness, primaries);
       for (int j = 0; j < 3; j++) {
         params.gamut_r0[j] = (float) m.m[0][j];
         params.gamut_r1[j] = (float) m.m[1][j];
@@ -912,6 +959,7 @@ namespace platf::dxgi {
         sdr_to_pq_white_nits = sdr_white_nits;
         sdr_to_pq_gamma = gamma;
         sdr_to_pq_wideness = wideness;
+        sdr_to_pq_primaries = primaries;
       }
     }
 
@@ -1856,6 +1904,7 @@ namespace platf::dxgi {
     float sdr_to_pq_white_nits = 100.0f;
     float sdr_to_pq_gamma {-1.0f};
     int sdr_to_pq_wideness {-1};
+    std::string sdr_to_pq_primaries;
 
     blend_t blend_disable;
     sampler_state_t sampler_linear;

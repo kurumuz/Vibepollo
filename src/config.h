@@ -142,8 +142,13 @@ namespace config {
                          ///< sRGB (spec, lifts shadows), otherwise a pure power law.
                          ///< Default 2.2, matching how displays actually decode SDR.
       int sdr_gamut_wideness;  ///< 0..100. 0 = colorimetric sRGB; 100 interprets the SDR
-                               ///< values as Display P3, reproducing the saturation of a
-                               ///< wide-gamut monitor's native (unmanaged) SDR mode.
+                               ///< values as the client panel's native primaries (Display P3
+                               ///< when unreported), reproducing the saturation of a wide-gamut
+                               ///< monitor's native (unmanaged) SDR mode.
+      std::string sdr_gamut_primaries;  ///< Client-reported panel primaries+white as 8 comma-separated
+                                        ///< CIE xy values in millionths (Rx,Ry,Gx,Gy,Bx,By,Wx,Wy).
+                                        ///< Filled per session from the client's compositor (EDID/ICC);
+                                        ///< empty = Display P3 endpoint.
     } rtx_hdr;
 
     std::string capture;

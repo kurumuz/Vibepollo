@@ -43,6 +43,7 @@ const SWITCH_KEYS = new Set<string>([
   'frame_limiter_disable_vsync',
   'rtx_hdr',
   'rtx_hdr_force_sdr',
+  'rtx_hdr_fullscreen_match',
 ]);
 
 const NUMBER_FIELD_OVERRIDES: Record<string, Partial<ConfigFieldDefinition>> = {
@@ -75,6 +76,8 @@ const NUMBER_FIELD_OVERRIDES: Record<string, Partial<ConfigFieldDefinition>> = {
   rtx_hdr_sdr_brightness: { min: 0, max: 100, step: 1, placeholder: '0' },
   rtx_hdr_middle_gray: { min: 10, max: 100, step: 1, placeholder: '50' },
   rtx_hdr_peak_brightness: { min: 400, max: 2000, step: 1, placeholder: '1000' },
+  rtx_hdr_sdr_gamut_wideness: { min: 0, max: 100, step: 1, placeholder: '0' },
+  rtx_hdr_sdr_gamma: { min: 0, max: 3, step: 0.1, placeholder: '2.2' },
   dd_virtual_display_permanent_count: { min: 0, max: 4, step: 1, precision: 0, placeholder: '0' },
   nvenc_vbv_increase: { min: 0, max: 400, placeholder: '0' },
   frame_limiter_fps_limit: { min: 0, max: 1000, step: 1, precision: 0, placeholder: '0' },
@@ -86,6 +89,7 @@ const SLIDER_KEYS = new Set<string>([
   'rtx_hdr_sdr_brightness',
   'rtx_hdr_middle_gray',
   'rtx_hdr_peak_brightness',
+  'rtx_hdr_sdr_gamut_wideness',
 ]);
 
 function isFiniteNumber(value: unknown): value is number {

@@ -877,6 +877,33 @@ namespace nvhttp {
           overrides.try_emplace("rtx_hdr_sdr_brightness", std::to_string(brightness));
         }
       }
+
+      // The client panel's primaries (CIE xy in millionths, from the client
+      // compositor's EDID/ICC state), used as the gamut-wideness endpoint so
+      // "100" means THIS panel's native gamut rather than a P3 stand-in.
+      const auto primaries = get_arg(args, "rtxHdrPrimaries", "");
+      if (!primaries.empty() && primaries.size() <= 64) {
+        int fields = 0;
+        bool valid = true;
+        long long value = -1;
+        for (const char c : primaries) {
+          if (std::isdigit(static_cast<unsigned char>(c))) {
+            value = (value < 0 ? 0 : value) * 10 + (c - '0');
+            valid &= value <= 999999;
+          } else if (c == ',') {
+            valid &= value > 0;
+            fields++;
+            value = -1;
+          } else {
+            valid = false;
+            break;
+          }
+        }
+        valid &= value > 0;  // last field
+        if (valid && fields == 7) {
+          overrides.try_emplace("rtx_hdr_sdr_gamut_primaries", primaries);
+        }
+      }
     }
 
 
