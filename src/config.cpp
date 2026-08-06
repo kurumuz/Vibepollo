@@ -824,6 +824,8 @@ namespace config {
       0,  // rtx_hdr.saturation
       50,  // rtx_hdr.middle_gray
       1000,  // rtx_hdr.peak_brightness
+      2.2,  // rtx_hdr.sdr_gamma
+      0,  // rtx_hdr.sdr_gamut_wideness
     },  // rtx_hdr
 
     {},  // capture
@@ -1670,6 +1672,8 @@ namespace config {
     int_between_f(vars, "rtx_hdr_saturation", video.rtx_hdr.saturation, {-100, 100});
     int_between_f(vars, "rtx_hdr_middle_gray", video.rtx_hdr.middle_gray, {10, 100});
     int_between_f(vars, "rtx_hdr_peak_brightness", video.rtx_hdr.peak_brightness, {400, 2000});
+    double_f(vars, "rtx_hdr_sdr_gamma", video.rtx_hdr.sdr_gamma);
+    int_between_f(vars, "rtx_hdr_sdr_gamut_wideness", video.rtx_hdr.sdr_gamut_wideness, {0, 100});
 
     string_f(vars, "capture", video.capture);
     bool_f(vars, "wgc_pacing_smoothing", video.wgc_pacing_smoothing);
@@ -2433,6 +2437,8 @@ namespace config {
         "rtx_hdr_middle_gray",
         "rtx_hdr_peak_brightness",
         "rtx_hdr_fullscreen_match",
+        "rtx_hdr_sdr_gamma",
+        "rtx_hdr_sdr_gamut_wideness",
         "sw_preset",
         "sw_tune",
       };

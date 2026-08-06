@@ -138,6 +138,12 @@ namespace config {
       int saturation;  ///< -100..100 (overlay "Saturation", default 0 = neutral)
       int middle_gray;  ///< 10..100 (overlay "Middle Gray", default 50)
       int peak_brightness;  ///< 400..2000 nits (overlay "Peak Brightness", default 1000)
+      double sdr_gamma;  ///< EOTF for the SDR->PQ desktop/fallback path: 0 = piecewise
+                         ///< sRGB (spec, lifts shadows), otherwise a pure power law.
+                         ///< Default 2.2, matching how displays actually decode SDR.
+      int sdr_gamut_wideness;  ///< 0..100. 0 = colorimetric sRGB; 100 interprets the SDR
+                               ///< values as Display P3, reproducing the saturation of a
+                               ///< wide-gamut monitor's native (unmanaged) SDR mode.
     } rtx_hdr;
 
     std::string capture;

@@ -863,6 +863,20 @@ namespace nvhttp {
         // Range enforcement happens in the config parser ({400, 2000})
         overrides.try_emplace("rtx_hdr_peak_brightness", peak);
       }
+
+      // The client's desktop white level, so the streamed desktop matches what
+      // the client's own desktop is calibrated to. The brightness dial maps
+      // 0..100 -> 100..200 nits, so clients calibrated above 200 (rare) get
+      // the 200 nit ceiling -- still far closer than the 100 nit default.
+      const auto sdrWhite = get_arg(args, "rtxHdrSdrWhiteNits", "");
+      if (!sdrWhite.empty() && sdrWhite.size() <= 4 &&
+          std::all_of(sdrWhite.begin(), sdrWhite.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        const int nits = std::stoi(sdrWhite);
+        if (nits >= 80 && nits <= 1000) {
+          const int brightness = std::clamp(nits - 100, 0, 100);
+          overrides.try_emplace("rtx_hdr_sdr_brightness", std::to_string(brightness));
+        }
+      }
     }
 
 

@@ -82,8 +82,99 @@ namespace platf::dxgi {
 
   struct alignas(16) sdr_to_pq_params_t {
     float sdr_white_nits;
-    float padding[3];
+    float sdr_gamma;
+    float padding[2];
+    float gamut_r0[4];
+    float gamut_r1[4];
+    float gamut_r2[4];
   };
+
+  namespace gamut {
+    // Chromaticity math for the SDR->PQ source-primaries matrix. Double
+    // precision throughout; this runs once per parameter change, not per frame.
+    struct xy_t {
+      double x, y;
+    };
+    struct mat3_t {
+      double m[3][3];
+    };
+
+    constexpr xy_t kD65 {0.3127, 0.3290};
+    constexpr xy_t kRec709[3] {{0.640, 0.330}, {0.300, 0.600}, {0.150, 0.060}};
+    constexpr xy_t kDisplayP3[3] {{0.680, 0.320}, {0.265, 0.690}, {0.150, 0.060}};
+    constexpr xy_t kRec2020[3] {{0.708, 0.292}, {0.170, 0.797}, {0.131, 0.046}};
+
+    mat3_t mul(const mat3_t &a, const mat3_t &b) {
+      mat3_t r {};
+      for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+          for (int k = 0; k < 3; k++) {
+            r.m[i][j] += a.m[i][k] * b.m[k][j];
+          }
+        }
+      }
+      return r;
+    }
+
+    mat3_t inverse(const mat3_t &a) {
+      const auto &m = a.m;
+      const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+                         m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                         m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+      const double id = 1.0 / det;
+      mat3_t r;
+      r.m[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * id;
+      r.m[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * id;
+      r.m[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * id;
+      r.m[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * id;
+      r.m[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * id;
+      r.m[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * id;
+      r.m[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * id;
+      r.m[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * id;
+      r.m[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * id;
+      return r;
+    }
+
+    // Standard primaries+white -> RGB-to-XYZ construction
+    mat3_t rgb_to_xyz(const xy_t prims[3], const xy_t &white) {
+      mat3_t p {};
+      for (int i = 0; i < 3; i++) {
+        p.m[0][i] = prims[i].x / prims[i].y;
+        p.m[1][i] = 1.0;
+        p.m[2][i] = (1.0 - prims[i].x - prims[i].y) / prims[i].y;
+      }
+      const double wX = white.x / white.y;
+      const double wZ = (1.0 - white.x - white.y) / white.y;
+      const mat3_t pinv = inverse(p);
+      const double s[3] = {
+        pinv.m[0][0] * wX + pinv.m[0][1] * 1.0 + pinv.m[0][2] * wZ,
+        pinv.m[1][0] * wX + pinv.m[1][1] * 1.0 + pinv.m[1][2] * wZ,
+        pinv.m[2][0] * wX + pinv.m[2][1] * 1.0 + pinv.m[2][2] * wZ,
+      };
+      mat3_t r;
+      for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+          r.m[i][j] = p.m[i][j] * s[j];
+        }
+      }
+      return r;
+    }
+
+    // Source-primaries -> BT.2020 for a given wideness. 0 assumes the content
+    // really is Rec.709 (colorimetric); 100 pretends the values are Display P3,
+    // which is what a wide-gamut monitor's unmanaged SDR mode does and what
+    // KDE's "sRGB color intensity" slider at 100% reproduces. Interpolation is
+    // in chromaticity space, matching that slider's behaviour.
+    mat3_t source_to_2020(int wideness) {
+      const double t = std::clamp(wideness, 0, 100) / 100.0;
+      xy_t src[3];
+      for (int i = 0; i < 3; i++) {
+        src[i].x = kRec709[i].x + (kDisplayP3[i].x - kRec709[i].x) * t;
+        src[i].y = kRec709[i].y + (kDisplayP3[i].y - kRec709[i].y) * t;
+      }
+      return mul(inverse(rgb_to_xyz(kRec2020, kD65)), rgb_to_xyz(src, kD65));
+    }
+  }  // namespace gamut
 
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
   struct alignas(16) truehdr_peak_params_t {
@@ -798,14 +889,29 @@ namespace platf::dxgi {
     }
 
     void ensure_sdr_to_pq_params(float sdr_white_nits) {
-      if (sdr_to_pq_params && std::abs(sdr_to_pq_white_nits - sdr_white_nits) < 0.5f) {
+      const float gamma = (float) config::video.rtx_hdr.sdr_gamma;
+      const int wideness = config::video.rtx_hdr.sdr_gamut_wideness;
+      if (sdr_to_pq_params &&
+          std::abs(sdr_to_pq_white_nits - sdr_white_nits) < 0.5f &&
+          std::abs(sdr_to_pq_gamma - gamma) < 0.005f &&
+          sdr_to_pq_wideness == wideness) {
         return;
       }
 
-      sdr_to_pq_params_t params {sdr_white_nits, {}};
+      sdr_to_pq_params_t params {};
+      params.sdr_white_nits = sdr_white_nits;
+      params.sdr_gamma = gamma;
+      const auto m = gamut::source_to_2020(wideness);
+      for (int j = 0; j < 3; j++) {
+        params.gamut_r0[j] = (float) m.m[0][j];
+        params.gamut_r1[j] = (float) m.m[1][j];
+        params.gamut_r2[j] = (float) m.m[2][j];
+      }
       if (auto buffer = make_buffer(device.get(), params)) {
         sdr_to_pq_params = std::move(buffer);
         sdr_to_pq_white_nits = sdr_white_nits;
+        sdr_to_pq_gamma = gamma;
+        sdr_to_pq_wideness = wideness;
       }
     }
 
@@ -1748,6 +1854,8 @@ namespace platf::dxgi {
     buf_t color_matrix;
     buf_t sdr_to_pq_params;
     float sdr_to_pq_white_nits = 100.0f;
+    float sdr_to_pq_gamma {-1.0f};
+    int sdr_to_pq_wideness {-1};
 
     blend_t blend_disable;
     sampler_state_t sampler_linear;
