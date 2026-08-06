@@ -818,6 +818,7 @@ namespace config {
     {
       false,  // rtx_hdr.enabled
       false,  // rtx_hdr.force_sdr
+      false,  // rtx_hdr.fullscreen_match
       0,  // rtx_hdr.sdr_brightness
       0,  // rtx_hdr.contrast
       0,  // rtx_hdr.saturation
@@ -1662,6 +1663,7 @@ namespace config {
     int_f(vars, "vk_rc_mode", video.vk.rc_mode);
 
     bool_f(vars, "rtx_hdr", video.rtx_hdr.enabled);
+    bool_f(vars, "rtx_hdr_fullscreen_match", video.rtx_hdr.fullscreen_match);
     bool_f(vars, "rtx_hdr_force_sdr", video.rtx_hdr.force_sdr);
     int_between_f(vars, "rtx_hdr_sdr_brightness", video.rtx_hdr.sdr_brightness, {0, 100});
     int_between_f(vars, "rtx_hdr_contrast", video.rtx_hdr.contrast, {-100, 100});
@@ -2430,6 +2432,7 @@ namespace config {
         "rtx_hdr_saturation",
         "rtx_hdr_middle_gray",
         "rtx_hdr_peak_brightness",
+        "rtx_hdr_fullscreen_match",
         "sw_preset",
         "sw_tune",
       };

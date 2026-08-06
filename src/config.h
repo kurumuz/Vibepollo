@@ -129,6 +129,10 @@ namespace config {
     struct rtx_hdr_t {
       bool enabled;  ///< Enables conversion when an app/client runtime override opts the stream in.
       bool force_sdr;  ///< Legacy compatibility setting; app-enabled RTX HDR always forces SDR source.
+      bool fullscreen_match;  ///< Convert whenever the foreground window is fullscreen or borderless
+                              ///< fullscreen on the captured display, instead of matching the
+                              ///< session-launched app. For setups that launch Steam/desktop and
+                              ///< start games from inside.
       int sdr_brightness;  ///< 0..100 brightness boost for desktop/non-matching RTX HDR fallback frames
       int contrast;  ///< -100..100 (overlay "Contrast", default 0 = neutral)
       int saturation;  ///< -100..100 (overlay "Saturation", default 0 = neutral)

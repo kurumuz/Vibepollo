@@ -8,6 +8,7 @@
 // standard includes
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -843,6 +844,25 @@ namespace nvhttp {
         throw std::out_of_range(name);
       }
       return it->second;
+    }
+
+    // Client-requested RTX HDR for this session. The streaming client may opt
+    // the session into SDR->HDR conversion (and report its display's peak
+    // luminance) straight from its own UI, riding the runtime-override system.
+    // try_emplace: explicit per-app/per-client overrides configured on the
+    // host stay authoritative over the request.
+    void layer_client_rtx_hdr_args(std::unordered_map<std::string, std::string> &overrides, const args_t &args) {
+      const auto rtx_request = get_arg(args, "rtxHdrRequest", "");
+      if (!rtx_request.empty()) {
+        overrides.try_emplace("rtx_hdr", rtx_request == "1" ? "1" : "0");
+      }
+
+      const auto peak = get_arg(args, "rtxHdrPeakNits", "");
+      if (!peak.empty() && peak.size() <= 5 &&
+          std::all_of(peak.begin(), peak.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        // Range enforcement happens in the config parser ({400, 2000})
+        overrides.try_emplace("rtx_hdr_peak_brightness", peak);
+      }
     }
 
 
@@ -2715,6 +2735,8 @@ namespace nvhttp {
             }
           }
 
+          layer_client_rtx_hdr_args(overrides, args);
+
 #ifdef _WIN32
           // "Auto" client peak brightness follows the selected Windows HDR calibration
           // profile's MHC2 peak. An explicit app/client override remains authoritative.
@@ -3128,6 +3150,8 @@ namespace nvhttp {
           overrides.insert_or_assign(key, value);
         }
       }
+
+      layer_client_rtx_hdr_args(overrides, args);
 
 #ifdef _WIN32
       if (client_settings &&
