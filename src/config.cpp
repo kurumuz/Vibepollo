@@ -897,6 +897,7 @@ namespace config {
 
     0,  // pacing_max_bitrate_kbps (0 = legacy 1 Gbps Ethernet assumption)
     0,  // packetsize (0 = off)
+    1,  // prague_cc (0 = off, 1 = shadow mode)
   };
 
   nvhttp_t nvhttp {
@@ -1903,6 +1904,7 @@ namespace config {
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
     int_between_f(vars, "pacing_max_bitrate_kbps", stream.pacing_max_bitrate_kbps, {0, 10000000});
     int_between_f(vars, "packetsize", stream.packetsize, {0, PACKETSIZE_MAX});
+    int_between_f(vars, "prague_cc", stream.prague_cc, {0, 1});
     int_between_f(vars, "video_max_batch_size_kb", stream.video_max_batch_size_kb, {0, 64});
     if (stream.video_max_batch_size_kb == 0) {
       stream.video_max_batch_size_kb = 64;

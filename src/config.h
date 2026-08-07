@@ -280,6 +280,12 @@ namespace config {
 
     // Limit the packetsize to avoid fragmentation on a low MTU link. 0 = off.
     int packetsize;
+
+    // Prague congestion control (L4S). 0 = off, 1 = shadow mode: the controller
+    // runs on real per-datagram feedback from a supporting client and logs what
+    // it would do, but actuates nothing. Requires a client that negotiates
+    // ML_FF_PRAGUE_CC; costs 12 bytes per video datagram when active.
+    int prague_cc;
   };
 
   struct nvhttp_t {

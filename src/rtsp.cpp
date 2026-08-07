@@ -37,6 +37,7 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "prague/prague_wire.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -1259,7 +1260,13 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    uint32_t feature_flags = (uint32_t) platf::get_capabilities();
+    if (config::stream.prague_cc != 0) {
+      // Advertise Prague CC support; a client that answers with
+      // ML_FF_PRAGUE_CC gets per-datagram Prague headers on video.
+      feature_flags |= prague::SS_FF_PRAGUE_CC;
+    }
+    ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;

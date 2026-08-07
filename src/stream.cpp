@@ -40,6 +40,8 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
+#include "prague/prague_cc.h"
+#include "prague/prague_wire.h"
 #include "process.h"
 #include "rtsp.h"
 #include "session_history.h"
@@ -467,6 +469,32 @@ namespace stream {
     control_server_t control_server;
   };
 
+  namespace prague {
+    using namespace ::prague;
+
+    // Host-side per-session Prague controller. Stage 1 is shadow mode: the
+    // controller runs on real feedback (per-datagram headers out, client ACKs
+    // in) but actuates nothing; it only logs what it would have done next to
+    // what the static pacer actually did.
+    //
+    // Fed from two threads -- videoBroadcastThread stamps datagrams and asks
+    // for CC info, the broadcast recv thread applies client ACKs -- hence the
+    // mutex. Every controller call is microseconds-cheap.
+    struct session_ctx_t {
+      std::mutex lock;
+      PragueCC cc;
+      std::uint32_t seq_nr = 0;  ///< datagrams sent, parity shards included
+
+      // Shadow-mode reporting
+      std::chrono::steady_clock::time_point last_log {};
+      count_tp last_inflight = 0;
+
+      session_ctx_t(size_tp max_packet_size, fps_tp fps, time_tp frame_budget, rate_tp init_rate, rate_tp min_rate, rate_tp max_rate):
+          cc(max_packet_size, fps, frame_budget, init_rate, PRAGUE_INITWIN, min_rate, max_rate) {
+      }
+    };
+  }  // namespace prague
+
   struct session_t {
     config_t config;
     int stream_fps = 0;
@@ -501,6 +529,10 @@ namespace stream {
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
       safe::mail_raw_t::event_t<int> bitrate_events;
+
+      // Present iff Prague CC was negotiated for this session (config enabled
+      // + client sent ML_FF_PRAGUE_CC). Shadow mode in stage 1.
+      std::unique_ptr<prague::session_ctx_t> prague;
 
       std::unique_ptr<platf::deinit_t> qos;
     } video;
@@ -1737,6 +1769,68 @@ namespace stream {
     server->flush();
   }
 
+  namespace prague {
+    // ACKs arrive on the video socket carrying the client's SS_PING payload;
+    // sessions with an active controller register here so the recv thread can
+    // route them. Feeding happens under the map lock, so an erase (session
+    // teardown) can never race a feed: once unregister() returns, no ACK is
+    // mid-application.
+    sync_util::sync_t<std::map<std::string, session_t *>> &registry() {
+      static sync_util::sync_t<std::map<std::string, session_t *>> instance;
+      return instance;
+    }
+
+    void register_session(session_t *session) {
+      auto lg = registry().lock();
+      registry()->insert_or_assign(session->video.ping_payload, session);
+    }
+
+    void unregister_session(session_t *session) {
+      auto lg = registry().lock();
+      registry()->erase(session->video.ping_payload);
+    }
+
+    // Returns true if the datagram was a Prague ACK (whether or not a session
+    // claimed it), so the caller skips the ping paths.
+    bool try_apply_ack(const char *data, size_t bytes) {
+      if (bytes != sizeof(ack_msg_t)) {
+        return false;
+      }
+
+      ack_msg_t ack;
+      std::memcpy(&ack, data, sizeof(ack));
+      if (ack.magic != ACK_MAGIC) {
+        return false;
+      }
+
+      auto lg = registry().lock();
+      auto it = registry()->find(std::string {ack.payload, sizeof(ack.payload)});
+      if (it == registry()->end() || !it->second->video.prague) {
+        return true;
+      }
+
+      auto &pctx = *it->second->video.prague;
+      std::lock_guard pg {pctx.lock};
+
+      // Reference sender order: PacketReceived() freezes the peer timestamp
+      // (and measures RTT off our echoed one), then ACKReceived() runs the
+      // congestion machinery on the cumulative counters.
+      pctx.cc.PacketReceived((time_tp) ack.timestamp, (time_tp) ack.echoed_timestamp);
+
+      count_tp inflight = 0;
+      pctx.cc.ACKReceived(
+        (count_tp) ack.packets_received,
+        (count_tp) ack.packets_CE,
+        (count_tp) ack.packets_lost,
+        (count_tp) pctx.seq_nr,
+        ack.error_L4S != 0,
+        inflight
+      );
+      pctx.last_inflight = inflight;
+      return true;
+    }
+  }  // namespace prague
+
   void recvThread(broadcast_ctx_t &ctx) {
     std::map<av_session_id_t, message_queue_t> peer_to_video_session;
     std::map<av_session_id_t, message_queue_t> peer_to_audio_session;
@@ -1802,6 +1896,12 @@ namespace stream {
         }
 
         (buf_elem ? ctx.audio_recv_count : ctx.video_recv_count).fetch_add(1, std::memory_order_relaxed);
+
+        // Prague ACKs ride the video socket; identified by exact size + magic
+        // so they can never be mistaken for a ping (or vice versa).
+        if (buf_elem == 0 && prague::try_apply_ack(buf[buf_elem].data(), bytes)) {
+          return;
+        }
 
         if (bytes == 4) {
           // For legacy PING packets, find the matching session by address.
@@ -2053,6 +2153,44 @@ namespace stream {
         // Generic Segmentation Offload on Linux can't do more than 64.
         send_batch_size = std::min<size_t>(64, send_batch_size);
 
+        // Prague shadow mode: ask the controller what it would do for this
+        // frame and periodically log it against what the static pacer and
+        // encoder actually did. GetCCInfoVideo() is the controller's intended
+        // per-frame call; nothing here actuates anything.
+        if (session->video.prague) {
+          auto &pctx = *session->video.prague;
+
+          rate_tp prague_pacing_rate;
+          size_tp prague_frame_size, prague_packet_size;
+          count_tp prague_frame_window, prague_packet_burst;
+          PragueState pstats;
+          count_tp inflight;
+          {
+            std::lock_guard pg {pctx.lock};
+            pctx.cc.GetCCInfoVideo(prague_pacing_rate, prague_frame_size, prague_frame_window, prague_packet_burst, prague_packet_size);
+            pctx.cc.GetStats(pstats);
+            inflight = pctx.last_inflight;
+          }
+
+          auto now = std::chrono::steady_clock::now();
+          if (now - pctx.last_log >= 1s) {
+            pctx.last_log = now;
+            BOOST_LOG(info) << "Prague shadow: pace "sv << (prague_pacing_rate * 8 / 1000)
+                            << " kbps (actual "sv << (pacing_bps / 1000)
+                            << "), frame "sv << prague_frame_size
+                            << " B (actual "sv << payload.size()
+                            << "), win "sv << prague_frame_window
+                            << " frames, burst "sv << prague_packet_burst
+                            << " pkts, srtt "sv << (pstats.m_srtt / 1000.0)
+                            << " ms, inflight "sv << inflight
+                            << ", rx/CE/lost "sv << pstats.m_packets_received
+                            << '/' << pstats.m_packets_CE
+                            << '/' << pstats.m_packets_lost
+                            << ", sent "sv << pctx.seq_nr
+                            << ", state "sv << (int) pstats.m_cc_state;
+          }
+        }
+
         // Don't ignore the last ratecontrol group of the previous frame
         auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, std::chrono::steady_clock::now());
 
@@ -2098,8 +2236,14 @@ namespace stream {
           }
 
           frame_fec_latency_logger.first_point_now();
-          // If video encryption is enabled, we allocate space for the encryption header before each shard
-          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          // Per-shard prefix region: the Prague header (if negotiated) rides
+          // first, outside the FEC and encryption envelopes, then the
+          // encryption header (if enabled). FEC parity is computed over the
+          // blocksize payload only, so every datagram -- parity shards
+          // included -- carries its own fresh Prague header, and recovered
+          // packets on the client never re-feed the controller.
+          const size_t prague_prefix = session->video.prague ? sizeof(prague::data_hdr_t) : 0;
+          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, prague_prefix + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0));
           frame_fec_latency_logger.second_point_now_and_log();
 
           auto peer_address = session->video.peer.address();
@@ -2156,7 +2300,7 @@ namespace stream {
               session->video.gcm_iv_counter++;
 
               // Encrypt the target buffer in place
-              auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
+              auto *prefix = (video_packet_enc_prefix_t *) (shards.prefix(x) + prague_prefix);
               prefix->frameNumber = (std::uint32_t) packet->frame_index();
               std::copy(std::begin(iv), std::end(iv), prefix->iv);
               session->video.cipher->encrypt(std::string_view {(char *) inspect, (size_t) blocksize}, prefix->tag, (uint8_t *) inspect, &iv);
@@ -2189,6 +2333,25 @@ namespace stream {
               ratecontrol_batch_packets_logger.collect_and_log((double) current_batch_size);
               batch_info.block_offset = next_shard_to_send;
               batch_info.block_count = current_batch_size;
+
+              // Stamp the Prague headers at send time (not shard-build time),
+              // after the pacing sleep, so the timestamps reflect when the
+              // datagrams actually hit the wire. Outside the encryption
+              // envelope, so stamping after encrypt is safe.
+              if (session->video.prague) {
+                auto &pctx = *session->video.prague;
+                std::lock_guard pg {pctx.lock};
+                for (size_t y = next_shard_to_send; y <= (size_t) x; y++) {
+                  prague::data_hdr_t hdr;
+                  time_tp ts, echoed_ts;
+                  ecn_tp wire_ecn;  // ECN marking is stage 5; unused in shadow mode
+                  pctx.cc.GetTimeInfo(ts, echoed_ts, wire_ecn);
+                  hdr.timestamp = ts;
+                  hdr.echoed_timestamp = echoed_ts;
+                  hdr.seq_nr = ++pctx.seq_nr;
+                  std::memcpy(shards.prefix(y), &hdr, sizeof(hdr));
+                }
+              }
 
               frame_send_batch_latency_logger.first_point_now();
               // Use a batched send if it's supported on this platform
@@ -2563,6 +2726,17 @@ namespace stream {
     if (ping_error < 0) {
       return;
     }
+
+    // Route this client's Prague ACKs to our controller. Unregistered before
+    // this thread returns (and therefore before the session is torn down).
+    if (session->video.prague) {
+      prague::register_session(session);
+    }
+    auto prague_fg = util::fail_guard([session]() {
+      if (session->video.prague) {
+        prague::unregister_session(session);
+      }
+    });
 
     // Enable local prioritization and QoS tagging on video traffic if requested by the client
     auto address = session->video.peer.address();
@@ -3072,6 +3246,28 @@ namespace stream {
       session->video.bitrate_events = mail->event<int>(mail::dynamic_bitrate);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
+
+      if (config::stream.prague_cc != 0 && (config.mlFeatureFlags & (int) prague::ML_FF_PRAGUE_CC)) {
+        // Shadow mode (stage 1): bounds chosen so the logged numbers stay
+        // interpretable against the session bitrate rather than running off
+        // to the library's 100 Gbps default ceiling on a loss-free link.
+        auto fps = std::clamp(session->stream_fps > 0 ? session->stream_fps : config.monitor.framerate, 1, 255);
+        auto blocksize = (size_tp) (config.packetsize + MAX_RTP_HEADER_SIZE);
+        auto bitrate_Bps = (rate_tp) config.monitor.bitrate * 1000 / 8;
+
+        session->video.prague = std::make_unique<prague::session_ctx_t>(
+          blocksize,
+          (fps_tp) fps,
+          (time_tp) (1000000 / fps),
+          bitrate_Bps,
+          std::max<rate_tp>(bitrate_Bps / 4, 125000),
+          bitrate_Bps * 3 / 2
+        );
+
+        BOOST_LOG(info) << "Prague CC: shadow mode active (fps "sv << fps
+                        << ", packet size "sv << blocksize
+                        << " B, init rate "sv << bitrate_Bps * 8 / 1000 << " kbps)"sv;
+      }
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
         session->video.cipher = crypto::cipher::gcm_t {
