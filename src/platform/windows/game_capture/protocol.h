@@ -57,7 +57,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 10;
+  constexpr std::uint32_t kVersion = 11;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 320;
 
@@ -79,6 +79,7 @@ namespace game_capture {
     capturing = 2,  ///< frames are being published
     unsupported = 3,  ///< this process presents through an API the hook does not capture (see last_error)
     failed = 4,  ///< setup failed (see last_error)
+    fatal = 5,  ///< Windows no longer behaves as the hook relies on (see last_error): Vibepollo needs updating; the host stops loudly
   };
 
   enum class api_e : std::uint32_t {
@@ -89,7 +90,7 @@ namespace game_capture {
 
   // How the game's pixels are encoded
   enum class color_space_e : std::uint32_t {
-    unknown = 0,  ///< not established (a 10-bit swapchain whose SetColorSpace1 the hook never saw): do not use the frame
+    unknown = 0,  ///< one the host does not convert (or the hook could not read it): do not use the frame
     srgb = 1,  ///< DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
     scrgb = 2,  ///< DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, linear, 1.0 = 80 nits
     hdr10 = 3,  ///< DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, PQ

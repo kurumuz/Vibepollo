@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -212,6 +213,8 @@ namespace platf::dxgi::game_capture {
           return "unsupported";
         case gc::hook_state_e::failed:
           return "failed";
+        case gc::hook_state_e::fatal:
+          return "fatal";
       }
       return "?";
     }
@@ -708,6 +711,14 @@ namespace platf::dxgi::game_capture {
       const auto error = bounded_error(t.block);
       BOOST_LOG(info) << "Game capture: " << t.exe << " hook " << state_name(state) << (error.empty() ? std::string() : " (" + error + ")");
     }
+    if (state == static_cast<std::uint32_t>(gc::hook_state_e::fatal)) {
+      // Windows changed under the hook (e.g. DXGI dropped the colour-space
+      // getter every frame depends on). Deliberately loud: stop the host
+      // rather than stream on with a hook that can no longer be trusted.
+      BOOST_LOG(fatal) << "Game capture: " << t.exe << ": " << bounded_error(t.block);
+      logging::log_flush();
+      std::abort();
+    }
     if (state == static_cast<std::uint32_t>(gc::hook_state_e::unsupported) || state == static_cast<std::uint32_t>(gc::hook_state_e::failed)) {
       t.give_up(std::string(state_name(state)) + ": " + bounded_error(t.block));
       return false;
@@ -1137,15 +1148,9 @@ namespace platf::dxgi::game_capture {
     return true;
   }
 
-  bool converter_t::convert(ID3D11Device *device, ID3D11DeviceContext *context, const frame_t &frame, ID3D11Texture2D *target_texture, ID3D11RenderTargetView *target_rtv, DXGI_FORMAT target_format, float sdr_white_scale, bool display_hdr) {
+  bool converter_t::convert(ID3D11Device *device, ID3D11DeviceContext *context, const frame_t &frame, ID3D11Texture2D *target_texture, ID3D11RenderTargetView *target_rtv, DXGI_FORMAT target_format, float sdr_white_scale) {
     using cs = gc::color_space_e;
-    auto color_space = frame.color_space;
-    // A 10-bit swapchain is unknown when the hook missed the game's
-    // SetColorSpace1. A display not in HDR mode shows it as SDR whatever the
-    // game asked for, so on one that is what it is.
-    if (color_space == cs::unknown && frame.format == DXGI_FORMAT_R10G10B10A2_UNORM && !display_hdr) {
-      color_space = cs::srgb;
-    }
+    const auto color_space = frame.color_space;
     if (color_space == cs::unknown) {
       return false;
     }

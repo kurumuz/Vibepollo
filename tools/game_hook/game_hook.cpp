@@ -5,14 +5,15 @@
  *        src/platform/windows/game_capture/protocol.h for the protocol.
  *
  * D3D11 and D3D12 swapchains are captured. The DXGI entry points (Present,
- * Present1, SetColorSpace1) are inline-detoured with MinHook at their
+ * Present1, ResizeBuffers(1)) are inline-detoured with MinHook at their
  * function addresses, found from a throwaway swapchain: that catches every
  * swapchain in the process whatever its swap effect or creation API, and
  * overlays that keep private vtables (their cached "original" is the function
  * we patched). D3D12 also needs the queue a swapchain presents from, which
  * DXGI does not expose: ID3D12CommandQueue::ExecuteCommandLists is detoured
  * too, and a frame is captured only when that queue is certain (see the D3D12
- * section).
+ * section). A frame's colour space is read from its swapchain through DXGI's
+ * private getter (see swapchain_color_space).
  *
  * Threading, so that nothing here can stall or crash the game:
  *  - All work on the game's D3D objects happens on the game's own thread
@@ -55,6 +56,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <vector>
 
 namespace {
@@ -63,7 +65,6 @@ namespace {
 
   using present_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
   using present1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
-  using set_color_space1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
   using resize_buffers_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
   using resize_buffers1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT *, IUnknown *const *);
 
@@ -71,12 +72,8 @@ namespace {
   constexpr int kVtPresent = 8;
   constexpr int kVtResizeBuffers = 13;
   constexpr int kVtPresent1 = 22;  // IDXGISwapChain1
-  constexpr int kVtSetColorSpace1 = 38;  // IDXGISwapChain3
   constexpr int kVtResizeBuffers1 = 39;  // IDXGISwapChain3
 
-  // Private data key under which a swapchain remembers its colour space
-  // {8f4c2a6e-5b1d-4c7a-9e3f-2d6a8b1c4e70}
-  constexpr GUID kColorSpaceKey = {0x8f4c2a6e, 0x5b1d, 0x4c7a, {0x9e, 0x3f, 0x2d, 0x6a, 0x8b, 0x1c, 0x4e, 0x70}};
   // D3D12: the queue a swapchain was seen presenting from (an interface), and
   // whether it was ever seen presenting from more than one (a flag)
   // {3b9d7e21-6c4a-4f0e-8a5d-1e7c9b2f4a63}, {5e2a8c14-9b3d-4d71-b6e0-7f4a2c9d1e85}
@@ -88,13 +85,11 @@ namespace {
 
   present_fn g_real_present = nullptr;
   present1_fn g_real_present1 = nullptr;
-  set_color_space1_fn g_real_set_color_space1 = nullptr;
   resize_buffers_fn g_real_resize_buffers = nullptr;  // both or neither (D3D12 capture needs them)
   resize_buffers1_fn g_real_resize_buffers1 = nullptr;
 
   gc::shared_block_t *g_block = nullptr;
   thread_local bool t_in_present = false;
-  std::atomic<bool> g_color_tracking_lost {false};  // a SetColorSpace1 could not be recorded
 
   // ---- logging -----------------------------------------------------------
 
@@ -133,8 +128,8 @@ namespace {
   }
 
   void set_state(gc::hook_state_e state, const char *error = nullptr) {
-    if (!g_block) {
-      return;
+    if (!g_block || g_block->hook_state.load(std::memory_order_acquire) == static_cast<std::uint32_t>(gc::hook_state_e::fatal)) {
+      return;  // (fatal stays: the host must see it)
     }
     if (error) {
       std::snprintf(g_block->last_error, sizeof(g_block->last_error), "%s", error);
@@ -638,38 +633,60 @@ namespace {
     }
   }
 
-  // The documented defaults: an FP16 swapchain is scRGB, 8-bit is sRGB, 10-bit
-  // is sRGB unless SetColorSpace1 made it HDR10 (which we may have missed if
-  // injected late), so it is unknown until we see that call.
-  std::uint32_t default_color_space(DXGI_FORMAT format) {
-    switch (format) {
-      case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        return static_cast<std::uint32_t>(gc::color_space_e::scrgb);
-      case DXGI_FORMAT_R8G8B8A8_UNORM:
-      case DXGI_FORMAT_B8G8R8A8_UNORM:
-      case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-      case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        return static_cast<std::uint32_t>(gc::color_space_e::srgb);
-      default:
-        return static_cast<std::uint32_t>(gc::color_space_e::unknown);
+  // A swapchain's colour space, read from the swapchain itself. DXGI has no
+  // public getter, and the hook usually arrives after the game called
+  // SetColorSpace1, but DXGI's swapchains answer through an undocumented
+  // interface (ReShade and Special K rely on it; declaration from ReShade).
+  // Checked on dxgi.dll 10.0.26100.7309, D3D11 and D3D12: it reports each
+  // format's default before any call (0 = sRGB for 8/10-bit, 1 = scRGB for
+  // FP16), every successful SetColorSpace1 (an 8-bit chain can be PQ too),
+  // and is unchanged by failed ones. Only DXGI's own swapchains reach our
+  // detours (install_hooks checks), so one without it means Windows changed
+  // under us: fatal, reported to the host, never guessed around.
+  struct IDXGISwapChainTest : IUnknown {
+    virtual bool STDMETHODCALLTYPE HasProxyFrontBufferSurface() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetFrameStatisticsTest(void *) = 0;
+    virtual void STDMETHODCALLTYPE EmulateXBOXBehavior(BOOL) = 0;
+    virtual DXGI_COLOR_SPACE_TYPE STDMETHODCALLTYPE GetColorSpace1() = 0;
+  };
+
+  // {8C803E30-9E41-4DDF-B206-46F28E90E405}
+  constexpr GUID kIidSwapChainTest = {0x8c803e30, 0x9e41, 0x4ddf, {0xb2, 0x06, 0x46, 0xf2, 0x8e, 0x90, 0xe4, 0x05}};
+
+  // The colour space as DXGI reports it; false (and the hook fatal) if the
+  // swapchain cannot say
+  bool dxgi_color_space(IDXGISwapChain *swapchain, DXGI_COLOR_SPACE_TYPE &color_space) {
+    IDXGISwapChainTest *test = nullptr;
+    const HRESULT hr = swapchain->QueryInterface(kIidSwapChainTest, reinterpret_cast<void **>(&test));
+    if (FAILED(hr) || !test) {
+      char msg[gc::kErrorLength];
+      std::snprintf(msg, sizeof(msg), "DXGI's swapchain no longer answers IDXGISwapChainTest (colour-space getter) [0x%08lx]: this Windows build needs a Vibepollo update", hr);
+      set_state(gc::hook_state_e::fatal, msg);
+      return false;
     }
+    color_space = test->GetColorSpace1();
+    test->Release();
+    return true;
   }
 
-  // The colour space SetColorSpace1 last set on this swapchain, stored as
-  // its private data so it lives and dies with the object
-  std::uint32_t swapchain_color_space(IDXGISwapChain *swapchain, DXGI_FORMAT format) {
-    // A change we could not record may have made a 10-bit chain HDR10 (or
-    // back): its stored value can be stale, so it is unknown. Formats with a
-    // fixed encoding are unaffected.
-    if (g_color_tracking_lost.load(std::memory_order_acquire) && format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+  std::uint32_t swapchain_color_space(IDXGISwapChain *swapchain) {
+    DXGI_COLOR_SPACE_TYPE dxgi = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (!dxgi_color_space(swapchain, dxgi)) {
       return static_cast<std::uint32_t>(gc::color_space_e::unknown);
     }
-    std::uint32_t stored = 0;
-    UINT size = sizeof(stored);
-    if (SUCCEEDED(swapchain->GetPrivateData(kColorSpaceKey, &size, &stored)) && size == sizeof(stored)) {
-      return stored;
+    auto cs = gc::color_space_e::unknown;  // (a colour space we do not convert: the host uses desktop capture)
+    if (dxgi == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+      cs = gc::color_space_e::srgb;
+    } else if (dxgi == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) {
+      cs = gc::color_space_e::scrgb;
+    } else if (dxgi == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+      cs = gc::color_space_e::hdr10;
     }
-    return default_color_space(format);
+    static std::atomic<int> logged {-1};
+    if (logged.exchange(static_cast<int>(dxgi), std::memory_order_relaxed) != static_cast<int>(dxgi)) {
+      log("Swapchain %p colour space %d%s", static_cast<void *>(swapchain), static_cast<int>(dxgi), cs == gc::color_space_e::unknown ? " (not converted)" : "");
+    }
+    return static_cast<std::uint32_t>(cs);
   }
 
   bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd) {
@@ -1365,7 +1382,7 @@ namespace {
     if (!ensure_textures12(back_desc, hwnd)) {
       return;
     }
-    const std::uint32_t color_space = swapchain_color_space(swapchain, g_cap.format);
+    const std::uint32_t color_space = swapchain_color_space(swapchain);
 
     // A free slot whose list's last copy completed; claims its owner word
     const int slot = acquire_free_slot(&list_ready);
@@ -1560,7 +1577,7 @@ namespace {
       back->Release();
       return;
     }
-    const std::uint32_t color_space = swapchain_color_space(swapchain, g_cap.format);
+    const std::uint32_t color_space = swapchain_color_space(swapchain);
 
     const int slot = acquire_free_slot();
     if (slot == -2) {
@@ -1882,28 +1899,6 @@ namespace {
     });
   }
 
-  HRESULT STDMETHODCALLTYPE hook_set_color_space1(IDXGISwapChain3 *swapchain, DXGI_COLOR_SPACE_TYPE color_space) {
-    const HRESULT hr = g_real_set_color_space1(swapchain, color_space);
-    if (SUCCEEDED(hr)) {
-      auto cs = gc::color_space_e::unknown;
-      if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
-        cs = gc::color_space_e::srgb;
-      } else if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) {
-        cs = gc::color_space_e::scrgb;
-      } else if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-        cs = gc::color_space_e::hdr10;
-      }
-      const auto value = static_cast<std::uint32_t>(cs);
-      if (FAILED(swapchain->SetPrivateData(kColorSpaceKey, sizeof(value), &value))) {
-        g_color_tracking_lost.store(true, std::memory_order_release);
-        log("Swapchain %p color space %d could not be recorded", static_cast<void *>(swapchain), static_cast<int>(color_space));
-      } else {
-        log("Swapchain %p color space %d", static_cast<void *>(swapchain), static_cast<int>(color_space));
-      }
-    }
-    return hr;
-  }
-
   // ID3D12CommandQueue::ExecuteCommandLists, found from a throwaway queue on
   // a D3D12 device (the runtime hands back the process's existing device
   // for the adapter). Only when the game has loaded d3d12.dll; its runtime
@@ -1944,6 +1939,23 @@ namespace {
 
   // The entry points are found from a throwaway swapchain and inline-detoured
   // at their addresses, which every swapchain of the process shares.
+  // Whether the swapchain's implementation lives in Windows' dxgi.dll
+  bool windows_dxgi(IDXGISwapChain1 *swapchain) {
+    HMODULE module = nullptr;
+    void *present = (*reinterpret_cast<void ***>(swapchain))[kVtPresent];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(present), &module)) {
+      return false;
+    }
+    wchar_t path[MAX_PATH], system[MAX_PATH];
+    const UINT n = GetSystemDirectoryW(system, MAX_PATH);
+    if (!GetModuleFileNameW(module, path, MAX_PATH) || n == 0 || n + 10 >= MAX_PATH) {
+      return false;
+    }
+    std::wcscat(system, L"\\dxgi.dll");
+    log("DXGI: %ls", path);
+    return _wcsicmp(path, system) == 0;
+  }
+
   bool install_hooks() {
     WNDCLASSW wc {};
     wc.lpfnWndProc = DefWindowProcW;
@@ -1977,7 +1989,14 @@ namespace {
       desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
       hr = factory->CreateSwapChainForHwnd(device, hwnd, &desc, nullptr, nullptr, &swapchain);
     }
-    if (SUCCEEDED(hr)) {
+    if (SUCCEEDED(hr) && !windows_dxgi(swapchain)) {
+      // A replacement DXGI (DXVK, say) has other internals than the ones
+      // this hook relies on
+      set_state(gc::hook_state_e::unsupported, "The process uses a DXGI other than Windows' own");
+      hr = E_NOTIMPL;
+    } else if (DXGI_COLOR_SPACE_TYPE cs; SUCCEEDED(hr) && !dxgi_color_space(swapchain, cs)) {
+      hr = E_NOINTERFACE;  // (fatal, reported: without the getter no frame can be interpreted)
+    } else if (SUCCEEDED(hr)) {
       void **vtable = *reinterpret_cast<void ***>(swapchain);
       ok = MH_Initialize() == MH_OK &&
            MH_CreateHook(vtable[kVtPresent], reinterpret_cast<void *>(&hook_present), reinterpret_cast<void **>(&g_real_present)) == MH_OK &&
@@ -1985,9 +2004,6 @@ namespace {
       IDXGISwapChain3 *swapchain3 = nullptr;
       if (ok && SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
         void **vtable3 = *reinterpret_cast<void ***>(swapchain3);
-        if (MH_CreateHook(vtable3[kVtSetColorSpace1], reinterpret_cast<void *>(&hook_set_color_space1), reinterpret_cast<void **>(&g_real_set_color_space1)) != MH_OK) {
-          log("SetColorSpace1 could not be detoured; 10-bit swapchains stay unknown");
-        }
         // D3D12 capture needs both (a resize may change the presenting queue)
         if (MH_CreateHook(vtable[kVtResizeBuffers], reinterpret_cast<void *>(&hook_resize_buffers), reinterpret_cast<void **>(&g_real_resize_buffers)) != MH_OK) {
           g_real_resize_buffers = nullptr;
@@ -2006,7 +2022,7 @@ namespace {
         MH_DisableHook(MH_ALL_HOOKS);
         set_state(gc::hook_state_e::failed, "Installing the DXGI detours failed");
       }
-    } else {
+    } else if (hr != E_NOTIMPL && hr != E_NOINTERFACE) {
       char msg[96];
       std::snprintf(msg, sizeof(msg), "Could not create the dummy swapchain: 0x%08lx", hr);
       set_state(gc::hook_state_e::failed, msg);

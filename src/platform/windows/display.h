@@ -506,7 +506,6 @@ namespace platf::dxgi {
     foreground_app::state_t _game_foreground;
     std::chrono::steady_clock::time_point _game_foreground_checked {};
     float _game_sdr_white_scale = 1.0f;
-    bool _game_display_hdr = false;  ///< the captured display is in HDR mode (refreshed with the SDR white level)
     std::chrono::steady_clock::time_point _game_sdr_white_checked {};
     std::chrono::steady_clock::time_point _game_stats_logged {};
     std::uint64_t _game_frames_delivered = 0;  ///< game frames handed to the encoder since the last stats line

@@ -221,8 +221,7 @@ namespace platf::dxgi {
         _game_source->set_frame_rate(_config.framerateX100 > 0 ? _config.framerateX100 / 100.0 : static_cast<double>(_config.framerate));
         _game_converter = std::make_unique<game_capture::converter_t>();
         _game_sdr_white_scale = game_capture::sdr_white_scale_for_output(captured_output_desc.DeviceName);
-        _game_display_hdr = is_hdr();
-        BOOST_LOG(info) << "Game capture: enabled (desktop SDR white " << _game_sdr_white_scale * 80.0f << " nits, display " << (_game_display_hdr ? "HDR" : "SDR") << ')';
+        BOOST_LOG(info) << "Game capture: enabled (desktop SDR white " << _game_sdr_white_scale * 80.0f << " nits)";
       }
       const auto now = std::chrono::steady_clock::now();
       if (now - _game_foreground_checked >= std::chrono::milliseconds(100)) {
@@ -237,10 +236,6 @@ namespace platf::dxgi {
         if (scale != _game_sdr_white_scale) {
           BOOST_LOG(info) << "Game capture: desktop SDR white now " << scale * 80.0f << " nits";
           _game_sdr_white_scale = scale;
-        }
-        if (const bool hdr = is_hdr(); hdr != _game_display_hdr) {
-          BOOST_LOG(info) << "Game capture: display now " << (hdr ? "HDR" : "SDR");
-          _game_display_hdr = hdr;
         }
       }
       const bool game_active = _game_source->active(_game_foreground) && _game_source->still_foreground(captured_output_desc.DesktopCoordinates);
@@ -493,7 +488,7 @@ namespace platf::dxgi {
       return capture_e::ok;
     }
 
-    const bool converted = _game_converter->convert(device.get(), device_ctx.get(), frame, d3d_img->capture_texture.get(), d3d_img->capture_rt.get(), capture_format, _game_sdr_white_scale, _game_display_hdr);
+    const bool converted = _game_converter->convert(device.get(), device_ctx.get(), frame, d3d_img->capture_texture.get(), d3d_img->capture_rt.get(), capture_format, _game_sdr_white_scale);
     if (!converted) {
       const auto key = (static_cast<std::uint64_t>(frame.format) << 32) | static_cast<std::uint32_t>(frame.color_space) | (1ull << 63);
       if (_game_mismatch_logged != key) {
