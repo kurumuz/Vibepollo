@@ -630,6 +630,15 @@ namespace platf::dxgi::game_capture {
       return false;
     }
     reap_exited();
+    // Who paces the game we capture: our limiter, or the game itself
+    if (auto *t = current(); t && t->attached && t->block && t->host_locked) {
+      const auto *b = t->block;
+      _pacing.note_limiter(b->limiter_waits.load(std::memory_order_relaxed),
+                           b->limiter_late.load(std::memory_order_relaxed) + b->limiter_resets.load(std::memory_order_relaxed),
+                           b->limiter_divisor.load(std::memory_order_relaxed),
+                           b->limiter_drift_ppm.load(std::memory_order_relaxed),
+                           b->limiter_game_period_ps.load(std::memory_order_relaxed));
+    }
     const std::uint64_t limiter_period = config::video.game_capture_limiter ? _pacing.period_ps() : 0;
     const auto heartbeat = static_cast<std::uint64_t>(qpc_counter());
     for (auto &[pid, t] : _targets) {
@@ -651,6 +660,7 @@ namespace platf::dxgi::game_capture {
         previous->block->capture_enabled.store(0, std::memory_order_release);
       }
       _current_pid = pid;
+      _pacing.forget_limiter();
     }
     if (!pid) {
       return false;

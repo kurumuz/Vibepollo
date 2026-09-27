@@ -179,6 +179,8 @@ namespace game_capture {
     std::atomic<std::uint64_t> limiter_resets;  ///< ... so late the release grid restarted
     std::atomic<std::uint64_t> limiter_wait_us;  ///< total time spent waiting
     std::atomic<std::uint32_t> limiter_divisor;  ///< the game is paced at this many periods per frame (it cannot keep up with one)
+    std::atomic<std::int32_t> limiter_drift_ppm;  ///< how much slower than our grid the game's own schedule runs (limiter_logic_t::drift)
+    std::atomic<std::uint64_t> limiter_game_period_ps;  ///< the game's own frame period behind that drift (0 = none detected)
 
     char last_error[kErrorLength];  ///< the host copies at most kErrorLength bytes and terminates locally
   };
