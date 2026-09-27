@@ -52,9 +52,10 @@ namespace platf::dxgi::game_capture {
 
     /**
      * @brief Cheap re-check right before a frame is taken from the game:
-     *        the foreground window still belongs to the captured process.
+     *        the foreground window still belongs to the captured process
+     *        and still covers the captured display.
      */
-    bool still_foreground() const;
+    bool still_foreground(const RECT &capture_rect) const;
 
     /**
      * @brief Wait for the game to publish a frame newer than the last one used.

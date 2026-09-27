@@ -190,22 +190,26 @@ namespace platf::dxgi::game_capture {
     }
 
     // Security descriptor for the shared block: SYSTEM and administrators
-    // full access, the game process's user read/write, and a medium
+    // full access, the game's logon session read/write (the logon SID, so
+    // other sessions of the same account cannot reach it), and a medium
     // integrity label so the (medium integrity) game may write it at all.
-    // Nobody else can touch it.
     PSECURITY_DESCRIPTOR make_block_descriptor(HANDLE process) {
       winrt::handle token;
       if (!OpenProcessToken(process, TOKEN_QUERY, token.put())) {
         return nullptr;
       }
       DWORD size = 0;
-      GetTokenInformation(token.get(), TokenUser, nullptr, 0, &size);
+      GetTokenInformation(token.get(), TokenLogonSid, nullptr, 0, &size);
       std::vector<std::uint8_t> buffer(size);
-      if (!GetTokenInformation(token.get(), TokenUser, buffer.data(), size, &size)) {
+      if (!GetTokenInformation(token.get(), TokenLogonSid, buffer.data(), size, &size)) {
+        return nullptr;
+      }
+      auto *groups = reinterpret_cast<TOKEN_GROUPS *>(buffer.data());
+      if (groups->GroupCount < 1) {
         return nullptr;
       }
       LPWSTR sid_string = nullptr;
-      if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER *>(buffer.data())->User.Sid, &sid_string)) {
+      if (!ConvertSidToStringSidW(groups->Groups[0].Sid, &sid_string)) {
         return nullptr;
       }
       std::wstring sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;";
@@ -402,7 +406,8 @@ namespace platf::dxgi::game_capture {
     std::uint32_t logged_state = 0xffffffffu;
 
     winrt::handle frame_event;
-    std::uint32_t opened_generation = 0;
+    int open_failures = 0;
+    std::uint32_t opened_generation = 0;  // 0 = none opened (the hook's first generation is 1)
     winrt::com_ptr<ID3D11Texture2D> textures[gc::kSlots];
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC texture_desc {};
@@ -478,8 +483,19 @@ namespace platf::dxgi::game_capture {
     }
     _last_reap = now;
     for (auto it = _targets.begin(); it != _targets.end();) {
-      const auto &t = *it->second;
-      if (t.exited()) {
+      auto &t = *it->second;
+      // A job that finished while its game was not in the foreground still
+      // holds a process handle: adopt it so exit is noticed
+      if (!t.attached && t.job && t.job->state.load(std::memory_order_acquire) != attach_job_t::state_e::running && t.job->process) {
+        t.process = t.job->process.get();
+        t.block = t.job->block;
+        t.attached = t.job->state.load(std::memory_order_acquire) == attach_job_t::state_e::done;
+        if (!t.attached) {
+          t.give_up(t.job->error);
+        }
+      }
+      const bool exited = t.process && WaitForSingleObject(t.process, 0) == WAIT_OBJECT_0;
+      if (exited) {
         BOOST_LOG(info) << "Game capture: " << t.exe << " (pid " << t.pid << ") exited";
         if (it->first == _current_pid) {
           unlock();
@@ -588,13 +604,22 @@ namespace platf::dxgi::game_capture {
     return qpc_time_difference(static_cast<int64_t>(now), static_cast<int64_t>(publish_qpc)) < kFrameStaleAfter;
   }
 
-  bool source_t::still_foreground() const {
+  bool source_t::still_foreground(const RECT &capture_rect) const {
     if (!_current_pid) {
       return false;
     }
     const HWND foreground = GetForegroundWindow();
     DWORD pid = 0;
-    return foreground && GetWindowThreadProcessId(foreground, &pid) && pid == _current_pid;
+    if (!foreground || !GetWindowThreadProcessId(foreground, &pid) || pid != _current_pid) {
+      return false;
+    }
+    RECT window {}, intersection {};
+    if (!GetWindowRect(foreground, &window) || !IntersectRect(&intersection, &window, &capture_rect)) {
+      return false;
+    }
+    const auto capture_area = static_cast<long long>(capture_rect.right - capture_rect.left) * (capture_rect.bottom - capture_rect.top);
+    const auto covered = static_cast<long long>(intersection.right - intersection.left) * (intersection.bottom - intersection.top);
+    return capture_area > 0 && covered * 100 >= capture_area * 90;
   }
 
   bool source_t::open_generation(target_t &t) {
@@ -654,7 +679,11 @@ namespace platf::dxgi::game_capture {
       textures[i]->GetDesc(&this_desc);
       if (this_desc.MipLevels != 1 || this_desc.ArraySize != 1 || this_desc.SampleDesc.Count != 1 ||
           !(this_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) || this_desc.Width == 0 || this_desc.Height == 0) {
-        t.give_up("the hook's texture has an unexpected shape");
+        // A recycled handle during a resize storm looks like this too, so
+        // retry a few times before concluding the hook is misbehaving
+        if (++t.open_failures >= 8) {
+          t.give_up("the hook's texture has an unexpected shape");
+        }
         return false;
       }
       if (i == 0) {
@@ -681,6 +710,7 @@ namespace platf::dxgi::game_capture {
     }
     t.texture_desc = desc;
     t.opened_generation = generation;
+    t.open_failures = 0;
     BOOST_LOG(info) << "Game capture: " << t.exe << " frames " << desc.Width << 'x' << desc.Height << " format " << desc.Format << " (generation " << generation << ')';
     return true;
   }
@@ -742,6 +772,12 @@ namespace platf::dxgi::game_capture {
         continue;
       }
       if (frame_id <= t->consumed_frame_id) {
+        t->mutexes[slot]->ReleaseSync(0);
+        t->consumed_latest = latest;
+        return capture_e::timeout;
+      }
+      // A frame that sat unconsumed (a long pool wait) is not shown late
+      if (qpc_time_difference(qpc_counter(), static_cast<int64_t>(present_qpc)) > kFrameStaleAfter) {
         t->mutexes[slot]->ReleaseSync(0);
         t->consumed_latest = latest;
         return capture_e::timeout;

@@ -237,7 +237,7 @@ namespace platf::dxgi {
           _game_sdr_white_scale = scale;
         }
       }
-      const bool game_active = _game_source->active(_game_foreground) && _game_source->still_foreground();
+      const bool game_active = _game_source->active(_game_foreground) && _game_source->still_foreground(captured_output_desc.DesktopCoordinates);
       if (game_active != _game_mode) {
         _game_mode = game_active;
         BOOST_LOG(info) << "Game capture: " << (game_active ? "capturing from the game (" + _game_foreground.foreground_exe + ")" : std::string("back to desktop capture"));
@@ -404,7 +404,7 @@ namespace platf::dxgi {
       // Nothing from the game: if it is no longer the foreground fullscreen
       // window (alt-tab during the wait), this snapshot comes from the
       // desktop instead of being skipped
-      if (!_game_source->still_foreground()) {
+      if (!_game_source->still_foreground(captured_output_desc.DesktopCoordinates)) {
         fall_back = true;
         return capture_e::ok;
       }
@@ -447,7 +447,7 @@ namespace platf::dxgi {
     }
     // The pool wait can be long under encoder pressure: the game may have
     // lost the foreground meanwhile
-    if (!_game_source->still_foreground()) {
+    if (!_game_source->still_foreground(captured_output_desc.DesktopCoordinates)) {
       fall_back = true;
       return capture_e::ok;
     }
