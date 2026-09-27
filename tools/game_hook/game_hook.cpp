@@ -520,19 +520,18 @@ namespace {
   // The colour space SetColorSpace1 last set on this swapchain, stored as
   // its private data so it lives and dies with the object
   std::uint32_t swapchain_color_space(IDXGISwapChain *swapchain, DXGI_FORMAT format) {
+    // A change we could not record may have made a 10-bit chain HDR10 (or
+    // back): its stored value can be stale, so it is unknown. Formats with a
+    // fixed encoding are unaffected.
+    if (g_color_tracking_lost.load(std::memory_order_acquire) && format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+      return static_cast<std::uint32_t>(gc::color_space_e::unknown);
+    }
     std::uint32_t stored = 0;
     UINT size = sizeof(stored);
     if (SUCCEEDED(swapchain->GetPrivateData(kColorSpaceKey, &size, &stored)) && size == sizeof(stored)) {
       return stored;
     }
-    // A change we could not record may have made a 10-bit chain HDR10;
-    // formats with a fixed encoding are unaffected
-    const auto by_format = default_color_space(format);
-    if (g_color_tracking_lost.load(std::memory_order_acquire) && by_format != static_cast<std::uint32_t>(gc::color_space_e::scrgb) &&
-        (format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R10G10B10A2_TYPELESS)) {
-      return static_cast<std::uint32_t>(gc::color_space_e::unknown);
-    }
-    return by_format;
+    return default_color_space(format);
   }
 
   bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd) {
@@ -601,11 +600,20 @@ namespace {
   }
 
   // A free slot whose keyed mutex is available now (the host may still hold
-  // the previously published one); -1 if none
+  // the previously published one); -1 if none, -2 if a mutex was abandoned
+  // (the shared surface must be recreated)
   int acquire_free_slot() {
     for (int i = 0; i < gc::kSlots; ++i) {
-      if (word_state(g_slots[i].word.load(std::memory_order_acquire)) == st_free && g_cap.mutexes[i]->AcquireSync(0, 0) == S_OK) {
+      if (word_state(g_slots[i].word.load(std::memory_order_acquire)) != st_free) {
+        continue;
+      }
+      const HRESULT hr = g_cap.mutexes[i]->AcquireSync(0, 0);
+      if (hr == S_OK) {
         return i;
+      }
+      if (hr == static_cast<HRESULT>(WAIT_ABANDONED)) {
+        g_cap.mutexes[i]->ReleaseSync(0);
+        return -2;
       }
     }
     return -1;
@@ -641,6 +649,14 @@ namespace {
 
     collect_retired(false);
 
+    static std::uint32_t seen_recreate = 0;
+    const auto recreate = g_block->recreate_request.load(std::memory_order_acquire);
+    if (recreate != seen_recreate) {
+      seen_recreate = recreate;
+      log("The host asked for fresh capture textures");
+      retire_generation(hwnd);
+    }
+
     ID3D11Device *device = nullptr;
     if (FAILED(swapchain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void **>(&device)))) {
       if (!g_cap.reported_d3d12) {
@@ -665,6 +681,12 @@ namespace {
     const std::uint32_t color_space = swapchain_color_space(swapchain, g_cap.format);
 
     const int slot = acquire_free_slot();
+    if (slot == -2) {
+      log("A capture texture's keyed mutex was abandoned; recreating the textures");
+      retire_generation(hwnd);  // the next Present creates a fresh set
+      back->Release();
+      return;
+    }
     if (slot < 0) {
       g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       back->Release();

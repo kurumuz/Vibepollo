@@ -68,6 +68,11 @@ namespace platf::dxgi::game_capture {
     capture_e lock(frame_t &frame);
     void unlock();
 
+    /**
+     * @brief The hook's own counters, for the periodic log line.
+     */
+    std::string hook_stats() const;
+
   private:
     struct attach_job_t;
     struct target_t;
@@ -95,6 +100,12 @@ namespace platf::dxgi::game_capture {
      *         (caller falls back to desktop capture).
      */
     bool convert(ID3D11Device *device, ID3D11DeviceContext *context, const frame_t &frame, ID3D11Texture2D *target_texture, ID3D11RenderTargetView *target_rtv, DXGI_FORMAT target_format, float sdr_white_scale);
+
+    /**
+     * @brief Compile shaders and create resources ahead of the first frame
+     *        that needs them (never while holding the frame's mutexes).
+     */
+    bool prepare(ID3D11Device *device);
 
   private:
     bool init(ID3D11Device *device);

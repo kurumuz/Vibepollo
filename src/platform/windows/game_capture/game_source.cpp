@@ -605,6 +605,16 @@ namespace platf::dxgi::game_capture {
     return qpc_time_difference(static_cast<int64_t>(now), static_cast<int64_t>(publish_qpc)) < kFrameStaleAfter;
   }
 
+  std::string source_t::hook_stats() const {
+    const auto it = _targets.find(_current_pid);
+    if (it == _targets.end() || !it->second->attached || !it->second->block) {
+      return {};
+    }
+    const auto *b = it->second->block;
+    return "hook presented=" + std::to_string(b->frames_presented.load()) + " published=" + std::to_string(b->frames_published.load()) +
+           " skipped=" + std::to_string(b->frames_skipped.load());
+  }
+
   bool source_t::still_foreground(const RECT &capture_rect) const {
     if (!_current_pid) {
       return false;
@@ -726,17 +736,24 @@ namespace platf::dxgi::game_capture {
     if (!t || !t->attached || !t->frame_event) {
       return capture_e::error;
     }
-    // A frame published while we were busy has already consumed its event
-    if (t->block->latest.load(std::memory_order_acquire) != t->consumed_latest) {
-      return capture_e::ok;
-    }
-    switch (WaitForSingleObject(t->frame_event.get(), static_cast<DWORD>(std::clamp<long long>(timeout.count(), 0, 1000)))) {
-      case WAIT_OBJECT_0:
+    // The event is only a wake-up: it can be left over from a frame already
+    // consumed, so what decides is an unconsumed publication
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::clamp<long long>(timeout.count(), 0, 1000));
+    for (;;) {
+      if (t->block->latest.load(std::memory_order_acquire) != t->consumed_latest) {
         return capture_e::ok;
-      case WAIT_TIMEOUT:
+      }
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+      if (left.count() <= 0) {
         return capture_e::timeout;
-      default:
+      }
+      const DWORD r = WaitForSingleObject(t->frame_event.get(), static_cast<DWORD>(left.count()));
+      if (r == WAIT_TIMEOUT) {
+        return t->block->latest.load(std::memory_order_acquire) != t->consumed_latest ? capture_e::ok : capture_e::timeout;
+      }
+      if (r != WAIT_OBJECT_0) {
         return capture_e::error;
+      }
     }
   }
 
@@ -753,7 +770,14 @@ namespace platf::dxgi::game_capture {
       if (latest == 0 || latest == t->consumed_latest || slot >= static_cast<std::uint32_t>(gc::kSlots)) {
         return capture_e::timeout;
       }
-      if (t->mutexes[slot]->AcquireSync(0, 10) != S_OK) {
+      const HRESULT acquired = t->mutexes[slot]->AcquireSync(0, 10);
+      if (acquired == static_cast<HRESULT>(WAIT_ABANDONED)) {
+        t->mutexes[slot]->ReleaseSync(0);
+        BOOST_LOG(warning) << "Game capture: a shared texture's keyed mutex was abandoned; asking the hook for fresh textures";
+        t->block->recreate_request.fetch_add(1, std::memory_order_acq_rel);
+        return capture_e::timeout;
+      }
+      if (acquired != S_OK) {
         return capture_e::timeout;
       }
 
@@ -841,6 +865,13 @@ namespace platf::dxgi::game_capture {
       return f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM || is_srgb_format(f);
     }
   }  // namespace
+
+  bool converter_t::prepare(ID3D11Device *device) {
+    if (!_init_attempted && !init(device)) {
+      BOOST_LOG(error) << "Game capture: conversion shaders unavailable";
+    }
+    return _ready;
+  }
 
   bool converter_t::init(ID3D11Device *device) {
     _init_attempted = true;

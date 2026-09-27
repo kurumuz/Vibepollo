@@ -242,12 +242,22 @@ namespace platf::dxgi {
         _game_mode = game_active;
         BOOST_LOG(info) << "Game capture: " << (game_active ? "capturing from the game (" + _game_foreground.foreground_exe + ")" : std::string("back to desktop capture"));
       }
+      if (now - _game_stats_logged >= std::chrono::seconds(10)) {
+        if (_game_mode || _game_frames_delivered || _game_desktop_frames_in_game_mode) {
+          BOOST_LOG(info) << "Game capture: last 10 s delivered game=" << _game_frames_delivered
+                          << " desktop-while-eligible=" << _game_desktop_frames_in_game_mode << ' ' << _game_source->hook_stats();
+        }
+        _game_stats_logged = now;
+        _game_frames_delivered = 0;
+        _game_desktop_frames_in_game_mode = 0;
+      }
       if (game_active) {
         bool fall_back = false;
         const auto status = snapshot_game(pull_free_image_cb, img_out, effective_wgc_timeout(timeout, _config.framerate), fall_back);
         if (!fall_back) {
           return status;
         }
+        ++_game_desktop_frames_in_game_mode;
       }
     }
 
@@ -320,7 +330,10 @@ namespace platf::dxgi {
     HRESULT status = d3d_img->capture_mutex->AcquireSync(0, 3000);
     const auto capture_mutex_wait = std::chrono::steady_clock::now() - capture_mutex_wait_start;
     if (status == WAIT_ABANDONED) {
-      BOOST_LOG(error) << "Capture texture keyed mutex was abandoned; continuing with lock held";
+      // The shared surface is inconsistent: it must be recreated
+      d3d_img->capture_mutex->ReleaseSync(0);
+      BOOST_LOG(warning) << "Capture texture keyed mutex was abandoned; reinitializing capture";
+      return capture_e::reinit;
     } else if (status != S_OK) {
       BOOST_LOG(error) << "Failed to lock capture texture [0x"sv << util::hex(status).to_string_view() << ']';
       return capture_e::error;
@@ -442,11 +455,9 @@ namespace platf::dxgi {
       d3d_img->capture_mutex->ReleaseSync(0);
     });
 
-    // The waits above may have outlasted the game's foreground
-    if (!_game_source->still_foreground(captured_output_desc.DesktopCoordinates)) {
-      fall_back = true;
-      return capture_e::ok;
-    }
+    // First use compiles the conversion shaders: never with the game's
+    // frame locked
+    _game_converter->prepare(device.get());
 
     game_capture::frame_t frame;
     status = _game_source->lock(frame);  // rejects frames older than 250 ms
@@ -457,6 +468,13 @@ namespace platf::dxgi {
     auto unlock_game = util::fail_guard([&]() {
       _game_source->unlock();
     });
+
+    // Every wait is behind us: the frame is fresh (checked by lock), and the
+    // game must still be the focused fullscreen window right now
+    if (!_game_source->still_foreground(captured_output_desc.DesktopCoordinates)) {
+      fall_back = true;
+      return capture_e::ok;
+    }
 
     if (frame.width != static_cast<std::uint32_t>(width_before_rotation) || frame.height != static_cast<std::uint32_t>(height_before_rotation)) {
       const auto key = (static_cast<std::uint64_t>(frame.width) << 32) | frame.height;
@@ -492,6 +510,7 @@ namespace platf::dxgi {
     img->capture_pacing_timestamp = host_processing_timestamp;
     img_out = img;
     _last_cached_frame = img;
+    ++_game_frames_delivered;
     return capture_e::ok;
   }
 

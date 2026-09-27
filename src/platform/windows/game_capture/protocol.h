@@ -42,7 +42,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 3;
+  constexpr std::uint32_t kVersion = 4;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 160;
 
@@ -110,6 +110,7 @@ namespace game_capture {
 
     // Host -> hook
     std::atomic<std::uint32_t> capture_enabled;  ///< the hook copies only while non-zero
+    std::atomic<std::uint32_t> recreate_request;  ///< bumped by the host after an abandoned slot mutex: the hook recreates its textures
 
     // Hook -> host
     std::atomic<std::uint32_t> hook_state;  ///< hook_state_e
