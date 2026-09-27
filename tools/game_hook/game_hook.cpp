@@ -302,6 +302,7 @@ namespace {
     IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
     HANDLE shared_handles[gc::kSlots] = {};  // NT handles (owned); null with legacy sharing
     std::uint64_t legacy_handles[gc::kSlots] = {};  // global (KMT) share handles: not closable, live as long as the texture
+    bool owner_sync = false;  // no keyed mutexes: slots are guarded by shared_block_t::owner
     UINT width = 0;
     UINT height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -330,6 +331,7 @@ namespace {
       const auto value = g_cap.shared_handles[i] ? reinterpret_cast<std::uint64_t>(g_cap.shared_handles[i]) : g_cap.legacy_handles[i];
       b.setup.textures[i].store(valid ? value : 0, std::memory_order_relaxed);
     }
+    b.setup.sync.store(static_cast<std::uint32_t>(g_cap.owner_sync ? gc::sync_e::owner : gc::sync_e::keyed_mutex), std::memory_order_relaxed);
     b.setup.handle_kind.store(static_cast<std::uint32_t>(valid && g_cap.legacy_handles[0] ? gc::handle_kind_e::legacy : gc::handle_kind_e::nt), std::memory_order_relaxed);
     if (valid && g_cap.device) {
       IDXGIDevice *dxgi_device = nullptr;
@@ -444,6 +446,7 @@ namespace {
     std::memset(g_cap.mutexes, 0, sizeof(g_cap.mutexes));
     std::memset(g_cap.shared_handles, 0, sizeof(g_cap.shared_handles));
     std::memset(g_cap.legacy_handles, 0, sizeof(g_cap.legacy_handles));
+    g_cap.owner_sync = false;
     g_cap.width = g_cap.height = 0;
     g_cap.format = DXGI_FORMAT_UNKNOWN;
     g_cap.highest_fence_value_used = 0;
@@ -569,20 +572,27 @@ namespace {
     desc.Usage = D3D11_USAGE_DEFAULT;
 
     // Preferred: NT handles (duplicated by the host, never globally
-    // guessable). Some devices refuse NT-handle sharing (E_INVALIDARG), so
-    // fall back to the legacy global handles every capture tool uses. The
-    // hook only copies into these, so the render-target bind is optional.
+    // guessable) with keyed mutexes. Some devices refuse NT handles, so fall
+    // back to the legacy global handles; some refuse keyed mutexes entirely
+    // (NieR:Automata), so fall back to plain shared textures guarded by the
+    // owner words, which needs the fence (publish only after the copy
+    // completed). The hook only copies into these, so the render-target
+    // bind is optional.
     struct variant_t {
       bool nt;
+      bool keyed;
       UINT bind;
       const char *name;
     };
     constexpr variant_t variants[] = {
-      {true, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, "nt/rtv"},
-      {true, D3D11_BIND_SHADER_RESOURCE, "nt"},
-      {false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, "kmt/rtv"},
-      {false, D3D11_BIND_SHADER_RESOURCE, "kmt"},
+      {true, true, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, "nt/rtv"},
+      {true, true, D3D11_BIND_SHADER_RESOURCE, "nt"},
+      {false, true, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, "kmt/rtv"},
+      {false, true, D3D11_BIND_SHADER_RESOURCE, "kmt"},
+      {true, false, D3D11_BIND_SHADER_RESOURCE, "nt/nokm"},
+      {false, false, D3D11_BIND_SHADER_RESOURCE, "kmt/nokm"},
     };
+    const bool have_fence = g_cap.fence && g_cap.context4;
 
     auto release_partial = [] {
       for (int j = 0; j < gc::kSlots; ++j) {
@@ -596,8 +606,11 @@ namespace {
     char failures[gc::kErrorLength] = {};
     const variant_t *used = nullptr;
     for (const auto &v : variants) {
+      if (!v.keyed && !have_fence) {
+        continue;
+      }
       desc.BindFlags = v.bind;
-      desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | (v.nt ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0);
+      desc.MiscFlags = (v.keyed ? D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX : D3D11_RESOURCE_MISC_SHARED) | (v.nt ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0);
       const char *step = nullptr;
       HRESULT hr = S_OK;
       int failed_slot = 0;
@@ -605,7 +618,7 @@ namespace {
         failed_slot = i;
         step = "create";
         hr = g_cap.device->CreateTexture2D(&desc, nullptr, &g_cap.textures[i]);
-        if (SUCCEEDED(hr)) {
+        if (SUCCEEDED(hr) && v.keyed) {
           step = "keyedmutex";
           hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&g_cap.mutexes[i]));
         }
@@ -636,6 +649,7 @@ namespace {
       }
       if (SUCCEEDED(hr)) {
         used = &v;
+        g_cap.owner_sync = !v.keyed;
         break;
       }
       log("Capture texture variant %s (%ux%u fmt %d) failed at %s of slot %d: 0x%08lx", v.name, desc.Width, desc.Height, desc.Format, step, failed_slot, hr);
@@ -675,7 +689,7 @@ namespace {
       return false;
     }
     if (used != &variants[0]) {
-      log("Capture textures use %s sharing (device FL %x, flags %x)", used->name, g_cap.device->GetFeatureLevel(), g_cap.device->GetCreationFlags());
+      log("Capture textures use %s sharing%s (device FL %x, flags %x)", used->name, g_cap.owner_sync ? " without keyed mutexes (owner words)" : "", g_cap.device->GetFeatureLevel(), g_cap.device->GetCreationFlags());
     }
 
     g_cap.width = back.Width;
@@ -705,6 +719,14 @@ namespace {
   int acquire_free_slot() {
     for (int i = 0; i < gc::kSlots; ++i) {
       if (word_state(g_slots[i].word.load(std::memory_order_acquire)) != st_free) {
+        continue;
+      }
+      if (g_cap.owner_sync) {
+        // The host may still be reading the pixels it last locked here
+        auto expected = gc::kOwnerNone;
+        if (g_block->owner[i].compare_exchange_strong(expected, gc::kOwnerHook, std::memory_order_acq_rel)) {
+          return i;
+        }
         continue;
       }
       const HRESULT hr = g_cap.mutexes[i]->AcquireSync(0, 0);
@@ -815,7 +837,13 @@ namespace {
     } else {
       g_cap.context->CopyResource(g_cap.textures[slot], back);
     }
-    g_cap.mutexes[slot]->ReleaseSync(0);
+    if (g_cap.owner_sync) {
+      // The copy is still in flight, but the host takes only a published
+      // slot, and this one publishes after its fence completes
+      g_block->owner[slot].store(gc::kOwnerNone, std::memory_order_release);
+    } else {
+      g_cap.mutexes[slot]->ReleaseSync(0);
+    }
     back->Release();
 
     // The submission: fields first, then the pending word (release)

@@ -429,6 +429,13 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<ID3D11Texture2D> textures[gc::kSlots];
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC texture_desc {};
+    gc::sync_e sync = gc::sync_e::keyed_mutex;  // of the opened generation
+
+    // sync_e::owner: slots whose owner word we hold until our reads of them
+    // (the conversion draw) completed on the GPU
+    winrt::com_ptr<ID3D11Query> read_done[gc::kSlots];
+    bool held[gc::kSlots] = {};
+    bool reset_owners = true;  // first open by this host: clear claims a previous host left behind
 
     std::uint64_t consumed_latest = 0;
     std::uint64_t consumed_frame_id = 0;
@@ -448,7 +455,7 @@ namespace platf::dxgi::game_capture {
     }
 
     // Reads the setup consistently (seqlock)
-    bool read_setup(std::uint32_t &generation, std::uint64_t handles[gc::kSlots], std::uint32_t &handle_kind, LUID &luid, std::uint32_t &width, std::uint32_t &height) const {
+    bool read_setup(std::uint32_t &generation, std::uint64_t handles[gc::kSlots], std::uint32_t &handle_kind, std::uint32_t &sync, LUID &luid, std::uint32_t &width, std::uint32_t &height) const {
       for (int attempt = 0; attempt < 8; ++attempt) {
         const auto s1 = block->setup_seq.load(std::memory_order_acquire);
         if (s1 & 1u) {
@@ -459,6 +466,7 @@ namespace platf::dxgi::game_capture {
           handles[i] = block->setup.textures[i].load(std::memory_order_relaxed);
         }
         handle_kind = block->setup.handle_kind.load(std::memory_order_relaxed);
+        sync = block->setup.sync.load(std::memory_order_relaxed);
         luid.LowPart = block->setup.adapter_luid_low.load(std::memory_order_relaxed);
         luid.HighPart = block->setup.adapter_luid_high.load(std::memory_order_relaxed);
         width = block->setup.width.load(std::memory_order_relaxed);
@@ -474,6 +482,7 @@ namespace platf::dxgi::game_capture {
 
   source_t::source_t(ID3D11Device *device) {
     device->QueryInterface(__uuidof(ID3D11Device1), _device.put_void());
+    device->GetImmediateContext(_context.put());
     if (winrt::com_ptr<IDXGIDevice> dxgi_device; SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), dxgi_device.put_void()))) {
       winrt::com_ptr<IDXGIAdapter> adapter;
       if (SUCCEEDED(dxgi_device->GetAdapter(adapter.put()))) {
@@ -486,6 +495,11 @@ namespace platf::dxgi::game_capture {
 
   source_t::~source_t() {
     unlock();
+    for (auto &[pid, t] : _targets) {
+      if (t->attached && t->block && !t->exited()) {
+        release_reads(*t, true);
+      }
+    }
   }
 
   source_t::target_t *source_t::current() {
@@ -532,6 +546,11 @@ namespace platf::dxgi::game_capture {
       return false;
     }
     reap_exited();
+    for (auto &[pid, t] : _targets) {
+      if (t->attached && t->block) {
+        release_reads(*t, false);
+      }
+    }
 
     const bool eligible = foreground.valid_window && !foreground.shell_window && foreground.fullscreen_on_capture_display && foreground.foreground_pid != 0;
     const DWORD pid = eligible ? foreground.foreground_pid : 0;
@@ -604,10 +623,10 @@ namespace platf::dxgi::game_capture {
       return false;
     }
 
-    std::uint32_t generation, handle_kind, width, height;
+    std::uint32_t generation, handle_kind, sync, width, height;
     std::uint64_t handles[gc::kSlots];
     LUID luid;
-    if (!t.read_setup(generation, handles, handle_kind, luid, width, height)) {
+    if (!t.read_setup(generation, handles, handle_kind, sync, luid, width, height)) {
       return false;
     }
     if (generation != t.opened_generation && !open_generation(t)) {
@@ -652,10 +671,10 @@ namespace platf::dxgi::game_capture {
   }
 
   bool source_t::open_generation(target_t &t) {
-    std::uint32_t generation, handle_kind, width, height;
+    std::uint32_t generation, handle_kind, sync, width, height;
     std::uint64_t handles[gc::kSlots];
     LUID luid;
-    if (!t.read_setup(generation, handles, handle_kind, luid, width, height)) {
+    if (!t.read_setup(generation, handles, handle_kind, sync, luid, width, height)) {
       return false;
     }
     if (width == 0 || height == 0) {
@@ -684,6 +703,11 @@ namespace platf::dxgi::game_capture {
       t.give_up("the hook reported an unknown texture handle kind");
       return false;
     }
+    if (sync != static_cast<std::uint32_t>(gc::sync_e::keyed_mutex) && sync != static_cast<std::uint32_t>(gc::sync_e::owner)) {
+      t.give_up("the hook reported an unknown slot synchronization");
+      return false;
+    }
+    const bool owner_sync = sync == static_cast<std::uint32_t>(gc::sync_e::owner);
 
     if (!t.frame_event) {
       t.frame_event.attach(duplicate(t.block->frame_event.load(std::memory_order_relaxed)));
@@ -718,7 +742,7 @@ namespace platf::dxgi::game_capture {
         BOOST_LOG(warning) << "Game capture: cannot open shared texture " << i << " [0x" << util::hex(hr).to_string_view() << ']';
         return false;
       }
-      if (const HRESULT qi = textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), mutexes[i].put_void()); FAILED(qi)) {
+      if (const HRESULT qi = owner_sync ? S_OK : textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), mutexes[i].put_void()); FAILED(qi)) {
         BOOST_LOG(warning) << "Game capture: shared texture " << i << " has no keyed mutex [0x" << util::hex(qi).to_string_view() << ']';
         return false;
       }
@@ -749,17 +773,39 @@ namespace platf::dxgi::game_capture {
       return false;  // setup moved on while opening; the next call retries
     }
     // The setup must not have changed underneath the handles we opened
-    std::uint32_t generation2, handle_kind2, width2, height2;
+    std::uint32_t generation2, handle_kind2, sync2, width2, height2;
     std::uint64_t handles2[gc::kSlots];
     LUID luid2;
-    if (!t.read_setup(generation2, handles2, handle_kind2, luid2, width2, height2) || generation2 != generation) {
+    if (!t.read_setup(generation2, handles2, handle_kind2, sync2, luid2, width2, height2) || generation2 != generation) {
       return false;
+    }
+
+    if (owner_sync) {
+      for (int i = 0; i < gc::kSlots; ++i) {
+        if (!t.read_done[i]) {
+          const D3D11_QUERY_DESC query_desc {D3D11_QUERY_EVENT, 0};
+          if (FAILED(_device->CreateQuery(&query_desc, t.read_done[i].put()))) {
+            BOOST_LOG(warning) << "Game capture: cannot create a GPU event query";
+            return false;
+          }
+        }
+      }
+      if (t.reset_owners) {
+        // Claims only this host makes; one left by a host that died holding
+        // a slot would otherwise keep that slot from the hook forever
+        for (int i = 0; i < gc::kSlots; ++i) {
+          auto expected = gc::kOwnerHost;
+          t.block->owner[i].compare_exchange_strong(expected, gc::kOwnerNone, std::memory_order_acq_rel);
+        }
+        t.reset_owners = false;
+      }
     }
 
     for (int i = 0; i < gc::kSlots; ++i) {
       t.textures[i] = std::move(textures[i]);
       t.mutexes[i] = std::move(mutexes[i]);
     }
+    t.sync = owner_sync ? gc::sync_e::owner : gc::sync_e::keyed_mutex;
     t.texture_desc = desc;
     t.opened_generation = generation;
     t.open_failures = 0;
@@ -806,16 +852,33 @@ namespace platf::dxgi::game_capture {
       if (latest == 0 || latest == t->consumed_latest || slot >= static_cast<std::uint32_t>(gc::kSlots)) {
         return capture_e::timeout;
       }
-      const HRESULT acquired = t->mutexes[slot]->AcquireSync(0, 10);
-      if (acquired == static_cast<HRESULT>(WAIT_ABANDONED)) {
-        t->mutexes[slot]->ReleaseSync(0);
-        BOOST_LOG(warning) << "Game capture: a shared texture's keyed mutex was abandoned; asking the hook for fresh textures";
-        t->block->recreate_request.fetch_add(1, std::memory_order_acq_rel);
-        return capture_e::timeout;
+      const bool owner_sync = t->sync == gc::sync_e::owner;
+      if (owner_sync) {
+        // Never waits: the hook holds a slot's word only while submitting
+        auto expected = gc::kOwnerNone;
+        if (!t->block->owner[slot].compare_exchange_strong(expected, gc::kOwnerHost, std::memory_order_acq_rel)) {
+          return capture_e::timeout;
+        }
+      } else {
+        const HRESULT acquired = t->mutexes[slot]->AcquireSync(0, 10);
+        if (acquired == static_cast<HRESULT>(WAIT_ABANDONED)) {
+          t->mutexes[slot]->ReleaseSync(0);
+          BOOST_LOG(warning) << "Game capture: a shared texture's keyed mutex was abandoned; asking the hook for fresh textures";
+          t->block->recreate_request.fetch_add(1, std::memory_order_acq_rel);
+          return capture_e::timeout;
+        }
+        if (acquired != S_OK) {
+          return capture_e::timeout;
+        }
       }
-      if (acquired != S_OK) {
-        return capture_e::timeout;
-      }
+      // Nothing read yet: giving the slot back needs no GPU wait
+      auto release = [&]() {
+        if (owner_sync) {
+          t->block->owner[slot].store(gc::kOwnerNone, std::memory_order_release);
+        } else {
+          t->mutexes[slot]->ReleaseSync(0);
+        }
+      };
 
       // The slot's own record, now that we hold its pixels: it must still
       // carry the published version, and belong to the textures we opened
@@ -824,27 +887,34 @@ namespace platf::dxgi::game_capture {
       std::uint64_t frame_id, present_qpc, gpu_done_qpc;
       const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc);
       if (!valid || record_version != version) {
-        t->mutexes[slot]->ReleaseSync(0);
+        release();
         if (!valid) {
           return capture_e::timeout;
         }
         continue;  // rewritten meanwhile: a newer publication exists
       }
       if (generation != t->opened_generation) {
-        t->mutexes[slot]->ReleaseSync(0);
+        release();
         if (!open_generation(*t)) {
           return capture_e::timeout;
         }
         continue;
       }
+      // Without a keyed mutex only the hook's fence orders its copy before
+      // our read: a frame it could not time is not used
+      if (owner_sync && gpu_done_qpc == 0) {
+        release();
+        t->consumed_latest = latest;
+        return capture_e::timeout;
+      }
       if (frame_id <= t->consumed_frame_id) {
-        t->mutexes[slot]->ReleaseSync(0);
+        release();
         t->consumed_latest = latest;
         return capture_e::timeout;
       }
       // A frame that sat unconsumed (a long pool wait) is not shown late
       if (qpc_time_difference(qpc_counter(), static_cast<int64_t>(present_qpc)) > kFrameStaleAfter) {
-        t->mutexes[slot]->ReleaseSync(0);
+        release();
         t->consumed_latest = latest;
         return capture_e::timeout;
       }
@@ -869,10 +939,38 @@ namespace platf::dxgi::game_capture {
     if (_locked_slot < 0) {
       return;
     }
-    if (auto *t = current(); t && t->mutexes[_locked_slot]) {
+    if (auto *t = current(); t && t->sync == gc::sync_e::owner) {
+      // Our conversion draw may still be reading the slot: keep its owner
+      // word until the GPU passes this point
+      _context->End(t->read_done[_locked_slot].get());
+      t->held[_locked_slot] = true;
+    } else if (t && t->mutexes[_locked_slot]) {
       t->mutexes[_locked_slot]->ReleaseSync(0);
     }
     _locked_slot = -1;
+  }
+
+  void source_t::release_reads(target_t &t, bool wait) {
+    const auto deadline = std::chrono::steady_clock::now() + 100ms;
+    for (int i = 0; i < gc::kSlots; ++i) {
+      if (!t.held[i]) {
+        continue;
+      }
+      for (;;) {
+        const HRESULT hr = _context->GetData(t.read_done[i].get(), nullptr, 0, 0);  // flushes if the query is still unsubmitted
+        if (hr != S_FALSE || !wait || std::chrono::steady_clock::now() > deadline) {
+          // S_OK: reads done. An error (device removed) will not complete
+          // either way. A bounded wait that ran out releases anyway: at
+          // worst the hook overwrites pixels already read
+          if (hr != S_FALSE || wait) {
+            t.block->owner[i].store(gc::kOwnerNone, std::memory_order_release);
+            t.held[i] = false;
+          }
+          break;
+        }
+        std::this_thread::yield();
+      }
+    }
   }
 
   // ---- conversion --------------------------------------------------------

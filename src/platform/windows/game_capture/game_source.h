@@ -22,7 +22,7 @@
 namespace platf::dxgi::game_capture {
 
   struct frame_t {
-    ID3D11Texture2D *texture = nullptr;  ///< keyed mutex held until source_t::unlock()
+    ID3D11Texture2D *texture = nullptr;  ///< slot held (keyed mutex or owner word) until source_t::unlock()
     std::uint32_t width = 0;  ///< from the opened texture, not the shared block
     std::uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -78,10 +78,12 @@ namespace platf::dxgi::game_capture {
     struct target_t;
 
     void reap_exited();
+    void release_reads(target_t &target, bool wait);
     bool open_generation(target_t &target);
     target_t *current();
 
     winrt::com_ptr<ID3D11Device1> _device;
+    winrt::com_ptr<ID3D11DeviceContext> _context;  // the capture thread's immediate context
     LUID _adapter_luid {};
     std::map<DWORD, std::unique_ptr<target_t>> _targets;
     DWORD _current_pid = 0;

@@ -15,6 +15,11 @@
  *  3. The host duplicates the hook's NT handles out of the game process and
  *     reads the published slot.
  *
+ * Without keyed mutexes (sync_e::owner) the per-slot owner word takes the
+ * mutex's place: the hook claims a free slot's word before rewriting it, the
+ * host claims the published slot's word before reading it, and each releases
+ * only when its own GPU work on the slot is complete.
+ *
  * Slot protocol (three slots: free, pending, published):
  *  - The hook's render thread writes only a FREE slot, taking its keyed
  *    mutex with a zero timeout; if none is free or the mutex is held, the
@@ -42,7 +47,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 5;
+  constexpr std::uint32_t kVersion = 6;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 160;
 
@@ -79,6 +84,18 @@ namespace game_capture {
     legacy = 1,  ///< global (KMT) share handles, opened directly (for devices that refuse NT-handle sharing)
   };
 
+  // How a slot's pixels are guarded between the hook's copy and the host's read
+  enum class sync_e : std::uint32_t {
+    keyed_mutex = 0,  ///< a DXGI keyed mutex per texture (GPU-ordered)
+    owner = 1,  ///< shared_block_t::owner, for devices that cannot create keyed-mutex textures. The hook publishes only
+                ///< after its fence saw the copy complete; the host releases a slot only after its own reads completed.
+  };
+
+  // shared_block_t::owner values
+  constexpr std::uint32_t kOwnerNone = 0;
+  constexpr std::uint32_t kOwnerHook = 1;  ///< rewriting the slot's record and submitting its copy
+  constexpr std::uint32_t kOwnerHost = 2;  ///< reading the slot (until its GPU reads completed)
+
   // Texture setup for one generation (rewritten on every resize / device
   // change), published as a unit under setup_seq. The hook keeps a retired
   // generation's handles (NT) or textures (legacy) for a two-second grace
@@ -94,6 +111,7 @@ namespace game_capture {
     std::atomic<std::int32_t> adapter_luid_high;
     std::atomic<std::uint64_t> hwnd;  ///< the swapchain's output window
     std::atomic<std::uint32_t> handle_kind;  ///< handle_kind_e
+    std::atomic<std::uint32_t> sync;  ///< sync_e
     std::atomic<std::uint64_t> textures[kSlots];  ///< handle values, see handle_kind (0 = none)
   };
 
@@ -129,6 +147,7 @@ namespace game_capture {
     setup_t setup;
 
     slot_record_t slots[kSlots];
+    std::atomic<std::uint32_t> owner[kSlots];  ///< kOwner*, claimed by compare-exchange from kOwnerNone (sync_e::owner only)
     std::atomic<std::uint64_t> latest;  ///< make_latest(slot, version) of the published frame; 0 = none. Single writer.
 
     // Statistics
