@@ -818,6 +818,20 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<ID3D11Texture2D> textures[gc::kSlots];
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC desc {};
+    // A recycled handle during a resize storm fails like a bad texture, so a
+    // setup is retried a few times before the hook is taken to be wrong;
+    // true once it has been retried enough (then the target gave up)
+    auto count_failure = [&](const std::string &why) {
+      if (t.open_failures_generation != generation) {
+        t.open_failures_generation = generation;
+        t.open_failures = 0;
+      }
+      if (++t.open_failures >= 8) {
+        t.give_up(why);
+        return true;
+      }
+      return false;
+    };
     for (int i = 0; i < gc::kSlots; ++i) {
       HRESULT hr;
       if (handle_kind == static_cast<std::uint32_t>(gc::handle_kind_e::legacy)) {
@@ -835,7 +849,7 @@ namespace platf::dxgi::game_capture {
         hr = _device->OpenSharedResource1(shared.get(), __uuidof(ID3D11Texture2D), textures[i].put_void());
       }
       if (FAILED(hr)) {
-        BOOST_LOG(warning) << "Game capture: cannot open shared texture " << i << " [0x" << util::hex(hr).to_string_view() << ']';
+        count_failure("cannot open the hook's shared texture " + std::to_string(i) + " [0x" + std::string(util::hex(hr).to_string_view()) + ']');
         return false;
       }
       if (const HRESULT qi = owner_sync ? S_OK : textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), mutexes[i].put_void()); FAILED(qi)) {
@@ -849,16 +863,7 @@ namespace platf::dxgi::game_capture {
       const bool keyed = (this_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) != 0;
       if (this_desc.MipLevels != 1 || this_desc.ArraySize != 1 || this_desc.SampleDesc.Count != 1 ||
           !(this_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) || this_desc.Width == 0 || this_desc.Height == 0 || keyed == owner_sync) {
-        // A recycled handle during a resize storm looks like this too, so
-        // retry a few times against the same setup before concluding the
-        // hook is misbehaving
-        if (t.open_failures_generation != generation) {
-          t.open_failures_generation = generation;
-          t.open_failures = 0;
-        }
-        if (++t.open_failures >= 8) {
-          t.give_up("the hook's texture has an unexpected shape");
-        }
+        count_failure("the hook's texture has an unexpected shape");
         return false;
       }
       if (i == 0) {
@@ -1132,9 +1137,16 @@ namespace platf::dxgi::game_capture {
     return true;
   }
 
-  bool converter_t::convert(ID3D11Device *device, ID3D11DeviceContext *context, const frame_t &frame, ID3D11Texture2D *target_texture, ID3D11RenderTargetView *target_rtv, DXGI_FORMAT target_format, float sdr_white_scale) {
+  bool converter_t::convert(ID3D11Device *device, ID3D11DeviceContext *context, const frame_t &frame, ID3D11Texture2D *target_texture, ID3D11RenderTargetView *target_rtv, DXGI_FORMAT target_format, float sdr_white_scale, bool display_hdr) {
     using cs = gc::color_space_e;
-    if (frame.color_space == cs::unknown) {
+    auto color_space = frame.color_space;
+    // A 10-bit swapchain is unknown when the hook missed the game's
+    // SetColorSpace1. A display not in HDR mode shows it as SDR whatever the
+    // game asked for, so on one that is what it is.
+    if (color_space == cs::unknown && frame.format == DXGI_FORMAT_R10G10B10A2_UNORM && !display_hdr) {
+      color_space = cs::srgb;
+    }
+    if (color_space == cs::unknown) {
       return false;
     }
 
@@ -1142,17 +1154,17 @@ namespace platf::dxgi::game_capture {
     bool plain_copy = false;
     if (target_format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
       // HDR (advanced color) desktop: scRGB, as the compositor would emit
-      if (frame.color_space == cs::scrgb) {
+      if (color_space == cs::scrgb) {
         plain_copy = frame.format == target_format;
         mode = kModeCopy;
-      } else if (frame.color_space == cs::hdr10) {
+      } else if (color_space == cs::hdr10) {
         mode = kModePqToScrgb;
       } else {
         mode = is_srgb_format(frame.format) ? kModeLinearScale : kModeSrgbToScrgb;
       }
     } else if (is_8bit_unorm(target_format) || target_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
       // SDR desktop: only SDR games map onto it
-      if (frame.color_space != cs::srgb) {
+      if (color_space != cs::srgb) {
         return false;
       }
       plain_copy = frame.format == target_format;
