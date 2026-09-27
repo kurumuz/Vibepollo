@@ -1234,8 +1234,10 @@ namespace {
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    // Simultaneous access: the supported baseline for textures D3D11 opens
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    // D3D11 opens a D3D12 shared texture only if it allows render targets
+    // (OpenSharedResource1 is E_INVALIDARG otherwise, whatever the format:
+    // tested on genwin); simultaneous access spares us barriers on it
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
 
     const char *step = nullptr;
     HRESULT hr = S_OK;
