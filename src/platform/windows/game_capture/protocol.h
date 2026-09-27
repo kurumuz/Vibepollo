@@ -16,9 +16,19 @@
  *     reads the published slot.
  *
  * Without keyed mutexes (sync_e::owner) the per-slot owner word takes the
- * mutex's place: the hook claims a free slot's word before rewriting it, the
- * host claims the published slot's word before reading it, and each releases
- * only when its own GPU work on the slot is complete.
+ * mutex's place: the hook claims a free slot's word while it rewrites the
+ * record and submits the copy (the copy may still be running when it lets
+ * go: the slot publishes only after the hook's fence saw it complete, and a
+ * host that claims it before then finds a record version that is not the
+ * published one). The host claims the published slot's word before reading
+ * it and lets go only once its own GPU reads of it completed. One host at a
+ * time: host_lock names it.
+ *
+ * Frame limiter: while limiter_period_ps is non-zero and host_heartbeat_qpc
+ * is recent, the hook paces the game from inside Present (front edge: it
+ * waits after the real Present returns, so the game starts its next frame,
+ * and samples input, right at the release time). Each frame's record carries
+ * the release that started it.
  *
  * Slot protocol (three slots: free, pending, published):
  *  - The hook's render thread writes only a FREE slot, taking its keyed
@@ -47,9 +57,15 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 6;
+  constexpr std::uint32_t kVersion = 7;
   constexpr int kSlots = 3;
-  constexpr std::size_t kErrorLength = 160;
+  constexpr std::size_t kErrorLength = 320;
+
+  // Limiter periods the hook accepts (1000 fps .. 10 fps)
+  constexpr std::uint64_t kMinLimiterPeriodPs = 1'000'000'000ull;
+  constexpr std::uint64_t kMaxLimiterPeriodPs = 100'000'000'000ull;
+  // The limiter stops when the host has not refreshed its heartbeat this long
+  constexpr std::uint64_t kHeartbeatTimeoutMs = 2000;
 
   inline void shared_block_name(wchar_t *buffer, std::size_t count, std::uint32_t pid) {
     // Versioned: a mapping left by an earlier implementation (other layout,
@@ -124,6 +140,7 @@ namespace game_capture {
     std::atomic<std::uint64_t> frame_id;
     std::atomic<std::uint64_t> present_qpc;  ///< QueryPerformanceCounter at the game's Present()
     std::atomic<std::uint64_t> gpu_done_qpc;  ///< written by the completion thread just before publishing (0 = no fence)
+    std::atomic<std::uint64_t> release_qpc;  ///< the limiter release that started this frame (0 = not paced)
   };
 
   inline std::uint64_t make_latest(std::uint32_t slot, std::uint32_t version) {
@@ -137,6 +154,9 @@ namespace game_capture {
     // Host -> hook
     std::atomic<std::uint32_t> capture_enabled;  ///< the hook copies only while non-zero
     std::atomic<std::uint32_t> recreate_request;  ///< bumped by the host after an abandoned slot mutex: the hook recreates its textures
+    std::atomic<std::uint64_t> host_lock;  ///< (host pid << 32) | host instance of the one host reading this block; 0 = none
+    std::atomic<std::uint64_t> host_heartbeat_qpc;  ///< refreshed by the host while it streams; the limiter stops when it goes stale
+    std::atomic<std::uint64_t> limiter_period_ps;  ///< frame period the hook paces the game at, picoseconds; 0 = no limiter
 
     // Hook -> host
     std::atomic<std::uint32_t> hook_state;  ///< hook_state_e
@@ -154,6 +174,10 @@ namespace game_capture {
     std::atomic<std::uint64_t> frames_presented;
     std::atomic<std::uint64_t> frames_published;
     std::atomic<std::uint64_t> frames_skipped;  ///< no free slot / mutex held / another thread capturing
+    std::atomic<std::uint64_t> limiter_waits;  ///< Presents the limiter paced
+    std::atomic<std::uint64_t> limiter_late;  ///< ... that arrived after their release time (no wait)
+    std::atomic<std::uint64_t> limiter_resets;  ///< ... so late the release grid restarted
+    std::atomic<std::uint64_t> limiter_wait_us;  ///< total time spent waiting
 
     char last_error[kErrorLength];  ///< the host copies at most kErrorLength bytes and terminates locally
   };

@@ -44,6 +44,7 @@
 #include <d3d11on12.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdarg>
@@ -312,6 +313,7 @@ namespace {
   };
 
   capture_t g_cap;
+  std::atomic<IDXGISwapChain *> g_captured_swapchain {nullptr};  // g_cap.swapchain, readable without the capture lock
 
   ID3D11Fence *current_fence() {
     return g_cap.fence;
@@ -469,6 +471,7 @@ namespace {
     safe_release(g_cap.context);
     safe_release(g_cap.device);
     g_cap.swapchain = nullptr;
+    g_captured_swapchain.store(nullptr, std::memory_order_release);
     g_cap.owner_thread = 0;
     g_cap.single_threaded = false;
   }
@@ -479,6 +482,7 @@ namespace {
     }
     release_capture(hwnd);
     g_cap.swapchain = swapchain;
+    g_captured_swapchain.store(swapchain, std::memory_order_release);
     device->AddRef();
     g_cap.device = device;
     device->GetImmediateContext(&g_cap.context);
@@ -741,7 +745,7 @@ namespace {
     return -1;
   }
 
-  void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc) {
+  void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc, std::uint64_t release_qpc) {
     g_block->frames_presented.fetch_add(1, std::memory_order_relaxed);
     if (!g_block->capture_enabled.load(std::memory_order_acquire)) {
       return;
@@ -828,6 +832,7 @@ namespace {
     record.color_space.store(color_space, std::memory_order_relaxed);
     record.frame_id.store(frame_id, std::memory_order_relaxed);
     record.present_qpc.store(present_qpc, std::memory_order_relaxed);
+    record.release_qpc.store(release_qpc, std::memory_order_relaxed);
     record.gpu_done_qpc.store(0, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     record.seq.store(seq + 2, std::memory_order_release);
@@ -863,6 +868,11 @@ namespace {
       g_cap.highest_fence_value_used = s.fence_value;
       signalled = SUCCEEDED(g_cap.context4->Signal(g_cap.fence, s.fence_value)) &&
                   SUCCEEDED(g_cap.fence->SetEventOnCompletion(s.fence_value, s.done_event));
+      if (signalled && g_cap.owner_sync) {
+        // Without a keyed mutex nothing else submits the copy: a shared
+        // resource's writer must flush (OpenSharedResource)
+        g_cap.context->Flush();
+      }
     }
     if (!signalled) {
       if (s.fence_value) {
@@ -882,6 +892,150 @@ namespace {
     }
   }
 
+
+  // ---- frame limiter -------------------------------------------------------
+  //
+  // Front edge: the wait comes AFTER the real Present returns, so the game
+  // starts its next frame, and samples input, at the release time, and its
+  // next Present (where we capture) follows as soon as that frame is
+  // rendered. A limiter that waits before Present (RTSS async) holds a
+  // finished frame instead: its content ages by the whole wait.
+  //
+  // One swapchain is paced: the one being captured when it presents, else
+  // the first to present (re-chosen once it has been idle for half a
+  // second). A second thread presenting meanwhile never waits here.
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+  #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+  struct limiter_t {
+    std::atomic<IDXGISwapChain *> swapchain {nullptr};  // identity only
+    std::atomic<std::uint64_t> last_present_qpc {0};
+    SRWLOCK lock = SRWLOCK_INIT;  // next_release
+    double next_release = 0;  // QPC of the current release point; 0 = no grid yet
+    std::atomic<std::uint64_t> release_qpc {0};  // the release that started the frame now being rendered
+  };
+
+  limiter_t g_limiter;
+  thread_local HANDLE t_limiter_timer = nullptr;
+
+  // The period to pace at, in QPC ticks; 0 while the limiter is off (no
+  // period, or the host stopped refreshing its heartbeat)
+  double limiter_period_qpc(std::uint64_t now) {
+    const auto period_ps = g_block->limiter_period_ps.load(std::memory_order_acquire);
+    if (period_ps < gc::kMinLimiterPeriodPs || period_ps > gc::kMaxLimiterPeriodPs) {
+      return 0;
+    }
+    const auto heartbeat = g_block->host_heartbeat_qpc.load(std::memory_order_acquire);
+    const auto timeout = gc::kHeartbeatTimeoutMs * qpc_frequency() / 1000;
+    if (heartbeat == 0 || now > heartbeat + timeout || heartbeat > now + timeout) {
+      return 0;
+    }
+    return static_cast<double>(period_ps) * 1e-12 * static_cast<double>(qpc_frequency());
+  }
+
+  bool limiter_paces(IDXGISwapChain *swapchain, std::uint64_t now) {
+    auto *current = g_limiter.swapchain.load(std::memory_order_acquire);
+    if (current != swapchain) {
+      const bool captured = g_captured_swapchain.load(std::memory_order_acquire) == swapchain;
+      const bool idle = !current || now - g_limiter.last_present_qpc.load(std::memory_order_relaxed) > qpc_frequency() / 2;
+      if (!captured && !idle) {
+        return false;
+      }
+      g_limiter.swapchain.store(swapchain, std::memory_order_release);
+    }
+    g_limiter.last_present_qpc.store(now, std::memory_order_relaxed);
+    return true;
+  }
+
+  void limiter_reset() {
+    if (TryAcquireSRWLockExclusive(&g_limiter.lock)) {
+      g_limiter.next_release = 0;
+      ReleaseSRWLockExclusive(&g_limiter.lock);
+    }
+    g_limiter.release_qpc.store(0, std::memory_order_relaxed);
+  }
+
+  // A high-resolution waitable timer for all but the last millisecond (its
+  // wakeups land within ~0.5 ms), then a spin to the exact point
+  void sleep_until(std::uint64_t target) {
+    const auto freq = qpc_frequency();
+    const auto spin = freq / 1000;
+    const auto now = qpc_now();
+    if (target > now + spin) {
+      if (!t_limiter_timer) {
+        t_limiter_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!t_limiter_timer) {
+          t_limiter_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);  // before Windows 10 1803
+        }
+      }
+      const auto ticks = target - spin - now;
+      LARGE_INTEGER due;
+      due.QuadPart = -static_cast<LONGLONG>(ticks * 10'000'000ull / freq);  // relative, 100 ns units
+      if (t_limiter_timer && due.QuadPart < 0 && SetWaitableTimer(t_limiter_timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(t_limiter_timer, 1000);
+      } else {
+        Sleep(static_cast<DWORD>(ticks * 1000 / freq));
+      }
+    }
+    while (qpc_now() < target) {
+      YieldProcessor();
+    }
+  }
+
+  // After the real Present of the paced swapchain: wait for the next release
+  // point. The grid survives a frame that is a little late (the release is
+  // then immediate) and restarts from now after a longer stall, so a slow
+  // stretch never turns into a burst of catch-up frames.
+  void limiter_wait(double period) {
+    if (!TryAcquireSRWLockExclusive(&g_limiter.lock)) {
+      return;
+    }
+    const auto now = qpc_now();
+    const double nowd = static_cast<double>(now);
+    double target = g_limiter.next_release == 0 ? nowd : g_limiter.next_release + period;
+    if (nowd - target > period / 2) {
+      target = nowd;
+      g_block->limiter_resets.fetch_add(1, std::memory_order_relaxed);
+    } else if (nowd >= target) {
+      g_block->limiter_late.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_limiter.next_release = target;
+    ReleaseSRWLockExclusive(&g_limiter.lock);
+
+    // Never longer than two periods, whatever the grid says
+    const auto target_qpc = static_cast<std::uint64_t>(std::min(target, nowd + 2 * period));
+    if (target_qpc > now) {
+      sleep_until(target_qpc);
+    }
+    const auto released = qpc_now();
+    g_block->limiter_waits.fetch_add(1, std::memory_order_relaxed);
+    g_block->limiter_wait_us.fetch_add((released - now) * 1'000'000ull / qpc_frequency(), std::memory_order_relaxed);
+    g_limiter.release_qpc.store(released, std::memory_order_release);
+  }
+
+  // What one outermost Present does around the real call
+  template<class F>
+  HRESULT present_with_capture(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags, F &&real) {
+    if (flags & DXGI_PRESENT_TEST) {
+      return real(sync_interval);
+    }
+    const auto now = qpc_now();
+    const double period = g_block ? limiter_period_qpc(now) : 0;
+    const bool paced = period > 0 && limiter_paces(swapchain, now);
+    if (period <= 0 && g_block) {
+      limiter_reset();
+    }
+    capture_frame(swapchain, now, paced ? g_limiter.release_qpc.load(std::memory_order_acquire) : 0);
+    // Paced, the game must not also wait for the host display's vblank
+    const HRESULT hr = real(paced ? 0 : sync_interval);
+    if (paced && hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+      limiter_wait(period);
+    }
+    return hr;
+  }
+
   // ---- detours -------------------------------------------------------------
 
   // DXGI may implement one Present entry point through the other; only the
@@ -891,10 +1045,9 @@ namespace {
       return g_real_present(swapchain, sync_interval, flags);
     }
     t_in_present = true;
-    if (!(flags & DXGI_PRESENT_TEST)) {
-      capture_frame(swapchain, qpc_now());
-    }
-    const HRESULT hr = g_real_present(swapchain, sync_interval, flags);
+    const HRESULT hr = present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
+      return g_real_present(swapchain, interval, flags);
+    });
     t_in_present = false;
     return hr;
   }
@@ -904,10 +1057,9 @@ namespace {
       return g_real_present1(swapchain, sync_interval, flags, params);
     }
     t_in_present = true;
-    if (!(flags & DXGI_PRESENT_TEST)) {
-      capture_frame(swapchain, qpc_now());
-    }
-    const HRESULT hr = g_real_present1(swapchain, sync_interval, flags, params);
+    const HRESULT hr = present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
+      return g_real_present1(swapchain, interval, flags, params);
+    });
     t_in_present = false;
     return hr;
   }

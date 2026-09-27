@@ -40,6 +40,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "pacing_lock.h"
 #include "platform/common.h"
 #include "prague/prague_cc.h"
 #include "prague/prague_wire.h"
@@ -1068,6 +1069,7 @@ namespace stream {
           break;
         case ENET_EVENT_TYPE_CONNECT:
           BOOST_LOG(info) << "CLIENT CONNECTED"sv;
+          pacing_lock::clear();  // no stale lock from an earlier client
           break;
         case ENET_EVENT_TYPE_DISCONNECT:
           BOOST_LOG(info) << "CLIENT DISCONNECTED"sv;
@@ -1491,6 +1493,15 @@ namespace stream {
         << "time in milli since last report [" << t.count() << ']' << std::endl
         << "last good frame [" << lastGoodFrame << ']' << std::endl
         << "---end stats---";
+    });
+
+    server->map(pacing_lock::SS_PACING_FEEDBACK_PTYPE, [&](session_t *session, const std::string_view &payload) {
+      if (payload.size() < sizeof(pacing_lock::pacing_feedback_t)) {
+        return;
+      }
+      pacing_lock::pacing_feedback_t feedback;
+      std::memcpy(&feedback, payload.data(), sizeof(feedback));  // little-endian on both ends
+      pacing_lock::submit(feedback);
     });
 
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {

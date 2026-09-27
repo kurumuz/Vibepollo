@@ -218,6 +218,7 @@ namespace platf::dxgi {
     if (config::video.game_capture) {
       if (!_game_source) {
         _game_source = std::make_unique<game_capture::source_t>(device.get());
+        _game_source->set_frame_rate(_config.framerateX100 > 0 ? _config.framerateX100 / 100.0 : static_cast<double>(_config.framerate));
         _game_converter = std::make_unique<game_capture::converter_t>();
         _game_sdr_white_scale = game_capture::sdr_white_scale_for_output(captured_output_desc.DeviceName);
         BOOST_LOG(info) << "Game capture: enabled (desktop SDR white " << _game_sdr_white_scale * 80.0f << " nits)";
@@ -504,7 +505,10 @@ namespace platf::dxgi {
     // The frame is the game's: stamped when the GPU finished it (the fence
     // completing the hook's copy), or at its Present without fence support
     const auto host_processing_timestamp = std::chrono::steady_clock::now();
-    const std::uint64_t frame_qpc = frame.gpu_done_qpc ? frame.gpu_done_qpc : frame.present_qpc;
+    // Paced, a frame's content time is its release: the game sampled input
+    // and its clock right after it. Otherwise the best we have is when the
+    // GPU finished it.
+    const std::uint64_t frame_qpc = frame.release_qpc ? frame.release_qpc : frame.gpu_done_qpc ? frame.gpu_done_qpc : frame.present_qpc;
     img->frame_timestamp = host_processing_timestamp - qpc_time_difference(qpc_counter(), static_cast<int64_t>(frame_qpc));
     img->host_processing_timestamp = host_processing_timestamp;
     img->capture_pacing_timestamp = host_processing_timestamp;

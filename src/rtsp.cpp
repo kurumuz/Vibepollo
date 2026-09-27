@@ -37,6 +37,7 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "pacing_lock.h"
 #include "prague/prague_wire.h"
 #include "rtsp.h"
 #include "stream.h"
@@ -1270,6 +1271,11 @@ namespace rtsp_stream {
         // ML_FF_FRAME_REPORTS gets its bitrate driven by slo-bayes.
         feature_flags |= prague::SS_FF_FRAME_REPORTS;
       }
+    }
+    if (config::video.game_capture && config::video.game_capture_limiter) {
+      // Hooked games are paced by our limiter, which follows the client's
+      // pacing feedback
+      feature_flags |= pacing_lock::SS_FF_PACING_LOCK;
     }
     ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 

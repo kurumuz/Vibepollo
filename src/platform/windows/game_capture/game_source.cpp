@@ -19,6 +19,8 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -45,6 +47,27 @@ namespace platf::dxgi::game_capture {
     constexpr auto kFrameStaleAfter = 250ms;
     constexpr auto kReapInterval = 1s;
     constexpr std::uint32_t kMaxDimension = 16384;
+
+    // Live source_t instances of this process, by host_lock value
+    std::mutex g_instances_lock;
+    std::set<std::uint64_t> g_instances;
+    std::uint32_t g_next_instance = 0;
+
+    // Whether the host named by a host_lock value still exists
+    bool host_alive(std::uint64_t lock) {
+      const auto pid = static_cast<DWORD>(lock >> 32);
+      if (pid == GetCurrentProcessId()) {
+        std::lock_guard lg(g_instances_lock);
+        return g_instances.count(lock) != 0;
+      }
+      HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+      if (!process) {
+        return GetLastError() == ERROR_ACCESS_DENIED;  // exists, just not ours to open
+      }
+      const bool alive = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+      CloseHandle(process);
+      return alive;
+    }
 
     std::wstring hook_dll_path() {
       wchar_t exe[MAX_PATH];
@@ -309,7 +332,7 @@ namespace platf::dxgi::game_capture {
 
     // Reads a slot's record consistently (seqlock; the render thread is its
     // only writer). Validated: enum range, timestamps within the last second.
-    bool read_slot(const gc::slot_record_t &record, std::uint32_t &version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc) {
+    bool read_slot(const gc::slot_record_t &record, std::uint32_t &version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc, std::uint64_t &release_qpc) {
       for (int attempt = 0; attempt < 8; ++attempt) {
         const auto s1 = record.seq.load(std::memory_order_acquire);
         if (s1 & 1u) {
@@ -320,6 +343,7 @@ namespace platf::dxgi::game_capture {
         frame_id = record.frame_id.load(std::memory_order_relaxed);
         present_qpc = record.present_qpc.load(std::memory_order_relaxed);
         gpu_done_qpc = record.gpu_done_qpc.load(std::memory_order_relaxed);
+        release_qpc = record.release_qpc.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
         if (record.seq.load(std::memory_order_relaxed) != s1) {
           continue;
@@ -336,6 +360,10 @@ namespace platf::dxgi::game_capture {
         }
         if (gpu_done_qpc != 0 && !plausible(gpu_done_qpc)) {
           gpu_done_qpc = 0;
+        }
+        // The release starts the frame: it precedes its Present
+        if (release_qpc != 0 && (!plausible(release_qpc) || release_qpc > present_qpc)) {
+          release_qpc = 0;
         }
         version = s1 >> 1;
         color_space = static_cast<gc::color_space_e>(cs);
@@ -420,6 +448,7 @@ namespace platf::dxgi::game_capture {
     HANDLE process = nullptr;  // owned by the job
     gc::shared_block_t *block = nullptr;  // owned by the job
     bool given_up = false;
+    bool host_busy_logged = false;
     std::uint32_t logged_state = 0xffffffffu;
 
     winrt::handle frame_event;
@@ -435,7 +464,7 @@ namespace platf::dxgi::game_capture {
     // (the conversion draw) completed on the GPU
     winrt::com_ptr<ID3D11Query> read_done[gc::kSlots];
     bool held[gc::kSlots] = {};
-    bool reset_owners = true;  // first open by this host: clear claims a previous host left behind
+    bool host_locked = false;  // we hold block->host_lock
 
     std::uint64_t consumed_latest = 0;
     std::uint64_t consumed_frame_id = 0;
@@ -481,6 +510,11 @@ namespace platf::dxgi::game_capture {
   };
 
   source_t::source_t(ID3D11Device *device) {
+    {
+      std::lock_guard lg(g_instances_lock);
+      _instance_id = (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32) | ++g_next_instance;
+      g_instances.insert(_instance_id);
+    }
     device->QueryInterface(__uuidof(ID3D11Device1), _device.put_void());
     device->GetImmediateContext(_context.put());
     if (winrt::com_ptr<IDXGIDevice> dxgi_device; SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), dxgi_device.put_void()))) {
@@ -496,10 +530,52 @@ namespace platf::dxgi::game_capture {
   source_t::~source_t() {
     unlock();
     for (auto &[pid, t] : _targets) {
-      if (t->attached && t->block && !t->exited()) {
+      if (!t->attached || !t->block || !t->host_locked) {
+        continue;
+      }
+      // Stop the hook first: no new copies, and the game runs unpaced
+      t->block->capture_enabled.store(0, std::memory_order_release);
+      t->block->limiter_period_ps.store(0, std::memory_order_release);
+      if (!t->exited()) {
         release_reads(*t, true);
       }
+      bool holding = false;
+      for (bool held : t->held) {
+        holding = holding || held;
+      }
+      // Still reading after the wait (a stuck GPU): keep the lock, and with it
+      // our claims, rather than let a successor clear them
+      if (!holding) {
+        auto mine = _instance_id;
+        t->block->host_lock.compare_exchange_strong(mine, 0, std::memory_order_acq_rel);
+      }
     }
+    std::lock_guard lg(g_instances_lock);
+    g_instances.erase(_instance_id);
+  }
+
+  bool source_t::acquire_host(target_t &t) {
+    if (t.host_locked) {
+      return true;
+    }
+    auto current = t.block->host_lock.load(std::memory_order_acquire);
+    if (current != 0 && current != _instance_id && host_alive(current)) {
+      if (!t.host_busy_logged) {
+        t.host_busy_logged = true;
+        BOOST_LOG(info) << "Game capture: another host is attached to " << t.exe << "; waiting for it to let go";
+      }
+      return false;
+    }
+    if (!t.block->host_lock.compare_exchange_strong(current, _instance_id, std::memory_order_acq_rel)) {
+      return false;
+    }
+    // The previous host (if any) is gone: slots it still claimed are free
+    for (int i = 0; i < gc::kSlots; ++i) {
+      auto expected = gc::kOwnerHost;
+      t.block->owner[i].compare_exchange_strong(expected, gc::kOwnerNone, std::memory_order_acq_rel);
+    }
+    t.host_locked = true;
+    return true;
   }
 
   source_t::target_t *source_t::current() {
@@ -546,9 +622,14 @@ namespace platf::dxgi::game_capture {
       return false;
     }
     reap_exited();
+    const std::uint64_t limiter_period = config::video.game_capture_limiter ? _pacing.period_ps() : 0;
+    const auto heartbeat = static_cast<std::uint64_t>(qpc_counter());
     for (auto &[pid, t] : _targets) {
-      if (t->attached && t->block) {
+      if (t->attached && t->block && t->host_locked) {
         release_reads(*t, false);
+        // Every hooked game is paced while we stream, focused or not
+        t->block->limiter_period_ps.store(limiter_period, std::memory_order_release);
+        t->block->host_heartbeat_qpc.store(heartbeat, std::memory_order_release);
       }
     }
 
@@ -606,6 +687,9 @@ namespace platf::dxgi::game_capture {
           break;
       }
     }
+    if (!acquire_host(t)) {
+      return false;
+    }
 
     t.block->capture_enabled.store(1, std::memory_order_release);
 
@@ -648,8 +732,11 @@ namespace platf::dxgi::game_capture {
       return {};
     }
     const auto *b = it->second->block;
+    const auto waits = b->limiter_waits.load();
     return "hook presented=" + std::to_string(b->frames_presented.load()) + " published=" + std::to_string(b->frames_published.load()) +
-           " skipped=" + std::to_string(b->frames_skipped.load());
+           " skipped=" + std::to_string(b->frames_skipped.load()) + "; limiter waits=" + std::to_string(waits) +
+           " late=" + std::to_string(b->limiter_late.load()) + " resets=" + std::to_string(b->limiter_resets.load()) +
+           " mean wait=" + std::to_string(waits ? b->limiter_wait_us.load() / waits : 0) + "us; " + _pacing.stats();
   }
 
   bool source_t::still_foreground(const RECT &capture_rect) const {
@@ -748,8 +835,11 @@ namespace platf::dxgi::game_capture {
       }
       D3D11_TEXTURE2D_DESC this_desc {};
       textures[i]->GetDesc(&this_desc);
+      // A keyed-mutex texture must be acquired before any use, so it cannot
+      // be read under owner words
+      const bool keyed = (this_desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) != 0;
       if (this_desc.MipLevels != 1 || this_desc.ArraySize != 1 || this_desc.SampleDesc.Count != 1 ||
-          !(this_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) || this_desc.Width == 0 || this_desc.Height == 0) {
+          !(this_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) || this_desc.Width == 0 || this_desc.Height == 0 || keyed == owner_sync) {
         // A recycled handle during a resize storm looks like this too, so
         // retry a few times against the same setup before concluding the
         // hook is misbehaving
@@ -789,15 +879,6 @@ namespace platf::dxgi::game_capture {
             return false;
           }
         }
-      }
-      if (t.reset_owners) {
-        // Claims only this host makes; one left by a host that died holding
-        // a slot would otherwise keep that slot from the hook forever
-        for (int i = 0; i < gc::kSlots; ++i) {
-          auto expected = gc::kOwnerHost;
-          t.block->owner[i].compare_exchange_strong(expected, gc::kOwnerNone, std::memory_order_acq_rel);
-        }
-        t.reset_owners = false;
       }
     }
 
@@ -884,8 +965,8 @@ namespace platf::dxgi::game_capture {
       // carry the published version, and belong to the textures we opened
       std::uint32_t record_version, generation;
       gc::color_space_e color_space;
-      std::uint64_t frame_id, present_qpc, gpu_done_qpc;
-      const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc);
+      std::uint64_t frame_id, present_qpc, gpu_done_qpc, release_qpc;
+      const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc, release_qpc);
       if (!valid || record_version != version) {
         release();
         if (!valid) {
@@ -927,6 +1008,7 @@ namespace platf::dxgi::game_capture {
       frame.frame_id = frame_id;
       frame.present_qpc = present_qpc;
       frame.gpu_done_qpc = gpu_done_qpc;
+      frame.release_qpc = release_qpc;
       t->consumed_latest = latest;
       t->consumed_frame_id = frame_id;
       _locked_slot = static_cast<int>(slot);
@@ -950,6 +1032,10 @@ namespace platf::dxgi::game_capture {
     _locked_slot = -1;
   }
 
+  void source_t::set_frame_rate(double fps) {
+    _pacing.set_nominal(fps > 0 ? 1.0 / fps : 0);
+  }
+
   void source_t::release_reads(target_t &t, bool wait) {
     const auto deadline = std::chrono::steady_clock::now() + 100ms;
     for (int i = 0; i < gc::kSlots; ++i) {
@@ -958,14 +1044,15 @@ namespace platf::dxgi::game_capture {
       }
       for (;;) {
         const HRESULT hr = _context->GetData(t.read_done[i].get(), nullptr, 0, 0);  // flushes if the query is still unsubmitted
-        if (hr != S_FALSE || !wait || std::chrono::steady_clock::now() > deadline) {
-          // S_OK: reads done. An error (device removed) will not complete
-          // either way. A bounded wait that ran out releases anyway: at
-          // worst the hook overwrites pixels already read
-          if (hr != S_FALSE || wait) {
-            t.block->owner[i].store(gc::kOwnerNone, std::memory_order_release);
-            t.held[i] = false;
-          }
+        // Released only once our reads are known to be over: the query
+        // completed, or the device is gone (nothing of ours runs any more).
+        // Otherwise the claim stays: the hook skips that slot meanwhile.
+        if (hr == S_OK || (FAILED(hr) && FAILED(_device->GetDeviceRemovedReason()))) {
+          t.block->owner[i].store(gc::kOwnerNone, std::memory_order_release);
+          t.held[i] = false;
+          break;
+        }
+        if (!wait || std::chrono::steady_clock::now() > deadline) {
           break;
         }
         std::this_thread::yield();

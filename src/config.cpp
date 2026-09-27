@@ -1682,6 +1682,7 @@ namespace config {
 
     string_f(vars, "capture", video.capture);
     bool_f(vars, "game_capture", video.game_capture);
+    bool_f(vars, "game_capture_limiter", video.game_capture_limiter);
     bool_f(vars, "wgc_pacing_smoothing", video.wgc_pacing_smoothing);
     bool_f(vars, "wire_capture_timestamps", video.wire_capture_timestamps);
     string_f(vars, "encoder", video.encoder);

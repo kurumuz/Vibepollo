@@ -7,6 +7,7 @@
 #pragma once
 
 #include "protocol.h"
+#include "src/pacing_lock.h"
 #include "src/platform/common.h"
 #include "src/platform/windows/foreground_app.h"
 
@@ -30,6 +31,7 @@ namespace platf::dxgi::game_capture {
     std::uint64_t frame_id = 0;
     std::uint64_t present_qpc = 0;  ///< validated: within the last second
     std::uint64_t gpu_done_qpc = 0;  ///< 0 when the hook had no fence
+    std::uint64_t release_qpc = 0;  ///< the limiter release that started the frame (0 = not paced)
   };
 
   class source_t {
@@ -73,15 +75,23 @@ namespace platf::dxgi::game_capture {
      */
     std::string hook_stats() const;
 
+    /**
+     * @brief The stream's frame rate: the limiter's nominal pace.
+     */
+    void set_frame_rate(double fps);
+
   private:
     struct attach_job_t;
     struct target_t;
 
     void reap_exited();
+    bool acquire_host(target_t &target);
     void release_reads(target_t &target, bool wait);
     bool open_generation(target_t &target);
     target_t *current();
 
+    std::uint64_t _instance_id = 0;  ///< our block->host_lock value
+    pacing_lock::controller_t _pacing;
     winrt::com_ptr<ID3D11Device1> _device;
     winrt::com_ptr<ID3D11DeviceContext> _context;  // the capture thread's immediate context
     LUID _adapter_luid {};
