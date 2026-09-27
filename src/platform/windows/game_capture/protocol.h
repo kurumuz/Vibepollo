@@ -16,15 +16,19 @@
  *     reads the published slot.
  *
  * Slot protocol (three slots: free, pending, published):
- *  - The hook writes only a FREE slot, taking its keyed mutex with a zero
- *    timeout; if none is free or the mutex is held, the frame is skipped.
- *    A frame is never waited for and Present is never blocked.
- *  - A written slot is PENDING until its copy completes, then PUBLISHED; the
- *    previously published slot becomes free.
- *  - Every write bumps the slot's version. The published metadata names
- *    (slot, version); the host re-reads it after taking the keyed mutex and
- *    uses the frame only if both still match, so pixels and metadata can
- *    never be mixed between frames.
+ *  - The hook's render thread writes only a FREE slot, taking its keyed
+ *    mutex with a zero timeout; if none is free or the mutex is held, the
+ *    frame is skipped. Present is never blocked and never waits.
+ *  - Each slot has its own record here, seqlocked by the render thread: the
+ *    record's version is what identifies the pixels currently in that slot.
+ *  - A written slot is PENDING until the hook's completion thread sees its
+ *    copy finish; that thread is the ONLY writer of `latest`. It publishes
+ *    (slot, version) first and only then frees the previously published
+ *    slot, and it never publishes a frame older than the last one.
+ *  - The host takes the keyed mutex of the slot `latest` names, then reads
+ *    that slot's record and uses the frame only if the record's version is
+ *    the published one. A slot rewritten meanwhile has a new version, so
+ *    pixels and metadata can never be mixed.
  *
  * Everything the host reads from this block is untrusted: the game's user
  * can write it. The host bounds and validates every field.
@@ -38,7 +42,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 2;
+  constexpr std::uint32_t kVersion = 3;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 160;
 
@@ -68,7 +72,7 @@ namespace game_capture {
   };
 
   // Texture setup for one generation (rewritten on every resize / device
-  // change). Published as a unit under setup_seq; handles of the previous
+  // change), published as a unit under setup_seq. Handles of the previous
   // generation stay open in the hook until the one after it, so a host still
   // opening them never meets a recycled handle value.
   struct setup_t {
@@ -80,8 +84,23 @@ namespace game_capture {
     std::atomic<std::uint32_t> adapter_luid_low;
     std::atomic<std::int32_t> adapter_luid_high;
     std::atomic<std::uint64_t> hwnd;  ///< the swapchain's output window
-    std::atomic<std::uint64_t> textures[kSlots];  ///< NT handle values in the game process
+    std::atomic<std::uint64_t> textures[kSlots];  ///< NT handle values in the game process (0 = none)
   };
+
+  // What one slot's texture holds. `seq` is odd while the render thread
+  // rewrites the record; version = seq >> 1.
+  struct slot_record_t {
+    std::atomic<std::uint32_t> seq;
+    std::atomic<std::uint32_t> generation;
+    std::atomic<std::uint32_t> color_space;  ///< color_space_e
+    std::atomic<std::uint64_t> frame_id;
+    std::atomic<std::uint64_t> present_qpc;  ///< QueryPerformanceCounter at the game's Present()
+    std::atomic<std::uint64_t> gpu_done_qpc;  ///< written by the completion thread just before publishing (0 = no fence)
+  };
+
+  inline std::uint64_t make_latest(std::uint32_t slot, std::uint32_t version) {
+    return (static_cast<std::uint64_t>(slot) << 32) | version;
+  }
 
   struct shared_block_t {
     std::uint32_t magic;
@@ -95,19 +114,11 @@ namespace game_capture {
     std::atomic<std::uint64_t> frame_event;  ///< auto-reset event (handle value in the game process), set on each publish
     std::atomic<std::uint64_t> publish_qpc;  ///< QueryPerformanceCounter of the last publish (for staleness)
 
-    // Setup, seqlocked: odd setup_seq while being rewritten
-    std::atomic<std::uint32_t> setup_seq;
+    std::atomic<std::uint32_t> setup_seq;  ///< odd while setup is being rewritten
     setup_t setup;
 
-    // The latest completed frame, seqlocked: odd frame_seq while being written
-    std::atomic<std::uint32_t> frame_seq;
-    std::atomic<std::uint32_t> slot;
-    std::atomic<std::uint32_t> slot_version;
-    std::atomic<std::uint32_t> generation;
-    std::atomic<std::uint32_t> color_space;  ///< color_space_e, of this frame
-    std::atomic<std::uint64_t> frame_id;
-    std::atomic<std::uint64_t> present_qpc;  ///< QueryPerformanceCounter at the game's Present()
-    std::atomic<std::uint64_t> gpu_done_qpc;  ///< when the hook observed the copy complete (0 = no fence support)
+    slot_record_t slots[kSlots];
+    std::atomic<std::uint64_t> latest;  ///< make_latest(slot, version) of the published frame; 0 = none. Single writer.
 
     // Statistics
     std::atomic<std::uint64_t> frames_presented;

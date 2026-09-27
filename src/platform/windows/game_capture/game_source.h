@@ -28,7 +28,7 @@ namespace platf::dxgi::game_capture {
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     ::game_capture::color_space_e color_space = ::game_capture::color_space_e::unknown;
     std::uint64_t frame_id = 0;
-    std::uint64_t present_qpc = 0;
+    std::uint64_t present_qpc = 0;  ///< validated: within the last second
     std::uint64_t gpu_done_qpc = 0;  ///< 0 when the hook had no fence
   };
 
@@ -68,6 +68,7 @@ namespace platf::dxgi::game_capture {
     void unlock();
 
   private:
+    struct attach_job_t;
     struct target_t;
 
     void reap_exited();

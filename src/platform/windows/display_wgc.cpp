@@ -445,6 +445,12 @@ namespace platf::dxgi {
     if (!pull_free_image_cb(img)) {
       return capture_e::interrupted;
     }
+    // The pool wait can be long under encoder pressure: the game may have
+    // lost the foreground meanwhile
+    if (!_game_source->still_foreground()) {
+      fall_back = true;
+      return capture_e::ok;
+    }
     auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
     if (complete_img(d3d_img.get(), false)) {
       return capture_e::error;

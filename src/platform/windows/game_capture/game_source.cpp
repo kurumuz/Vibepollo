@@ -83,10 +83,15 @@ namespace platf::dxgi::game_capture {
       return true;
     }
 
+    enum class anti_cheat_e { clear,
+                              detected,
+                              unknown };
+
     // Games under an anti-cheat are never injected: the hook would be flagged
     // or blocked. Detected from the modules the process has loaded and from
-    // the anti-cheat runtimes shipped next to the executable.
-    bool has_anti_cheat(HANDLE process, const std::string &exe, std::string &which) {
+    // the anti-cheat runtimes shipped next to the executable. An inspection
+    // that could not complete is `unknown`, which is treated as detected.
+    anti_cheat_e detect_anti_cheat(HANDLE process, const std::string &exe, std::string &which) {
       static constexpr const char *kModules[] = {
         "easyanticheat",  // EAC (EasyAntiCheat.dll, EasyAntiCheat_EOS.dll, ...)
         "beclient",  // BattlEye
@@ -100,40 +105,57 @@ namespace platf::dxgi::game_capture {
         "xigncode",
         "x3.xem",
         "hackshield",
-        "vac.dll",  // just in case a VAC module is mapped in-process
+        "vac.dll",
         "denuvo_anti_cheat",
         "ricochet",
         "mhyprot",  // miHoYo
         "zksvc",
         "anticheat",
       };
-      HMODULE modules[1024];
-      DWORD needed = 0;
-      if (EnumProcessModulesEx(process, modules, sizeof(modules), &needed, LIST_MODULES_ALL)) {
-        const auto count = std::min<DWORD>(needed / sizeof(HMODULE), 1024);
-        for (DWORD i = 0; i < count; ++i) {
-          char name[MAX_PATH];
-          if (GetModuleBaseNameA(process, modules[i], name, MAX_PATH) == 0) {
-            continue;
-          }
-          const auto module = lower(name);
-          for (const auto *pattern : kModules) {
-            if (module.find(pattern) != std::string::npos) {
-              which = name;
-              return true;
-            }
-          }
-        }
-      }
       std::error_code ec;
       const auto dir = std::filesystem::path(exe).parent_path();
       for (const auto *runtime : {"EasyAntiCheat", "EasyAntiCheat_EOS_Setup.exe", "BattlEye", "EasyAntiCheat.exe"}) {
         if (std::filesystem::exists(dir / runtime, ec)) {
           which = runtime;
-          return true;
+          return anti_cheat_e::detected;
         }
       }
-      return false;
+
+      // The module list changes while the game loads; retry until an
+      // enumeration fits and is consistent
+      std::vector<HMODULE> modules(512);
+      bool enumerated = false;
+      for (int attempt = 0; attempt < 5 && !enumerated; ++attempt) {
+        DWORD needed = 0;
+        const DWORD bytes = static_cast<DWORD>(modules.size() * sizeof(HMODULE));
+        if (!EnumProcessModulesEx(process, modules.data(), bytes, &needed, LIST_MODULES_ALL)) {
+          Sleep(50);
+          continue;
+        }
+        if (needed > bytes) {
+          modules.resize(needed / sizeof(HMODULE) + 64);
+          continue;
+        }
+        modules.resize(needed / sizeof(HMODULE));
+        enumerated = true;
+      }
+      if (!enumerated) {
+        return anti_cheat_e::unknown;
+      }
+      for (HMODULE module : modules) {
+        char name[MAX_PATH];
+        if (GetModuleBaseNameA(process, module, name, MAX_PATH) == 0) {
+          return anti_cheat_e::unknown;
+        }
+        const auto lowered = lower(name);
+        for (const auto *pattern : kModules) {
+          if (lowered.find(pattern) != std::string::npos) {
+            which = name;
+            return anti_cheat_e::detected;
+          }
+        }
+      }
+      return anti_cheat_e::clear;
     }
 
     const char *state_name(std::uint32_t state) {
@@ -168,7 +190,7 @@ namespace platf::dxgi::game_capture {
     }
 
     // Security descriptor for the shared block: SYSTEM and administrators
-    // full access, the game's own logon user read/write, and a medium
+    // full access, the game process's user read/write, and a medium
     // integrity label so the (medium integrity) game may write it at all.
     // Nobody else can touch it.
     PSECURITY_DESCRIPTOR make_block_descriptor(HANDLE process) {
@@ -263,26 +285,121 @@ namespace platf::dxgi::game_capture {
       }
       return true;
     }
+
+    // Reads a slot's record consistently (seqlock; the render thread is its
+    // only writer). Validated: enum range, timestamps within the last second.
+    bool read_slot(const gc::slot_record_t &record, std::uint32_t &version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc) {
+      for (int attempt = 0; attempt < 8; ++attempt) {
+        const auto s1 = record.seq.load(std::memory_order_acquire);
+        if (s1 & 1u) {
+          continue;
+        }
+        generation = record.generation.load(std::memory_order_relaxed);
+        const auto cs = record.color_space.load(std::memory_order_relaxed);
+        frame_id = record.frame_id.load(std::memory_order_relaxed);
+        present_qpc = record.present_qpc.load(std::memory_order_relaxed);
+        gpu_done_qpc = record.gpu_done_qpc.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (record.seq.load(std::memory_order_relaxed) != s1) {
+          continue;
+        }
+        if (cs > static_cast<std::uint32_t>(gc::color_space_e::hdr10)) {
+          return false;
+        }
+        const auto now = static_cast<std::uint64_t>(qpc_counter());
+        auto plausible = [&](std::uint64_t qpc) {
+          return qpc != 0 && qpc <= now && qpc_time_difference(static_cast<int64_t>(now), static_cast<int64_t>(qpc)) < 1s;
+        };
+        if (!plausible(present_qpc)) {
+          return false;
+        }
+        if (gpu_done_qpc != 0 && !plausible(gpu_done_qpc)) {
+          gpu_done_qpc = 0;
+        }
+        version = s1 >> 1;
+        color_space = static_cast<gc::color_space_e>(cs);
+        return true;
+      }
+      return false;
+    }
   }  // namespace
+
+  // Attachment (open, check, create the block, inject) runs on a worker with
+  // its own lifetime: the target only holds a reference and reads the
+  // results once `state` says they are complete. A source destroyed while
+  // the worker waits on the game's loader simply drops its reference.
+  struct source_t::attach_job_t {
+    enum class state_e { running,
+                         done,
+                         failed };
+
+    DWORD pid = 0;
+    std::string exe;
+    std::wstring dll;
+
+    // Written by the worker, read by the capture thread only after `state`
+    // is done or failed
+    winrt::handle process;
+    winrt::handle mapping;
+    gc::shared_block_t *block = nullptr;
+    std::string error;
+    std::atomic<state_e> state {state_e::running};
+
+    ~attach_job_t() {
+      if (block) {
+        block->capture_enabled.store(0, std::memory_order_release);
+        UnmapViewOfFile(block);
+      }
+    }
+
+    void run() {
+      auto fail = [&](std::string why) {
+        error = std::move(why);
+        state.store(state_e::failed, std::memory_order_release);
+      };
+      process.attach(OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, pid));
+      if (!process) {
+        return fail("cannot open the process (" + std::to_string(GetLastError()) + ")");
+      }
+      BOOL wow64 = FALSE;
+      if (IsWow64Process(process.get(), &wow64) && wow64) {
+        return fail("32-bit process");
+      }
+      std::string anti_cheat;
+      switch (detect_anti_cheat(process.get(), exe, anti_cheat)) {
+        case anti_cheat_e::detected:
+          return fail("anti-cheat present (" + anti_cheat + ")");
+        case anti_cheat_e::unknown:
+          return fail("could not inspect the process for anti-cheat");
+        case anti_cheat_e::clear:
+          break;
+      }
+      bool existed = false;
+      if (!create_block(process.get(), pid, mapping, block, existed)) {
+        return fail("cannot create the shared block (" + std::to_string(GetLastError()) + ")");
+      }
+      if (!existed) {
+        std::string why;
+        if (!inject(process.get(), dll, why)) {
+          return fail("injection failed: " + why);
+        }
+        BOOST_LOG(info) << "Game capture: injected the hook into " << exe << " (pid " << pid << ')';
+      } else {
+        BOOST_LOG(info) << "Game capture: reattached to the hook already in " << exe << " (pid " << pid << ')';
+      }
+      state.store(state_e::done, std::memory_order_release);
+    }
+  };
 
   struct source_t::target_t {
     DWORD pid = 0;
     std::string exe;
-    winrt::handle process;
-    winrt::handle mapping;
-    gc::shared_block_t *block = nullptr;
+    std::shared_ptr<attach_job_t> job;
+    bool attached = false;  // job results consumed: process/block below are valid
+    HANDLE process = nullptr;  // owned by the job
+    gc::shared_block_t *block = nullptr;  // owned by the job
     bool given_up = false;
     std::uint32_t logged_state = 0xffffffffu;
-
-    // Attachment (open, check, create the block, inject) runs on a worker
-    // so a slow LoadLibrary in the game never stalls capture
-    enum class attach_e { pending,
-                          running,
-                          done,
-                          failed };
-    std::atomic<attach_e> attach {attach_e::pending};
-    std::string attach_error;
-    std::thread attach_thread;
 
     winrt::handle frame_event;
     std::uint32_t opened_generation = 0;
@@ -290,17 +407,8 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC texture_desc {};
 
+    std::uint64_t consumed_latest = 0;
     std::uint64_t consumed_frame_id = 0;
-
-    ~target_t() {
-      if (attach_thread.joinable()) {
-        attach_thread.join();
-      }
-      if (block) {
-        block->capture_enabled.store(0, std::memory_order_release);
-        UnmapViewOfFile(block);
-      }
-    }
 
     void give_up(const std::string &why) {
       if (!given_up) {
@@ -313,34 +421,7 @@ namespace platf::dxgi::game_capture {
     }
 
     bool exited() const {
-      return process && WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0;
-    }
-
-    // Reads the latest published frame consistently (seqlock); validated
-    bool read_latest(std::uint32_t &slot, std::uint32_t &slot_version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc) const {
-      for (int attempt = 0; attempt < 8; ++attempt) {
-        const auto s1 = block->frame_seq.load(std::memory_order_acquire);
-        if (s1 & 1u) {
-          continue;
-        }
-        slot = block->slot.load(std::memory_order_relaxed);
-        slot_version = block->slot_version.load(std::memory_order_relaxed);
-        generation = block->generation.load(std::memory_order_relaxed);
-        const auto cs = block->color_space.load(std::memory_order_relaxed);
-        frame_id = block->frame_id.load(std::memory_order_relaxed);
-        present_qpc = block->present_qpc.load(std::memory_order_relaxed);
-        gpu_done_qpc = block->gpu_done_qpc.load(std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (block->frame_seq.load(std::memory_order_relaxed) != s1) {
-          continue;
-        }
-        if (slot >= static_cast<std::uint32_t>(gc::kSlots) || cs > static_cast<std::uint32_t>(gc::color_space_e::hdr10)) {
-          return false;
-        }
-        color_space = static_cast<gc::color_space_e>(cs);
-        return true;
-      }
-      return false;
+      return attached && process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
     }
 
     // Reads the setup consistently (seqlock)
@@ -389,7 +470,7 @@ namespace platf::dxgi::game_capture {
   }
 
   // Exited games are dropped whatever the foreground is, so their shared
-  // textures (two 4K FP16 frames are ~127 MiB) do not accumulate
+  // textures (three 4K FP16 frames are ~190 MiB) do not accumulate
   void source_t::reap_exited() {
     const auto now = std::chrono::steady_clock::now();
     if (now - _last_reap < kReapInterval) {
@@ -398,8 +479,7 @@ namespace platf::dxgi::game_capture {
     _last_reap = now;
     for (auto it = _targets.begin(); it != _targets.end();) {
       const auto &t = *it->second;
-      const bool attaching = t.attach.load() == target_t::attach_e::running;
-      if (!attaching && t.exited()) {
+      if (t.exited()) {
         BOOST_LOG(info) << "Game capture: " << t.exe << " (pid " << t.pid << ") exited";
         if (it->first == _current_pid) {
           unlock();
@@ -424,7 +504,7 @@ namespace platf::dxgi::game_capture {
       // Stop copying in the process we are leaving; its hook stays loaded
       // for when it comes back into focus
       unlock();
-      if (auto *previous = current(); previous && previous->block) {
+      if (auto *previous = current(); previous && previous->attached && previous->block) {
         previous->block->capture_enabled.store(0, std::memory_order_release);
       }
       _current_pid = pid;
@@ -444,60 +524,33 @@ namespace platf::dxgi::game_capture {
       return false;
     }
 
-    switch (t.attach.load(std::memory_order_acquire)) {
-      case target_t::attach_e::pending: {
+    if (!t.attached) {
+      if (!t.job) {
         if (!is_candidate_process(pid, t.exe)) {
           t.give_up("excluded process");
           return false;
         }
-        t.attach.store(target_t::attach_e::running, std::memory_order_release);
-        t.attach_thread = std::thread([&t, dll = hook_dll_path()]() {
-          auto fail = [&](std::string why) {
-            t.attach_error = std::move(why);
-            t.attach.store(target_t::attach_e::failed, std::memory_order_release);
-          };
-          t.process.attach(OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, t.pid));
-          if (!t.process) {
-            return fail("cannot open the process (" + std::to_string(GetLastError()) + ")");
-          }
-          BOOL wow64 = FALSE;
-          if (IsWow64Process(t.process.get(), &wow64) && wow64) {
-            return fail("32-bit process");
-          }
-          std::string anti_cheat;
-          if (has_anti_cheat(t.process.get(), t.exe, anti_cheat)) {
-            return fail("anti-cheat present (" + anti_cheat + ")");
-          }
-          bool existed = false;
-          if (!create_block(t.process.get(), t.pid, t.mapping, t.block, existed)) {
-            return fail("cannot create the shared block (" + std::to_string(GetLastError()) + ")");
-          }
-          if (!existed) {
-            std::string error;
-            if (!inject(t.process.get(), dll, error)) {
-              return fail("injection failed: " + error);
-            }
-            BOOST_LOG(info) << "Game capture: injected the hook into " << t.exe << " (pid " << t.pid << ')';
-          } else {
-            BOOST_LOG(info) << "Game capture: reattached to the hook already in " << t.exe << " (pid " << t.pid << ')';
-          }
-          t.attach.store(target_t::attach_e::done, std::memory_order_release);
-        });
+        t.job = std::make_shared<attach_job_t>();
+        t.job->pid = pid;
+        t.job->exe = t.exe;
+        t.job->dll = hook_dll_path();
+        std::thread([job = t.job]() {
+          job->run();
+        }).detach();
         return false;
       }
-      case target_t::attach_e::running:
-        return false;
-      case target_t::attach_e::failed:
-        if (t.attach_thread.joinable()) {
-          t.attach_thread.join();
-        }
-        t.give_up(t.attach_error);
-        return false;
-      case target_t::attach_e::done:
-        if (t.attach_thread.joinable()) {
-          t.attach_thread.join();
-        }
-        break;
+      switch (t.job->state.load(std::memory_order_acquire)) {
+        case attach_job_t::state_e::running:
+          return false;
+        case attach_job_t::state_e::failed:
+          t.give_up(t.job->error);
+          return false;
+        case attach_job_t::state_e::done:
+          t.process = t.job->process.get();
+          t.block = t.job->block;
+          t.attached = true;
+          break;
+      }
     }
 
     t.block->capture_enabled.store(1, std::memory_order_release);
@@ -528,11 +581,11 @@ namespace platf::dxgi::game_capture {
 
     // Fresh means the hook published recently, by its own clock
     const auto publish_qpc = t.block->publish_qpc.load(std::memory_order_acquire);
-    if (publish_qpc == 0) {
+    const auto now = static_cast<std::uint64_t>(qpc_counter());
+    if (publish_qpc == 0 || publish_qpc > now) {
       return false;
     }
-    const auto age = qpc_time_difference(qpc_counter(), static_cast<int64_t>(publish_qpc));
-    return age >= std::chrono::nanoseconds::zero() && age < kFrameStaleAfter;
+    return qpc_time_difference(static_cast<int64_t>(now), static_cast<int64_t>(publish_qpc)) < kFrameStaleAfter;
   }
 
   bool source_t::still_foreground() const {
@@ -551,7 +604,10 @@ namespace platf::dxgi::game_capture {
     if (!t.read_setup(generation, handles, luid, width, height)) {
       return false;
     }
-    if (width == 0 || height == 0 || width > kMaxDimension || height > kMaxDimension) {
+    if (width == 0 || height == 0) {
+      return false;  // retired setup, nothing to open yet
+    }
+    if (width > kMaxDimension || height > kMaxDimension) {
       t.give_up("the hook reported an implausible frame size");
       return false;
     }
@@ -564,7 +620,7 @@ namespace platf::dxgi::game_capture {
 
     auto duplicate = [&](std::uint64_t value) -> HANDLE {
       HANDLE out = nullptr;
-      if (!value || !DuplicateHandle(t.process.get(), reinterpret_cast<HANDLE>(value), GetCurrentProcess(), &out, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      if (!value || !DuplicateHandle(t.process, reinterpret_cast<HANDLE>(value), GetCurrentProcess(), &out, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
         return nullptr;
       }
       return out;
@@ -579,7 +635,7 @@ namespace platf::dxgi::game_capture {
     }
 
     // Open into temporaries; commit only when every slot opened and all
-    // describe the same texture of the size the setup announced
+    // describe the same, plain, sampleable 2D texture of the announced size
     winrt::com_ptr<ID3D11Texture2D> textures[gc::kSlots];
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC desc {};
@@ -596,6 +652,11 @@ namespace platf::dxgi::game_capture {
       }
       D3D11_TEXTURE2D_DESC this_desc {};
       textures[i]->GetDesc(&this_desc);
+      if (this_desc.MipLevels != 1 || this_desc.ArraySize != 1 || this_desc.SampleDesc.Count != 1 ||
+          !(this_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) || this_desc.Width == 0 || this_desc.Height == 0) {
+        t.give_up("the hook's texture has an unexpected shape");
+        return false;
+      }
       if (i == 0) {
         desc = this_desc;
       } else if (this_desc.Width != desc.Width || this_desc.Height != desc.Height || this_desc.Format != desc.Format) {
@@ -620,18 +681,17 @@ namespace platf::dxgi::game_capture {
     }
     t.texture_desc = desc;
     t.opened_generation = generation;
-    t.consumed_frame_id = 0;
     BOOST_LOG(info) << "Game capture: " << t.exe << " frames " << desc.Width << 'x' << desc.Height << " format " << desc.Format << " (generation " << generation << ')';
     return true;
   }
 
   capture_e source_t::wait(std::chrono::milliseconds timeout) {
     auto *t = current();
-    if (!t || !t->block || !t->frame_event) {
+    if (!t || !t->attached || !t->frame_event) {
       return capture_e::error;
     }
     // A frame published while we were busy has already consumed its event
-    if (t->block->frame_id.load(std::memory_order_acquire) != t->consumed_frame_id) {
+    if (t->block->latest.load(std::memory_order_acquire) != t->consumed_latest) {
       return capture_e::ok;
     }
     switch (WaitForSingleObject(t->frame_event.get(), static_cast<DWORD>(std::clamp<long long>(timeout.count(), 0, 1000)))) {
@@ -646,49 +706,57 @@ namespace platf::dxgi::game_capture {
 
   capture_e source_t::lock(frame_t &frame) {
     auto *t = current();
-    if (!t || !t->block || !t->textures[0]) {
+    if (!t || !t->attached || !t->textures[0]) {
       return capture_e::error;
     }
 
     for (int attempt = 0; attempt < 3; ++attempt) {
-      std::uint32_t slot, version, generation;
-      gc::color_space_e color_space;
-      std::uint64_t frame_id, present_qpc, gpu_done_qpc;
-      if (!t->read_latest(slot, version, generation, color_space, frame_id, present_qpc, gpu_done_qpc)) {
-        return capture_e::timeout;
-      }
-      if (generation != t->opened_generation) {
-        if (!open_generation(*t) || generation != t->opened_generation) {
-          return capture_e::timeout;
-        }
-      }
-      if (frame_id == t->consumed_frame_id) {
+      const auto latest = t->block->latest.load(std::memory_order_acquire);
+      const auto slot = static_cast<std::uint32_t>(latest >> 32);
+      const auto version = static_cast<std::uint32_t>(latest);
+      if (latest == 0 || latest == t->consumed_latest || slot >= static_cast<std::uint32_t>(gc::kSlots)) {
         return capture_e::timeout;
       }
       if (t->mutexes[slot]->AcquireSync(0, 10) != S_OK) {
         return capture_e::timeout;
       }
 
-      // The pixels in the slot are the frame we read about only if the
-      // published (slot, version) is unchanged now that we hold the mutex
-      std::uint32_t slot2, version2, generation2;
-      gc::color_space_e color_space2;
-      std::uint64_t frame_id2, present_qpc2, gpu_done_qpc2;
-      if (!t->read_latest(slot2, version2, generation2, color_space2, frame_id2, present_qpc2, gpu_done_qpc2) ||
-          slot2 != slot || version2 != version || generation2 != generation) {
+      // The slot's own record, now that we hold its pixels: it must still
+      // carry the published version, and belong to the textures we opened
+      std::uint32_t record_version, generation;
+      gc::color_space_e color_space;
+      std::uint64_t frame_id, present_qpc, gpu_done_qpc;
+      const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc);
+      if (!valid || record_version != version) {
         t->mutexes[slot]->ReleaseSync(0);
+        if (!valid) {
+          return capture_e::timeout;
+        }
+        continue;  // rewritten meanwhile: a newer publication exists
+      }
+      if (generation != t->opened_generation) {
+        t->mutexes[slot]->ReleaseSync(0);
+        if (!open_generation(*t)) {
+          return capture_e::timeout;
+        }
         continue;
+      }
+      if (frame_id <= t->consumed_frame_id) {
+        t->mutexes[slot]->ReleaseSync(0);
+        t->consumed_latest = latest;
+        return capture_e::timeout;
       }
 
       frame.texture = t->textures[slot].get();
       frame.width = t->texture_desc.Width;
       frame.height = t->texture_desc.Height;
       frame.format = t->texture_desc.Format;
-      frame.color_space = color_space2;
-      frame.frame_id = frame_id2;
-      frame.present_qpc = present_qpc2;
-      frame.gpu_done_qpc = gpu_done_qpc2;
-      t->consumed_frame_id = frame_id2;
+      frame.color_space = color_space;
+      frame.frame_id = frame_id;
+      frame.present_qpc = present_qpc;
+      frame.gpu_done_qpc = gpu_done_qpc;
+      t->consumed_latest = latest;
+      t->consumed_frame_id = frame_id;
       _locked_slot = static_cast<int>(slot);
       return capture_e::ok;
     }
