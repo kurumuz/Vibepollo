@@ -82,6 +82,9 @@ namespace {
   // {3b9d7e21-6c4a-4f0e-8a5d-1e7c9b2f4a63}, {5e2a8c14-9b3d-4d71-b6e0-7f4a2c9d1e85}
   constexpr GUID kQueueKey = {0x3b9d7e21, 0x6c4a, 0x4f0e, {0x8a, 0x5d, 0x1e, 0x7c, 0x9b, 0x2f, 0x4a, 0x63}};
   constexpr GUID kQueueAmbiguousKey = {0x5e2a8c14, 0x9b3d, 0x4d71, {0xb6, 0xe0, 0x7f, 0x4a, 0x2c, 0x9d, 0x1e, 0x85}};
+  // ... and in how many Presents in a row it was seen (a count)
+  // {7c1f4b9a-2e6d-4a83-9f15-3b8e6d2a7c40}
+  constexpr GUID kQueueSeenKey = {0x7c1f4b9a, 0x2e6d, 0x4a83, {0x9f, 0x15, 0x3b, 0x8e, 0x6d, 0x2a, 0x7c, 0x40}};
 
   present_fn g_real_present = nullptr;
   present1_fn g_real_present1 = nullptr;
@@ -302,6 +305,7 @@ namespace {
     bool textures_released = false;
     bool legacy = false;  // shared through global handles: the textures themselves keep the values valid
     bool in_use = false;
+    DWORD owner_thread = 0;  // a single-threaded D3D11 device's thread, the only one that may release it; 0 = any
   };
 
 
@@ -422,8 +426,9 @@ namespace {
   // Called on the render thread; never waits.
   void collect_retired(bool force) {
     const auto now = qpc_now();
+    const DWORD thread = GetCurrentThreadId();
     for (auto &r : g_cap.retired) {
-      if (!r.in_use) {
+      if (!r.in_use || (r.owner_thread && r.owner_thread != thread)) {
         continue;
       }
       if (!r.textures_released) {
@@ -451,7 +456,29 @@ namespace {
     }
   }
 
-  // A free entry of the retirement list (a new one if none is free)
+  // Retiring must not allocate (it runs inside Present, and what it keeps
+  // must not be dropped), so free entries are reserved up front: enough for
+  // the most one capture pass can retire (a recreate, a device switch and a
+  // failed Signal: two texture sets and two command stores, plus one spare)
+  constexpr std::size_t kRetireReserve = 5;
+
+  bool reserve_retirement() {
+    const auto free = static_cast<std::size_t>(std::count_if(g_cap.retired.begin(), g_cap.retired.end(), [](const retired_t &r) {
+      return !r.in_use;
+    }));
+    if (free + (g_cap.retired.capacity() - g_cap.retired.size()) >= kRetireReserve) {
+      return true;
+    }
+    try {
+      g_cap.retired.reserve(g_cap.retired.size() + kRetireReserve);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // A free entry of the retirement list (a new one if none is free; there
+  // is room: reserve_retirement)
   retired_t &new_retired() {
     for (auto &r : g_cap.retired) {
       if (!r.in_use) {
@@ -477,6 +504,7 @@ namespace {
     slot->in_use = true;
     slot->retired_qpc = qpc_now();
     slot->highest_fence_value = g_cap.highest_fence_value_used;
+    slot->owner_thread = g_cap.single_threaded ? g_cap.owner_thread : 0;
     if (g_cap.fence) {
       g_cap.fence->AddRef();
       slot->fence = g_cap.fence;
@@ -896,8 +924,10 @@ namespace {
   // is a direct queue of the swapchain's own device on a single-node adapter.
   // A swapchain ever seen presenting from more than one queue is marked
   // ambiguous and never captured; one on which no queue shows up within
-  // kQueueUnseenMs is reported unsupported. The first Present after injection
-  // therefore only learns the queue; capture starts with the next. An
+  // kQueueUnseenMs is reported unsupported. A swapchain may present each back
+  // buffer from its own queue (ResizeBuffers1), which may have been set up
+  // before we were injected, so a learned queue is trusted only once it was
+  // seen in as many Presents as there are buffers; capture starts after. An
   // observation is thrown away if the Present failed or another swapchain
   // presented inside it. ResizeBuffers1 names the swapchain's queues, so it
   // sets the queue itself (or vetoes the swapchain if they differ); a plain
@@ -970,9 +1000,20 @@ namespace {
     log("Swapchain %p %s: not captured", static_cast<void *>(swapchain), why);
   }
 
+  // How many Presents in a row showed the stored queue (0: none stored or unreadable)
+  std::uint32_t queue_seen(IDXGISwapChain *swapchain) {
+    std::uint32_t value = 0;
+    UINT size = sizeof(value);
+    return SUCCEEDED(swapchain->GetPrivateData(kQueueSeenKey, &size, &value)) && size == sizeof(value) ? value : 0;
+  }
+
+  bool set_queue_seen(IDXGISwapChain *swapchain, std::uint32_t value) {
+    return SUCCEEDED(swapchain->SetPrivateData(kQueueSeenKey, sizeof(value), &value));
+  }
+
   // Drops the swapchain's queue, to be learned again
   void forget_queue(IDXGISwapChain *swapchain) {
-    if (FAILED(swapchain->SetPrivateDataInterface(kQueueKey, nullptr))) {
+    if (!set_queue_seen(swapchain, 0) || FAILED(swapchain->SetPrivateDataInterface(kQueueKey, nullptr))) {
       veto(swapchain, "changed its buffers and its queue could not be forgotten");
     }
   }
@@ -990,12 +1031,17 @@ namespace {
     return usable;
   }
 
-  void remember_queue(IDXGISwapChain *swapchain, ID3D12CommandQueue *queue, const char *how) {
-    if (FAILED(swapchain->SetPrivateDataInterface(kQueueKey, queue))) {
-      log("Swapchain %p: its D3D12 queue %p could not be remembered", static_cast<void *>(swapchain), static_cast<void *>(queue));
-      return;
+  // Stores `queue` as seen `seen` times; false (and nothing stored) if the
+  // swapchain would not take it
+  bool remember_queue(IDXGISwapChain *swapchain, ID3D12CommandQueue *queue, std::uint32_t seen, const char *how) {
+    if (!set_queue_seen(swapchain, 0) || FAILED(swapchain->SetPrivateDataInterface(kQueueKey, queue))) {
+      return false;
+    }
+    if (!set_queue_seen(swapchain, seen)) {
+      return false;
     }
     log("Swapchain %p presents from D3D12 queue %p (%s)", static_cast<void *>(swapchain), static_cast<void *>(queue), how);
+    return true;
   }
 
   // The queue this swapchain was seen presenting from (a new reference), or null
@@ -1023,12 +1069,15 @@ namespace {
     ID3D12CommandQueue *known = known_queue(swapchain);
     if (t_seen_several || (known && known != seen)) {
       veto(swapchain, "presents from more than one D3D12 queue");
-    } else if (!known) {
-      if (usable_queue(swapchain, seen)) {
-        remember_queue(swapchain, seen, "seen inside Present");
-      } else {
-        veto(swapchain, "presents from a D3D12 queue of another device or node");
+    } else if (known) {
+      const auto count = queue_seen(swapchain);
+      if (count < 64 && !set_queue_seen(swapchain, count + 1)) {
+        forget_queue(swapchain);
       }
+    } else if (!usable_queue(swapchain, seen)) {
+      veto(swapchain, "presents from a D3D12 queue of another device or node");
+    } else if (!remember_queue(swapchain, seen, 1, "seen inside Present")) {
+      forget_queue(swapchain);
     }
     safe_release(known);
     safe_release(seen);
@@ -1043,9 +1092,8 @@ namespace {
       return;  // not D3D12
     }
     device->Release();
-    if (vetoed(swapchain)) {
-      return;
-    }
+    // (done even for a vetoed swapchain: a veto that could not be read now
+    // must not leave the old queue behind for a later read)
     if (!queues) {
       forget_queue(swapchain);
       return;
@@ -1071,8 +1119,9 @@ namespace {
     if (!one || !queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT || !usable_queue(swapchain, queue)) {
       forget_queue(swapchain);
       veto(swapchain, "was resized onto several D3D12 queues, or one we cannot copy on");
-    } else {
-      remember_queue(swapchain, queue, "named by ResizeBuffers1");
+    } else if (!remember_queue(swapchain, queue, UINT32_MAX, "named by ResizeBuffers1")) {
+      forget_queue(swapchain);
+      veto(swapchain, "was resized onto a D3D12 queue that could not be recorded");
     }
     safe_release(queue);
   }
@@ -1265,6 +1314,12 @@ namespace {
       return;
     }
     ID3D12CommandQueue *queue = known_queue(swapchain);
+    if (queue) {
+      DXGI_SWAP_CHAIN_DESC desc {};
+      if (FAILED(swapchain->GetDesc(&desc)) || queue_seen(swapchain) < std::max<UINT>(desc.BufferCount, 1)) {
+        safe_release(queue);  // not yet seen once per buffer
+      }
+    }
     if (!queue) {
       // Learned from this Present (after the real call); give up if it never shows
       const auto now = qpc_now();
@@ -1378,43 +1433,68 @@ namespace {
     return reinterpret_cast<HWND>(g_block->setup.hwnd.load(std::memory_order_relaxed));
   }
 
+  struct capture_lock_t {
+    bool held;
+
+    explicit capture_lock_t(bool block) {
+      if (block) {
+        AcquireSRWLockExclusive(&g_capture_lock);
+        held = true;
+      } else {
+        held = TryAcquireSRWLockExclusive(&g_capture_lock);
+      }
+    }
+
+    ~capture_lock_t() {
+      if (held) {
+        ReleaseSRWLockExclusive(&g_capture_lock);
+      }
+    }
+  };
+
+  // Whether this thread may touch the captured device (a single-threaded
+  // D3D11 device only from the thread that first presented it)
+  bool on_capture_thread() {
+    return !(g_cap.device && g_cap.single_threaded && GetCurrentThreadId() != g_cap.owner_thread);
+  }
+
   // The captured swapchain's device was lost (its Present said so): let go
   // of it now, since no further capture may come to notice
   void drop_lost_capture(IDXGISwapChain *swapchain) {
     if (g_captured_swapchain.load(std::memory_order_acquire) != swapchain) {
       return;
     }
-    AcquireSRWLockExclusive(&g_capture_lock);
-    if (g_cap.swapchain == swapchain) {
+    capture_lock_t lock(true);
+    if (g_cap.swapchain == swapchain && on_capture_thread() && reserve_retirement()) {
       log("The captured swapchain's device was lost: capture released");
       release_capture(setup_hwnd());
-      collect_retired(false);
     }
-    ReleaseSRWLockExclusive(&g_capture_lock);
   }
 
-  // While not capturing: retired entries are still collected, and a lost
-  // D3D12 device is still let go of
-  void housekeeping() {
-    if (!TryAcquireSRWLockExclusive(&g_capture_lock)) {
+  // While not capturing: retired entries are still collected, and a D3D12
+  // capture that must end (lost device, vetoed swapchain, D3D12 stopped)
+  // still ends
+  void housekeeping(IDXGISwapChain *swapchain) {
+    capture_lock_t lock(false);
+    if (!lock.held) {
       return;
     }
-    if (g_cap.device12 && FAILED(g_cap.device12->GetDeviceRemovedReason())) {
+    if (g_cap.device12 && reserve_retirement() &&
+        (FAILED(g_cap.device12->GetDeviceRemovedReason()) || g_d3d12_dead.load(std::memory_order_acquire) || (g_cap.swapchain == swapchain && vetoed(swapchain)))) {
       release_capture(setup_hwnd());
     }
     collect_retired(false);
-    ReleaseSRWLockExclusive(&g_capture_lock);
   }
 
   void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc, std::uint64_t release_qpc) {
     g_block->frames_presented.fetch_add(1, std::memory_order_relaxed);
     if (!g_block->capture_enabled.load(std::memory_order_acquire)) {
-      housekeeping();
+      housekeeping(swapchain);
       return;
     }
     HWND hwnd = nullptr;
     if (!foreground_window(swapchain, hwnd)) {
-      housekeeping();
+      housekeeping(swapchain);
       return;
     }
 
@@ -1431,9 +1511,13 @@ namespace {
 
     // A single-threaded device is touched only from the thread that first
     // presented it: any other thread skips before looking at any device
-    if (g_cap.device && g_cap.single_threaded && GetCurrentThreadId() != g_cap.owner_thread) {
+    if (!on_capture_thread()) {
       g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       return;
+    }
+    if (!reserve_retirement()) {
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+      return;  // out of memory: nothing may be retired this frame
     }
 
     collect_retired(false);
@@ -1671,7 +1755,11 @@ namespace {
   template<class F>
   HRESULT present_with_capture(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags, F &&real) {
     if (flags & DXGI_PRESENT_TEST) {
-      return real(sync_interval);
+      const HRESULT hr = real(sync_interval);
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        drop_lost_capture(swapchain);
+      }
+      return hr;
     }
     const auto now = qpc_now();
     const double period = g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) ? limiter_period_qpc(now) : 0;
