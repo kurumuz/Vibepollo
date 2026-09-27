@@ -418,13 +418,41 @@ namespace platf::dxgi {
       return capture_e::ok;
     }
 
-    // Hold the published slot first: the hook never writes the published
-    // slot, so holding it while the encoder image frees up costs the game
-    // nothing
+    // Destination first (the pool and encoder waits can be long), then the
+    // newest game frame, so what is converted is recent and the game's slot
+    // is held only for the copy
+    std::shared_ptr<platf::img_t> img;
+    if (!pull_free_image_cb(img)) {
+      return capture_e::interrupted;
+    }
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+    if (complete_img(d3d_img.get(), false)) {
+      return capture_e::error;
+    }
+    HRESULT hr = d3d_img->capture_mutex->AcquireSync(0, 3000);
+    if (hr == static_cast<HRESULT>(WAIT_ABANDONED)) {
+      BOOST_LOG(warning) << "Capture texture keyed mutex was abandoned; reinitializing capture"sv;
+      return capture_e::reinit;
+    }
+    if (hr != S_OK) {
+      BOOST_LOG(error) << "Failed to lock capture texture [0x"sv << util::hex(hr).to_string_view() << ']';
+      return capture_e::error;
+    }
+    auto release_capture_mutex = util::fail_guard([&]() {
+      d3d_img->capture_mutex->ReleaseSync(0);
+    });
+
+    // The waits above may have outlasted the game's foreground
+    if (!_game_source->still_foreground(captured_output_desc.DesktopCoordinates)) {
+      fall_back = true;
+      return capture_e::ok;
+    }
+
     game_capture::frame_t frame;
-    status = _game_source->lock(frame);
+    status = _game_source->lock(frame);  // rejects frames older than 250 ms
     if (status != capture_e::ok) {
-      return status;
+      fall_back = status == capture_e::timeout;  // nothing usable from the game right now
+      return fall_back ? capture_e::ok : status;
     }
     auto unlock_game = util::fail_guard([&]() {
       _game_source->unlock();
@@ -441,28 +469,7 @@ namespace platf::dxgi {
       return capture_e::ok;
     }
 
-    std::shared_ptr<platf::img_t> img;
-    if (!pull_free_image_cb(img)) {
-      return capture_e::interrupted;
-    }
-    // The pool wait can be long under encoder pressure: the game may have
-    // lost the foreground meanwhile
-    if (!_game_source->still_foreground(captured_output_desc.DesktopCoordinates)) {
-      fall_back = true;
-      return capture_e::ok;
-    }
-    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
-    if (complete_img(d3d_img.get(), false)) {
-      return capture_e::error;
-    }
-
-    HRESULT hr = d3d_img->capture_mutex->AcquireSync(0, 3000);
-    if (hr != S_OK && hr != static_cast<HRESULT>(WAIT_ABANDONED)) {
-      BOOST_LOG(error) << "Failed to lock capture texture [0x"sv << util::hex(hr).to_string_view() << ']';
-      return capture_e::error;
-    }
     const bool converted = _game_converter->convert(device.get(), device_ctx.get(), frame, d3d_img->capture_texture.get(), d3d_img->capture_rt.get(), capture_format, _game_sdr_white_scale);
-    d3d_img->capture_mutex->ReleaseSync(0);
     if (!converted) {
       const auto key = (static_cast<std::uint64_t>(frame.format) << 32) | static_cast<std::uint32_t>(frame.color_space) | (1ull << 63);
       if (_game_mismatch_logged != key) {

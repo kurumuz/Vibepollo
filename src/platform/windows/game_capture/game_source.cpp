@@ -407,6 +407,7 @@ namespace platf::dxgi::game_capture {
 
     winrt::handle frame_event;
     int open_failures = 0;
+    std::uint32_t open_failures_generation = 0;
     std::uint32_t opened_generation = 0;  // 0 = none opened (the hook's first generation is 1)
     winrt::com_ptr<ID3D11Texture2D> textures[gc::kSlots];
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
@@ -680,7 +681,12 @@ namespace platf::dxgi::game_capture {
       if (this_desc.MipLevels != 1 || this_desc.ArraySize != 1 || this_desc.SampleDesc.Count != 1 ||
           !(this_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) || this_desc.Width == 0 || this_desc.Height == 0) {
         // A recycled handle during a resize storm looks like this too, so
-        // retry a few times before concluding the hook is misbehaving
+        // retry a few times against the same setup before concluding the
+        // hook is misbehaving
+        if (t.open_failures_generation != generation) {
+          t.open_failures_generation = generation;
+          t.open_failures = 0;
+        }
         if (++t.open_failures >= 8) {
           t.give_up("the hook's texture has an unexpected shape");
         }

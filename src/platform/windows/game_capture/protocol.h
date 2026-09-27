@@ -47,7 +47,9 @@ namespace game_capture {
   constexpr std::size_t kErrorLength = 160;
 
   inline void shared_block_name(wchar_t *buffer, std::size_t count, std::uint32_t pid) {
-    std::swprintf(buffer, count, L"Global\\VibepolloGameCapture_%u", pid);
+    // Versioned: a mapping left by an earlier implementation (other layout,
+    // wider ACL) is never reattached
+    std::swprintf(buffer, count, L"Global\\VibepolloGameCapture%u_%u", kVersion, pid);
   }
 
   enum class hook_state_e : std::uint32_t {

@@ -28,7 +28,10 @@
  *  - Slot ownership is a per-slot atomic word (state | submission ticket).
  *    Every transition is a CAS on the exact word observed, so a stale
  *    completion, a retirement or a reuse can never act on a slot's new
- *    occupant. The completion thread is the only writer of `latest`.
+ *    occupant. The completion thread is the only writer of `latest`, and it
+ *    does its whole read/check/publish under the capture lock (a normal
+ *    acquire; the render thread only ever try-locks and skips), so no
+ *    submission is rewritten or retired underneath it.
  *  - Nothing is drained or waited for on the render thread: retired textures
  *    are released on a later Present, once their copies have completed.
  */
@@ -68,6 +71,7 @@ namespace {
 
   gc::shared_block_t *g_block = nullptr;
   thread_local bool t_in_present = false;
+  std::atomic<bool> g_color_tracking_lost {false};  // a SetColorSpace1 could not be recorded
 
   // ---- logging -----------------------------------------------------------
 
@@ -169,17 +173,16 @@ namespace {
   std::uint64_t g_next_ticket = 1;  // render thread only
   std::atomic<std::uint32_t> g_current_generation {0};  // 0 = nothing set up; first textures are generation 1
 
-  // The fence the completion thread checks completions against: one
-  // reference held for it by the render thread at publication, released by
-  // the completion thread when it sees a newer pointer.
-  std::atomic<ID3D11Fence *> g_worker_fence {nullptr};
-
   // Completion-thread state
   int g_published_slot = -1;
   std::uint64_t g_published_word = 0;
   std::uint64_t g_last_published_frame_id = 0;
-  ID3D11Fence *g_worker_fence_held = nullptr;
 
+  SRWLOCK g_capture_lock = SRWLOCK_INIT;  // held by the one thread capturing; Presents try-lock and skip
+  ID3D11Fence *current_fence();  // the captured device's fence; capture lock held
+
+  // Runs under the capture lock: nothing here can be retired or rewritten
+  // by the render thread meanwhile (it skips the frame instead).
   void complete_slot(int slot) {
     auto &s = g_slots[slot];
     const auto word = s.word.load(std::memory_order_acquire);
@@ -190,21 +193,20 @@ namespace {
     const auto generation = s.generation;
     const auto frame_id = s.frame_id;
     const auto fence_value = s.fence_value;
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (s.word.load(std::memory_order_relaxed) != word) {
-      return;  // reused meanwhile: those fields were not this submission's
-    }
 
-    // Is this event the copy's real completion? Only a fence can say; an
+    // Is this event the copy's real completion? Only the fence can say; an
     // event set early for this slot (a previous occupant's registration
-    // firing late) is ignored and the real one publishes.
+    // firing late) is ignored and the real one publishes. A removed device
+    // reports every value complete: nothing of it is trusted.
     if (fence_value) {
-      ID3D11Fence *fence = g_worker_fence.load(std::memory_order_acquire);
-      if (fence != g_worker_fence_held) {
-        safe_release(g_worker_fence_held);
-        g_worker_fence_held = fence;  // the reference the render thread left for us
+      ID3D11Fence *fence = current_fence();
+      const auto completed = fence ? fence->GetCompletedValue() : UINT64_MAX;
+      if (completed < fence_value) {
+        return;
       }
-      if (!fence || fence->GetCompletedValue() < fence_value) {
+      if (completed == UINT64_MAX) {
+        auto lost = word;
+        s.word.compare_exchange_strong(lost, make_word(st_free, word), std::memory_order_acq_rel);
         return;
       }
     }
@@ -250,7 +252,9 @@ namespace {
       if (r < WAIT_OBJECT_0 || r >= WAIT_OBJECT_0 + gc::kSlots) {
         return 1;
       }
+      AcquireSRWLockExclusive(&g_capture_lock);
       complete_slot(static_cast<int>(r - WAIT_OBJECT_0));
+      ReleaseSRWLockExclusive(&g_capture_lock);
     }
   }
 
@@ -297,7 +301,10 @@ namespace {
   };
 
   capture_t g_cap;
-  SRWLOCK g_capture_lock = SRWLOCK_INIT;  // held by the one thread capturing; others skip
+
+  ID3D11Fence *current_fence() {
+    return g_cap.fence;
+  }
 
   void publish_setup(HWND hwnd, bool valid) {
     auto &b = *g_block;
@@ -359,6 +366,7 @@ namespace {
         continue;
       }
       if (!r.textures_released) {
+        // (UINT64_MAX = device removed: nothing more will complete; release)
         const bool done = !r.fence || r.fence->GetCompletedValue() >= r.highest_fence_value;
         const bool old = now - r.retired_qpc > qpc_frequency();
         if (done || old || force) {
@@ -460,7 +468,6 @@ namespace {
     // thread checks its completed value through a reference of its own, so
     // a device created single-threaded gets no fence (frames publish at
     // Present time), as do runtimes without fences.
-    ID3D11Fence *worker_fence = nullptr;
     if (!g_cap.single_threaded) {
       ID3D11Device5 *device5 = nullptr;
       if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&device5)))) {
@@ -471,16 +478,8 @@ namespace {
         }
         device5->Release();
       }
-      if (g_cap.fence) {
-        g_cap.fence->AddRef();  // the completion thread's reference
-        worker_fence = g_cap.fence;
-      }
     }
     g_cap.fence_value = 0;
-    // Hand the completion thread its fence (it releases the previous one).
-    // An unclaimed handoff (no completion ever ran) leaks one reference,
-    // bounded by device changes, which are rare.
-    g_worker_fence.store(worker_fence, std::memory_order_release);
     log("Device %p (%s): frames timestamped at %s", static_cast<void *>(device), g_cap.single_threaded ? "single-threaded" : "multithreaded",
         g_cap.fence ? "GPU completion" : "Present");
     return true;
@@ -526,7 +525,14 @@ namespace {
     if (SUCCEEDED(swapchain->GetPrivateData(kColorSpaceKey, &size, &stored)) && size == sizeof(stored)) {
       return stored;
     }
-    return default_color_space(format);
+    // A change we could not record may have made a 10-bit chain HDR10;
+    // formats with a fixed encoding are unaffected
+    const auto by_format = default_color_space(format);
+    if (g_color_tracking_lost.load(std::memory_order_acquire) && by_format != static_cast<std::uint32_t>(gc::color_space_e::scrgb) &&
+        (format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R10G10B10A2_TYPELESS)) {
+      return static_cast<std::uint32_t>(gc::color_space_e::unknown);
+    }
+    return by_format;
   }
 
   bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd) {
@@ -594,9 +600,11 @@ namespace {
     return hwnd == foreground || GetAncestor(hwnd, GA_ROOT) == foreground;
   }
 
-  int find_free_slot() {
+  // A free slot whose keyed mutex is available now (the host may still hold
+  // the previously published one); -1 if none
+  int acquire_free_slot() {
     for (int i = 0; i < gc::kSlots; ++i) {
-      if (word_state(g_slots[i].word.load(std::memory_order_acquire)) == st_free) {
+      if (word_state(g_slots[i].word.load(std::memory_order_acquire)) == st_free && g_cap.mutexes[i]->AcquireSync(0, 0) == S_OK) {
         return i;
       }
     }
@@ -656,8 +664,8 @@ namespace {
     }
     const std::uint32_t color_space = swapchain_color_space(swapchain, g_cap.format);
 
-    const int slot = find_free_slot();
-    if (slot < 0 || g_cap.mutexes[slot]->AcquireSync(0, 0) != S_OK) {
+    const int slot = acquire_free_slot();
+    if (slot < 0) {
       g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       back->Release();
       return;
@@ -703,13 +711,13 @@ namespace {
     bool signalled = false;
     if (s.fence_value) {
       g_cap.highest_fence_value_used = s.fence_value;
-      g_cap.context4->Signal(g_cap.fence, s.fence_value);
-      signalled = SUCCEEDED(g_cap.fence->SetEventOnCompletion(s.fence_value, s.done_event));
+      signalled = SUCCEEDED(g_cap.context4->Signal(g_cap.fence, s.fence_value)) &&
+                  SUCCEEDED(g_cap.fence->SetEventOnCompletion(s.fence_value, s.done_event));
     }
     if (!signalled) {
       if (s.fence_value) {
-        // The completion thread would wait for the fence; without a
-        // registration nothing wakes it, so this frame is dropped instead
+        // No completion will come for this value: drop the frame rather
+        // than leave its slot pending forever
         auto pending = make_word(st_pending, ticket);
         s.word.compare_exchange_strong(pending, make_word(st_free, ticket), std::memory_order_acq_rel);
         g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -766,8 +774,12 @@ namespace {
         cs = gc::color_space_e::hdr10;
       }
       const auto value = static_cast<std::uint32_t>(cs);
-      swapchain->SetPrivateData(kColorSpaceKey, sizeof(value), &value);
-      log("Swapchain %p color space %d", static_cast<void *>(swapchain), static_cast<int>(color_space));
+      if (FAILED(swapchain->SetPrivateData(kColorSpaceKey, sizeof(value), &value))) {
+        g_color_tracking_lost.store(true, std::memory_order_release);
+        log("Swapchain %p color space %d could not be recorded", static_cast<void *>(swapchain), static_cast<int>(color_space));
+      } else {
+        log("Swapchain %p color space %d", static_cast<void *>(swapchain), static_cast<int>(color_space));
+      }
     }
     return hr;
   }
