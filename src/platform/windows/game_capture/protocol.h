@@ -42,7 +42,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 4;
+  constexpr std::uint32_t kVersion = 5;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 160;
 
@@ -73,6 +73,12 @@ namespace game_capture {
     hdr10 = 3,  ///< DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, PQ
   };
 
+  // How setup_t::textures are shared
+  enum class handle_kind_e : std::uint32_t {
+    nt = 0,  ///< NT handles in the game process: the host duplicates them
+    legacy = 1,  ///< global (KMT) share handles, opened directly (for devices that refuse NT-handle sharing)
+  };
+
   // Texture setup for one generation (rewritten on every resize / device
   // change), published as a unit under setup_seq. Handles of the previous
   // generation stay open in the hook until the one after it, so a host still
@@ -86,7 +92,8 @@ namespace game_capture {
     std::atomic<std::uint32_t> adapter_luid_low;
     std::atomic<std::int32_t> adapter_luid_high;
     std::atomic<std::uint64_t> hwnd;  ///< the swapchain's output window
-    std::atomic<std::uint64_t> textures[kSlots];  ///< NT handle values in the game process (0 = none)
+    std::atomic<std::uint32_t> handle_kind;  ///< handle_kind_e
+    std::atomic<std::uint64_t> textures[kSlots];  ///< handle values, see handle_kind (0 = none)
   };
 
   // What one slot's texture holds. `seq` is odd while the render thread

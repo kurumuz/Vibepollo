@@ -291,7 +291,8 @@ namespace {
 
     ID3D11Texture2D *textures[gc::kSlots] = {};
     IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
-    HANDLE shared_handles[gc::kSlots] = {};
+    HANDLE shared_handles[gc::kSlots] = {};  // NT handles (owned); null with legacy sharing
+    std::uint64_t legacy_handles[gc::kSlots] = {};  // global (KMT) share handles: not closable, live as long as the texture
     UINT width = 0;
     UINT height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -317,8 +318,10 @@ namespace {
     b.setup.format.store(static_cast<std::uint32_t>(valid ? g_cap.format : DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
     b.setup.hwnd.store(reinterpret_cast<std::uint64_t>(hwnd), std::memory_order_relaxed);
     for (int i = 0; i < gc::kSlots; ++i) {
-      b.setup.textures[i].store(valid ? reinterpret_cast<std::uint64_t>(g_cap.shared_handles[i]) : 0, std::memory_order_relaxed);
+      const auto value = g_cap.shared_handles[i] ? reinterpret_cast<std::uint64_t>(g_cap.shared_handles[i]) : g_cap.legacy_handles[i];
+      b.setup.textures[i].store(valid ? value : 0, std::memory_order_relaxed);
     }
+    b.setup.handle_kind.store(static_cast<std::uint32_t>(valid && g_cap.legacy_handles[0] ? gc::handle_kind_e::legacy : gc::handle_kind_e::nt), std::memory_order_relaxed);
     if (valid && g_cap.device) {
       IDXGIDevice *dxgi_device = nullptr;
       if (SUCCEEDED(g_cap.device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device)))) {
@@ -426,6 +429,7 @@ namespace {
     std::memset(g_cap.textures, 0, sizeof(g_cap.textures));
     std::memset(g_cap.mutexes, 0, sizeof(g_cap.mutexes));
     std::memset(g_cap.shared_handles, 0, sizeof(g_cap.shared_handles));
+    std::memset(g_cap.legacy_handles, 0, sizeof(g_cap.legacy_handles));
     g_cap.width = g_cap.height = 0;
     g_cap.format = DXGI_FORMAT_UNKNOWN;
     g_cap.highest_fence_value_used = 0;
@@ -549,33 +553,86 @@ namespace {
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
-    for (int i = 0; i < gc::kSlots; ++i) {
-      HRESULT hr = g_cap.device->CreateTexture2D(&desc, nullptr, &g_cap.textures[i]);
-      if (SUCCEEDED(hr)) {
-        hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&g_cap.mutexes[i]));
+    // Preferred: NT handles (duplicated by the host, never globally
+    // guessable). Some devices refuse NT-handle sharing (E_INVALIDARG), so
+    // fall back to the legacy global handles every capture tool uses. The
+    // hook only copies into these, so the render-target bind is optional.
+    struct variant_t {
+      bool nt;
+      UINT bind;
+      const char *name;
+    };
+    constexpr variant_t variants[] = {
+      {true, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, "nt/rtv"},
+      {true, D3D11_BIND_SHADER_RESOURCE, "nt"},
+      {false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, "kmt/rtv"},
+      {false, D3D11_BIND_SHADER_RESOURCE, "kmt"},
+    };
+
+    auto release_partial = [] {
+      for (int j = 0; j < gc::kSlots; ++j) {
+        safe_release(g_cap.mutexes[j]);
+        safe_release(g_cap.textures[j]);
       }
-      IDXGIResource1 *resource = nullptr;
-      if (SUCCEEDED(hr)) {
-        hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&resource));
-      }
-      if (SUCCEEDED(hr)) {
-        hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &g_cap.shared_handles[i]);
-        resource->Release();
-      }
-      if (FAILED(hr)) {
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "Creating capture texture %d (%ux%u fmt %d) failed: 0x%08lx", i, desc.Width, desc.Height, desc.Format, hr);
-        set_state(gc::hook_state_e::failed, msg);
-        for (int j = 0; j < gc::kSlots; ++j) {
-          safe_release(g_cap.mutexes[j]);
-          safe_release(g_cap.textures[j]);
+      close_handles(g_cap.shared_handles);
+      std::memset(g_cap.legacy_handles, 0, sizeof(g_cap.legacy_handles));
+    };
+
+    char failures[gc::kErrorLength] = {};
+    const variant_t *used = nullptr;
+    for (const auto &v : variants) {
+      desc.BindFlags = v.bind;
+      desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | (v.nt ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0);
+      const char *step = nullptr;
+      HRESULT hr = S_OK;
+      for (int i = 0; i < gc::kSlots && SUCCEEDED(hr); ++i) {
+        step = "create";
+        hr = g_cap.device->CreateTexture2D(&desc, nullptr, &g_cap.textures[i]);
+        if (SUCCEEDED(hr)) {
+          step = "keyedmutex";
+          hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&g_cap.mutexes[i]));
         }
-        close_handles(g_cap.shared_handles);
-        return false;
+        if (SUCCEEDED(hr) && v.nt) {
+          step = "nthandle";
+          IDXGIResource1 *resource = nullptr;
+          hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&resource));
+          if (SUCCEEDED(hr)) {
+            hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &g_cap.shared_handles[i]);
+            resource->Release();
+          }
+        } else if (SUCCEEDED(hr)) {
+          step = "sharedhandle";
+          IDXGIResource *resource = nullptr;
+          hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&resource));
+          HANDLE handle = nullptr;
+          if (SUCCEEDED(hr)) {
+            hr = resource->GetSharedHandle(&handle);
+            resource->Release();
+          }
+          if (SUCCEEDED(hr) && !handle) {
+            hr = E_FAIL;
+          }
+          g_cap.legacy_handles[i] = reinterpret_cast<std::uint64_t>(handle);
+        }
       }
+      if (SUCCEEDED(hr)) {
+        used = &v;
+        break;
+      }
+      log("Capture texture variant %s (%ux%u fmt %d) failed at %s: 0x%08lx", v.name, desc.Width, desc.Height, desc.Format, step, hr);
+      const auto len = std::strlen(failures);
+      std::snprintf(failures + len, sizeof(failures) - len, "%s%s@%s=0x%08lx", len ? " " : "", v.name, step, hr);
+      release_partial();
+    }
+    if (!used) {
+      char msg[gc::kErrorLength];
+      std::snprintf(msg, sizeof(msg), "Textures %ux%u f%d FL%x cf%x: %s", desc.Width, desc.Height, desc.Format, g_cap.device->GetFeatureLevel(), g_cap.device->GetCreationFlags(), failures);
+      set_state(gc::hook_state_e::failed, msg);
+      return false;
+    }
+    if (used != &variants[0]) {
+      log("Capture textures use %s sharing (device FL %x, flags %x)", used->name, g_cap.device->GetFeatureLevel(), g_cap.device->GetCreationFlags());
     }
 
     g_cap.width = back.Width;

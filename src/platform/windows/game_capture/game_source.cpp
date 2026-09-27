@@ -431,7 +431,7 @@ namespace platf::dxgi::game_capture {
     }
 
     // Reads the setup consistently (seqlock)
-    bool read_setup(std::uint32_t &generation, std::uint64_t handles[gc::kSlots], LUID &luid, std::uint32_t &width, std::uint32_t &height) const {
+    bool read_setup(std::uint32_t &generation, std::uint64_t handles[gc::kSlots], std::uint32_t &handle_kind, LUID &luid, std::uint32_t &width, std::uint32_t &height) const {
       for (int attempt = 0; attempt < 8; ++attempt) {
         const auto s1 = block->setup_seq.load(std::memory_order_acquire);
         if (s1 & 1u) {
@@ -441,6 +441,7 @@ namespace platf::dxgi::game_capture {
         for (int i = 0; i < gc::kSlots; ++i) {
           handles[i] = block->setup.textures[i].load(std::memory_order_relaxed);
         }
+        handle_kind = block->setup.handle_kind.load(std::memory_order_relaxed);
         luid.LowPart = block->setup.adapter_luid_low.load(std::memory_order_relaxed);
         luid.HighPart = block->setup.adapter_luid_high.load(std::memory_order_relaxed);
         width = block->setup.width.load(std::memory_order_relaxed);
@@ -586,10 +587,10 @@ namespace platf::dxgi::game_capture {
       return false;
     }
 
-    std::uint32_t generation, width, height;
+    std::uint32_t generation, handle_kind, width, height;
     std::uint64_t handles[gc::kSlots];
     LUID luid;
-    if (!t.read_setup(generation, handles, luid, width, height)) {
+    if (!t.read_setup(generation, handles, handle_kind, luid, width, height)) {
       return false;
     }
     if (generation != t.opened_generation && !open_generation(t)) {
@@ -634,10 +635,10 @@ namespace platf::dxgi::game_capture {
   }
 
   bool source_t::open_generation(target_t &t) {
-    std::uint32_t generation, width, height;
+    std::uint32_t generation, handle_kind, width, height;
     std::uint64_t handles[gc::kSlots];
     LUID luid;
-    if (!t.read_setup(generation, handles, luid, width, height)) {
+    if (!t.read_setup(generation, handles, handle_kind, luid, width, height)) {
       return false;
     }
     if (width == 0 || height == 0) {
@@ -676,12 +677,21 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC desc {};
     for (int i = 0; i < gc::kSlots; ++i) {
-      winrt::handle shared {duplicate(handles[i])};
-      if (!shared) {
-        BOOST_LOG(warning) << "Game capture: cannot duplicate texture handle " << i << " (" << GetLastError() << ')';
-        return false;
+      HRESULT hr;
+      if (handle_kind == static_cast<std::uint32_t>(gc::handle_kind_e::legacy)) {
+        // A global share handle: opened as is, nothing to duplicate
+        if (!handles[i]) {
+          return false;
+        }
+        hr = _device->OpenSharedResource(reinterpret_cast<HANDLE>(handles[i]), __uuidof(ID3D11Texture2D), textures[i].put_void());
+      } else {
+        winrt::handle shared {duplicate(handles[i])};
+        if (!shared) {
+          BOOST_LOG(warning) << "Game capture: cannot duplicate texture handle " << i << " (" << GetLastError() << ')';
+          return false;
+        }
+        hr = _device->OpenSharedResource1(shared.get(), __uuidof(ID3D11Texture2D), textures[i].put_void());
       }
-      const HRESULT hr = _device->OpenSharedResource1(shared.get(), __uuidof(ID3D11Texture2D), textures[i].put_void());
       if (FAILED(hr) || FAILED(textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), mutexes[i].put_void()))) {
         BOOST_LOG(warning) << "Game capture: cannot open shared texture " << i << " [0x" << util::hex(hr).to_string_view() << ']';
         return false;
@@ -713,10 +723,10 @@ namespace platf::dxgi::game_capture {
       return false;  // setup moved on while opening; the next call retries
     }
     // The setup must not have changed underneath the handles we opened
-    std::uint32_t generation2, width2, height2;
+    std::uint32_t generation2, handle_kind2, width2, height2;
     std::uint64_t handles2[gc::kSlots];
     LUID luid2;
-    if (!t.read_setup(generation2, handles2, luid2, width2, height2) || generation2 != generation) {
+    if (!t.read_setup(generation2, handles2, handle_kind2, luid2, width2, height2) || generation2 != generation) {
       return false;
     }
 
