@@ -256,10 +256,12 @@ namespace platf::dxgi {
         bool fall_back = false;
         const auto status = snapshot_game(pull_free_image_cb, img_out, effective_wgc_timeout(timeout, _config.framerate), fall_back);
         if (!fall_back) {
+          _game_source->note_frame_source(true);
           return status;
         }
         ++_game_desktop_frames_in_game_mode;
       }
+      _game_source->note_frame_source(false);  // this snapshot comes from the desktop
     }
 
     timeout = effective_wgc_timeout(timeout, _config.framerate);

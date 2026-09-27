@@ -60,13 +60,14 @@ namespace platf::dxgi::game_capture {
         std::lock_guard lg(g_instances_lock);
         return g_instances.count(lock) != 0;
       }
+      // Fails closed: only proof of absence counts as dead
       HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
       if (!process) {
-        return GetLastError() == ERROR_ACCESS_DENIED;  // exists, just not ours to open
+        return GetLastError() != ERROR_INVALID_PARAMETER;  // no such process
       }
-      const bool alive = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+      const bool exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
       CloseHandle(process);
-      return alive;
+      return !exited;
     }
 
     std::wstring hook_dll_path() {
@@ -529,6 +530,7 @@ namespace platf::dxgi::game_capture {
 
   source_t::~source_t() {
     unlock();
+    bool still_reading = false;
     for (auto &[pid, t] : _targets) {
       if (!t->attached || !t->block || !t->host_locked) {
         continue;
@@ -549,9 +551,15 @@ namespace platf::dxgi::game_capture {
         auto mine = _instance_id;
         t->block->host_lock.compare_exchange_strong(mine, 0, std::memory_order_acq_rel);
       }
+      still_reading = still_reading || holding;
     }
-    std::lock_guard lg(g_instances_lock);
-    g_instances.erase(_instance_id);
+    // An instance that kept a lock stays registered as alive: its claims
+    // outlive it until the process exits, rather than being cleared by a
+    // successor while its reads may still run
+    if (!still_reading) {
+      std::lock_guard lg(g_instances_lock);
+      g_instances.erase(_instance_id);
+    }
   }
 
   bool source_t::acquire_host(target_t &t) {
@@ -639,7 +647,7 @@ namespace platf::dxgi::game_capture {
       // Stop copying in the process we are leaving; its hook stays loaded
       // for when it comes back into focus
       unlock();
-      if (auto *previous = current(); previous && previous->attached && previous->block) {
+      if (auto *previous = current(); previous && previous->attached && previous->block && previous->host_locked) {
         previous->block->capture_enabled.store(0, std::memory_order_release);
       }
       _current_pid = pid;
@@ -1034,6 +1042,10 @@ namespace platf::dxgi::game_capture {
 
   void source_t::set_frame_rate(double fps) {
     _pacing.set_nominal(fps > 0 ? 1.0 / fps : 0);
+  }
+
+  void source_t::note_frame_source(bool from_game) {
+    _pacing.note_source(from_game);
   }
 
   void source_t::release_reads(target_t &t, bool wait) {

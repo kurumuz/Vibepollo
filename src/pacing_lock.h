@@ -37,7 +37,7 @@ namespace pacing_lock {
   // accepts pacing feedback
   constexpr std::uint32_t SS_FF_PACING_LOCK = 0x10000000;
 
-  constexpr std::uint32_t kFeedbackVersion = 1;
+  constexpr std::uint32_t kFeedbackVersion = 2;
   constexpr std::uint32_t kFeedbackValid = 0x1;  ///< the client measured a lockable relation
 
 #pragma pack(push, 1)
@@ -49,10 +49,12 @@ namespace pacing_lock {
     std::uint32_t vblanks_per_frame;  ///< client refreshes per stream frame (1, 2, 3, ...)
     std::int32_t phase_error_us;  ///< mean (vblank - scheduled present - margin), wrapped to +-half a refresh
     std::uint32_t samples;  ///< frames behind this report
+    std::uint32_t sequence;  ///< increments per report; an older one arriving late is dropped
+    std::uint32_t reserved;
   };
 #pragma pack(pop)
 
-  static_assert(sizeof(pacing_feedback_t) == 32, "pacing_feedback_t must be 32 bytes on the wire");
+  static_assert(sizeof(pacing_feedback_t) == 40, "pacing_feedback_t must be 40 bytes on the wire");
 
   /**
    * @brief Record a report from the client (control stream thread).
@@ -77,11 +79,21 @@ namespace pacing_lock {
     static constexpr double kMaxFeedforwardError = 0.01;
     // Reports older than this no longer steer: back to the nominal period
     static constexpr auto kFeedbackTimeout = std::chrono::milliseconds(1500);
+    // After the stream switches back to the game's frames, reports still
+    // describe the desktop's for a while (a report window plus transit)
+    static constexpr auto kSourceSettle = std::chrono::milliseconds(1000);
 
     /**
      * @param nominal_period_s the stream's frame period (1 / fps)
      */
     void set_nominal(double nominal_period_s);
+
+    /**
+     * @brief Whether the stream's frames currently come from the paced game.
+     *        While they do not, the loop holds its frequency and does not
+     *        steer on the phase it is told about.
+     */
+    void note_source(bool from_game);
 
     /**
      * @brief The limiter period to apply now, in picoseconds (0 when there is
@@ -100,7 +112,10 @@ namespace pacing_lock {
     std::uint64_t _seen_serial = 0;
     std::chrono::steady_clock::time_point _last_report {};
     double _integral = 0;
+    double _feedforward = 0;
     bool _locked = false;
+    bool _from_game = false;
+    std::chrono::steady_clock::time_point _game_since {};
     double _last_phase_us = 0;
     double _last_adjust = 0;
     double _last_feedforward_ppm = 0;

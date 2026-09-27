@@ -20,6 +20,11 @@ namespace pacing_lock {
 
   void submit(const pacing_feedback_t &feedback) {
     std::lock_guard lg(g_lock);
+    // Unsequenced delivery: a report overtaken by a newer one is stale
+    if (g_serial != 0 && g_latest.version == feedback.version &&
+        static_cast<std::int32_t>(feedback.sequence - g_latest.sequence) <= 0) {
+      return;
+    }
     g_latest = feedback;
     g_latest_at = std::chrono::steady_clock::now();
     ++g_serial;
@@ -39,6 +44,13 @@ namespace pacing_lock {
       _integral = 0;
       _locked = false;
     }
+  }
+
+  void controller_t::note_source(bool from_game) {
+    if (from_game && !_from_game) {
+      _game_since = std::chrono::steady_clock::now();
+    }
+    _from_game = from_game;
   }
 
   std::uint64_t controller_t::period_ps() {
@@ -69,11 +81,20 @@ namespace pacing_lock {
       const double phase = static_cast<double>(feedback.phase_error_us) * 1e-6;
       const auto vblanks = feedback.vblanks_per_frame;
       const double feedforward = vblanks >= 1 && vblanks <= 8 && std::abs(skew) < 1e-3 ? vblanks * refresh / (1 + skew) : 0;
-      if (feedforward <= 0 || std::abs(feedforward / _nominal - 1) > kMaxFeedforwardError || std::abs(phase) > refresh) {
+      if (feedforward <= 0 || std::abs(feedforward / _nominal - 1) > kMaxFeedforwardError || std::abs(phase) > refresh / 2 + 100e-6) {
         ++_rejected;
         _period = _nominal;
         _integral = 0;
         _locked = false;
+      } else if (!_from_game || now - _game_since < kSourceSettle) {
+        // The reports describe frames the limiter does not produce: hold the
+        // frequency, steer nothing
+        _feedforward = feedforward;
+        _period = feedforward * (1 + _integral);
+        _last_report = now;
+        _locked = true;
+        _last_phase_us = phase * 1e6;
+        _last_adjust = _integral;
       } else {
         // Reports arrive every ~250 ms; a gap (or the first report) counts as one interval
         double dt = _locked ? std::chrono::duration<double>(now - _last_report).count() : 0.25;
@@ -81,6 +102,7 @@ namespace pacing_lock {
         _last_report = now;
         _integral = std::clamp(_integral + phase * dt / (4 * kPhaseTimeConstant * kPhaseTimeConstant), -kMaxIntegral, kMaxIntegral);
         const double adjust = std::clamp(phase / kPhaseTimeConstant + _integral, -kMaxAdjust, kMaxAdjust);
+        _feedforward = feedforward;
         _period = feedforward * (1 + adjust);
         _locked = true;
         _last_phase_us = phase * 1e6;
@@ -96,7 +118,7 @@ namespace pacing_lock {
     if (!_locked) {
       std::snprintf(buffer, sizeof(buffer), "pacing lock off (period %.4f ms, reports=%llu rejected=%llu)", _period * 1e3, static_cast<unsigned long long>(_reports), static_cast<unsigned long long>(_rejected));
     } else {
-      std::snprintf(buffer, sizeof(buffer), "pacing lock on (period %.4f ms, feedforward %+.1f ppm, phase %+.0f us, adjust %+.0f ppm, integral %+.0f ppm, reports=%llu)", _period * 1e3, _last_feedforward_ppm, _last_phase_us, _last_adjust * 1e6, _integral * 1e6, static_cast<unsigned long long>(_reports));
+      std::snprintf(buffer, sizeof(buffer), "pacing lock %s (period %.4f ms, feedforward %+.1f ppm, phase %+.0f us, adjust %+.0f ppm, integral %+.0f ppm, reports=%llu)", _from_game ? "steering" : "holding (desktop frames)", _period * 1e3, _last_feedforward_ppm, _last_phase_us, _last_adjust * 1e6, _integral * 1e6, static_cast<unsigned long long>(_reports));
     }
     return buffer;
   }

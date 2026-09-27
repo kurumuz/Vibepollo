@@ -80,6 +80,13 @@ namespace platf::dxgi::game_capture {
      */
     void set_frame_rate(double fps);
 
+    /**
+     * @brief Where the frame just delivered came from. The client's phase
+     *        reports describe the stream it receives: they steer the game's
+     *        limiter only while that stream is the game's.
+     */
+    void note_frame_source(bool from_game);
+
   private:
     struct attach_job_t;
     struct target_t;

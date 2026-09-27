@@ -901,24 +901,30 @@ namespace {
   // rendered. A limiter that waits before Present (RTSS async) holds a
   // finished frame instead: its content ages by the whole wait.
   //
-  // One swapchain is paced: the one being captured when it presents, else
-  // the first to present (re-chosen once it has been idle for half a
-  // second). A second thread presenting meanwhile never waits here.
+  // One Present paces at a time: it takes `owner` before deciding anything
+  // and keeps it through its wait, and every other Present meanwhile (another
+  // thread, another swapchain) runs unpaced and untouched. All limiter state
+  // below belongs to the owner. One swapchain is paced: the one being
+  // captured when it presents, else the first to present, re-chosen once it
+  // has been idle for half a second; a change of swapchain starts a new grid.
+  // Presents that must not block (DXGI_PRESENT_DO_NOT_WAIT) are never paced.
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
   #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
   struct limiter_t {
-    std::atomic<IDXGISwapChain *> swapchain {nullptr};  // identity only
-    std::atomic<std::uint64_t> last_present_qpc {0};
-    SRWLOCK lock = SRWLOCK_INIT;  // next_release
+    std::atomic<DWORD> owner {0};  // thread id of the pacing Present; 0 = none
+
+    // Owner only
+    IDXGISwapChain *swapchain = nullptr;  // identity only
+    std::uint64_t last_present_qpc = 0;
     double next_release = 0;  // QPC of the current release point; 0 = no grid yet
-    std::atomic<std::uint64_t> release_qpc {0};  // the release that started the frame now being rendered
+    std::uint64_t release_qpc = 0;  // the release that started the frame now being rendered on `swapchain`
+    HANDLE timer = nullptr;  // one timer: only the owner waits
   };
 
   limiter_t g_limiter;
-  thread_local HANDLE t_limiter_timer = nullptr;
 
   // The period to pace at, in QPC ticks; 0 while the limiter is off (no
   // period, or the host stopped refreshing its heartbeat)
@@ -935,48 +941,58 @@ namespace {
     return static_cast<double>(period_ps) * 1e-12 * static_cast<double>(qpc_frequency());
   }
 
-  bool limiter_paces(IDXGISwapChain *swapchain, std::uint64_t now) {
-    auto *current = g_limiter.swapchain.load(std::memory_order_acquire);
-    if (current != swapchain) {
+  bool limiter_take() {
+    DWORD expected = 0;
+    return g_limiter.owner.compare_exchange_strong(expected, GetCurrentThreadId(), std::memory_order_acquire);
+  }
+
+  void limiter_give_back() {
+    g_limiter.owner.store(0, std::memory_order_release);
+  }
+
+  void limiter_forget() {
+    g_limiter.swapchain = nullptr;
+    g_limiter.next_release = 0;
+    g_limiter.release_qpc = 0;
+  }
+
+  // Owner only: whether this swapchain is the paced one
+  bool limiter_select(IDXGISwapChain *swapchain, std::uint64_t now) {
+    if (g_limiter.swapchain != swapchain) {
       const bool captured = g_captured_swapchain.load(std::memory_order_acquire) == swapchain;
-      const bool idle = !current || now - g_limiter.last_present_qpc.load(std::memory_order_relaxed) > qpc_frequency() / 2;
+      const bool idle = !g_limiter.swapchain || now < g_limiter.last_present_qpc || now - g_limiter.last_present_qpc > qpc_frequency() / 2;
       if (!captured && !idle) {
         return false;
       }
-      g_limiter.swapchain.store(swapchain, std::memory_order_release);
+      limiter_forget();  // a new grid: nothing of the previous swapchain's carries over
+      g_limiter.swapchain = swapchain;
     }
-    g_limiter.last_present_qpc.store(now, std::memory_order_relaxed);
+    g_limiter.last_present_qpc = now;
     return true;
   }
 
-  void limiter_reset() {
-    if (TryAcquireSRWLockExclusive(&g_limiter.lock)) {
-      g_limiter.next_release = 0;
-      ReleaseSRWLockExclusive(&g_limiter.lock);
-    }
-    g_limiter.release_qpc.store(0, std::memory_order_relaxed);
-  }
-
-  // A high-resolution waitable timer for all but the last millisecond (its
-  // wakeups land within ~0.5 ms), then a spin to the exact point
-  void sleep_until(std::uint64_t target) {
+  // Owner only. A high-resolution waitable timer for all but the last
+  // millisecond (its wakeups land within ~0.5 ms), then a spin to the exact
+  // point.
+  void sleep_until(std::uint64_t target, double period) {
     const auto freq = qpc_frequency();
     const auto spin = freq / 1000;
     const auto now = qpc_now();
     if (target > now + spin) {
-      if (!t_limiter_timer) {
-        t_limiter_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!t_limiter_timer) {
-          t_limiter_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);  // before Windows 10 1803
+      if (!g_limiter.timer) {
+        g_limiter.timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!g_limiter.timer) {
+          g_limiter.timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);  // before Windows 10 1803
         }
       }
       const auto ticks = target - spin - now;
+      const auto bound_ms = static_cast<DWORD>(2 * period * 1000 / static_cast<double>(freq)) + 2;
       LARGE_INTEGER due;
       due.QuadPart = -static_cast<LONGLONG>(ticks * 10'000'000ull / freq);  // relative, 100 ns units
-      if (t_limiter_timer && due.QuadPart < 0 && SetWaitableTimer(t_limiter_timer, &due, 0, nullptr, nullptr, FALSE)) {
-        WaitForSingleObject(t_limiter_timer, 1000);
+      if (g_limiter.timer && due.QuadPart < 0 && SetWaitableTimer(g_limiter.timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(g_limiter.timer, bound_ms);
       } else {
-        Sleep(static_cast<DWORD>(ticks * 1000 / freq));
+        Sleep(std::min<DWORD>(static_cast<DWORD>(ticks * 1000 / freq), bound_ms));
       }
     }
     while (qpc_now() < target) {
@@ -984,14 +1000,11 @@ namespace {
     }
   }
 
-  // After the real Present of the paced swapchain: wait for the next release
-  // point. The grid survives a frame that is a little late (the release is
-  // then immediate) and restarts from now after a longer stall, so a slow
-  // stretch never turns into a burst of catch-up frames.
+  // Owner only, after a successful real Present of the paced swapchain: wait
+  // for the next release point. A frame up to half a period late releases
+  // at once and keeps the grid (the next interval is then shorter: limited
+  // recovery); a longer stall restarts the grid from now.
   void limiter_wait(double period) {
-    if (!TryAcquireSRWLockExclusive(&g_limiter.lock)) {
-      return;
-    }
     const auto now = qpc_now();
     const double nowd = static_cast<double>(now);
     double target = g_limiter.next_release == 0 ? nowd : g_limiter.next_release + period;
@@ -1002,17 +1015,16 @@ namespace {
       g_block->limiter_late.fetch_add(1, std::memory_order_relaxed);
     }
     g_limiter.next_release = target;
-    ReleaseSRWLockExclusive(&g_limiter.lock);
 
     // Never longer than two periods, whatever the grid says
     const auto target_qpc = static_cast<std::uint64_t>(std::min(target, nowd + 2 * period));
     if (target_qpc > now) {
-      sleep_until(target_qpc);
+      sleep_until(target_qpc, period);
     }
     const auto released = qpc_now();
     g_block->limiter_waits.fetch_add(1, std::memory_order_relaxed);
     g_block->limiter_wait_us.fetch_add((released - now) * 1'000'000ull / qpc_frequency(), std::memory_order_relaxed);
-    g_limiter.release_qpc.store(released, std::memory_order_release);
+    g_limiter.release_qpc = released;
   }
 
   // What one outermost Present does around the real call
@@ -1022,16 +1034,32 @@ namespace {
       return real(sync_interval);
     }
     const auto now = qpc_now();
-    const double period = g_block ? limiter_period_qpc(now) : 0;
-    const bool paced = period > 0 && limiter_paces(swapchain, now);
-    if (period <= 0 && g_block) {
-      limiter_reset();
+    const double period = g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) ? limiter_period_qpc(now) : 0;
+
+    bool paced = false;
+    std::uint64_t release = 0;
+    if (period > 0) {
+      if (limiter_take()) {
+        paced = limiter_select(swapchain, now);
+        if (paced) {
+          release = g_limiter.release_qpc;
+        } else {
+          limiter_give_back();
+        }
+      }
+    } else if (g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) && limiter_take()) {
+      limiter_forget();  // off: the next start begins a fresh grid
+      limiter_give_back();
     }
-    capture_frame(swapchain, now, paced ? g_limiter.release_qpc.load(std::memory_order_acquire) : 0);
+
+    capture_frame(swapchain, now, release);
     // Paced, the game must not also wait for the host display's vblank
     const HRESULT hr = real(paced ? 0 : sync_interval);
-    if (paced && hr != DXGI_ERROR_WAS_STILL_DRAWING) {
-      limiter_wait(period);
+    if (paced) {
+      if (SUCCEEDED(hr)) {
+        limiter_wait(period);
+      }
+      limiter_give_back();
     }
     return hr;
   }
