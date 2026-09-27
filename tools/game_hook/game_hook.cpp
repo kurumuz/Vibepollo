@@ -55,6 +55,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -63,11 +64,15 @@ namespace {
   using present_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
   using present1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
   using set_color_space1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
+  using resize_buffers_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+  using resize_buffers1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT *, IUnknown *const *);
 
   // IDXGISwapChain vtable slots (IUnknown 0-2, IDXGIObject 3-6, IDXGIDeviceSubObject 7)
   constexpr int kVtPresent = 8;
+  constexpr int kVtResizeBuffers = 13;
   constexpr int kVtPresent1 = 22;  // IDXGISwapChain1
   constexpr int kVtSetColorSpace1 = 38;  // IDXGISwapChain3
+  constexpr int kVtResizeBuffers1 = 39;  // IDXGISwapChain3
 
   // Private data key under which a swapchain remembers its colour space
   // {8f4c2a6e-5b1d-4c7a-9e3f-2d6a8b1c4e70}
@@ -81,6 +86,8 @@ namespace {
   present_fn g_real_present = nullptr;
   present1_fn g_real_present1 = nullptr;
   set_color_space1_fn g_real_set_color_space1 = nullptr;
+  resize_buffers_fn g_real_resize_buffers = nullptr;  // both or neither (D3D12 capture needs them)
+  resize_buffers1_fn g_real_resize_buffers1 = nullptr;
 
   gc::shared_block_t *g_block = nullptr;
   thread_local bool t_in_present = false;
@@ -297,7 +304,6 @@ namespace {
     bool in_use = false;
   };
 
-  constexpr int kRetiredSets = 4;
 
   struct capture_t {
     IDXGISwapChain *swapchain = nullptr;  // identity only, never dereferenced outside its Present
@@ -331,7 +337,10 @@ namespace {
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     std::uint64_t highest_fence_value_used = 0;  // of this texture set
 
-    retired_t retired[kRetiredSets];
+    // Retired sets and command storage, until their copies completed (and,
+    // with handles, the host's grace period passed). Never evicted early:
+    // D3D12 frees memory the GPU still uses, so an unfinished entry waits.
+    std::vector<retired_t> retired;
   };
 
   capture_t g_cap;
@@ -432,11 +441,25 @@ namespace {
           release_retired(r);
         }
       }
-      if (r.textures_released && (now - r.retired_qpc > 2 * qpc_frequency() || force)) {
+      const bool has_handles = r.legacy || std::any_of(std::begin(r.handles), std::end(r.handles), [](HANDLE h) {
+                                 return h != nullptr;
+                               });
+      if (r.textures_released && (!has_handles || now - r.retired_qpc > 2 * qpc_frequency() || force)) {
         close_handles(r.handles);
         r.in_use = false;
       }
     }
+  }
+
+  // A free entry of the retirement list (a new one if none is free)
+  retired_t &new_retired() {
+    for (auto &r : g_cap.retired) {
+      if (!r.in_use) {
+        r = retired_t {};
+        return r;
+      }
+    }
+    return g_cap.retired.emplace_back();
   }
 
   // Retires the current texture set: one transition, however it was reached.
@@ -450,35 +473,7 @@ namespace {
     g_current_generation.fetch_add(1, std::memory_order_acq_rel);
     publish_setup(hwnd, false);
 
-    retired_t *slot = nullptr;
-    for (auto &r : g_cap.retired) {
-      if (!r.in_use) {
-        slot = &r;
-        break;
-      }
-    }
-    if (!slot) {
-      // Retirement storm: release the oldest set now (its copies had a
-      // second and more to complete)
-      slot = &g_cap.retired[0];
-      for (auto &r : g_cap.retired) {
-        if (r.retired_qpc < slot->retired_qpc) {
-          slot = &r;
-        }
-      }
-      if (!slot->textures_released) {
-        const bool unfinished = slot->fence12 && slot->fence12->GetCompletedValue() < slot->highest_fence_value;
-        if (unfinished) {
-          // Its copies are still running and D3D12 frees memory the GPU
-          // still uses: leak the set rather than destroy it under the GPU
-          log("Retirement storm: leaking a D3D12 texture set whose copies are still in flight");
-        } else {
-          release_retired(*slot);
-        }
-      }
-      close_handles(slot->handles);
-    }
-    *slot = retired_t {};
+    retired_t *slot = &new_retired();
     slot->in_use = true;
     slot->retired_qpc = qpc_now();
     slot->highest_fence_value = g_cap.highest_fence_value_used;
@@ -519,22 +514,7 @@ namespace {
   // Moves the D3D12 lists and allocators into a retired entry of their own,
   // released once the fence passes `last_used` (collect_retired)
   void retire_command_storage(std::uint64_t last_used) {
-    retired_t *slot = nullptr;
-    for (auto &r : g_cap.retired) {
-      if (!r.in_use) {
-        slot = &r;
-        break;
-      }
-    }
-    if (!slot) {
-      log("No room to retire D3D12 command storage with copies in flight: leaking it");
-      for (int i = 0; i < gc::kSlots; ++i) {
-        g_cap.lists[i] = nullptr;
-        g_cap.allocators[i] = nullptr;
-      }
-      return;
-    }
-    *slot = retired_t {};
+    retired_t *slot = &new_retired();
     slot->in_use = true;
     slot->retired_qpc = qpc_now();
     slot->highest_fence_value = last_used;
@@ -917,7 +897,12 @@ namespace {
   // A swapchain ever seen presenting from more than one queue is marked
   // ambiguous and never captured; one on which no queue shows up within
   // kQueueUnseenMs is reported unsupported. The first Present after injection
-  // therefore only learns the queue; capture starts with the next.
+  // therefore only learns the queue; capture starts with the next. An
+  // observation is thrown away if the Present failed or another swapchain
+  // presented inside it. ResizeBuffers1 names the swapchain's queues, so it
+  // sets the queue itself (or vetoes the swapchain if they differ); a plain
+  // ResizeBuffers forgets it, to be learned again. Either way no copy is
+  // submitted on a queue the swapchain no longer presents from.
   //
   // Per frame, on the presenting thread inside Present: the slot's own
   // command list (reused only once its previous copy completed) moves the
@@ -940,9 +925,16 @@ namespace {
   thread_local IDXGISwapChain *t_presenting = nullptr;
   thread_local ID3D12CommandQueue *t_seen_queue = nullptr;  // a reference, taken inside its own ExecuteCommandLists
   thread_local bool t_seen_several = false;
+  thread_local bool t_seen_contaminated = false;  // another swapchain presented inside this Present
+
+  // Set when a swapchain veto could not be recorded, or a Signal failed:
+  // D3D12 capture stops for the process (what our copies used is leaked)
+  std::atomic<bool> g_d3d12_dead {false};
 
   void STDMETHODCALLTYPE hook_execute_command_lists(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists) {
-    if (t_presenting) {
+    // Only direct queues can present; copy/compute submissions inside
+    // Present (an overlay's uploads, say) are not candidates
+    if (t_presenting && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
       if (!t_seen_queue) {
         queue->AddRef();
         t_seen_queue = queue;
@@ -957,10 +949,53 @@ namespace {
     return ms * qpc_frequency() / 1000;
   }
 
-  bool swapchain_flag(IDXGISwapChain *swapchain, const GUID &key) {
+  // Whether the swapchain was vetoed; a veto that cannot be read counts
+  bool vetoed(IDXGISwapChain *swapchain) {
     std::uint32_t value = 0;
     UINT size = sizeof(value);
-    return SUCCEEDED(swapchain->GetPrivateData(key, &size, &value)) && size == sizeof(value) && value != 0;
+    const HRESULT hr = swapchain->GetPrivateData(kQueueAmbiguousKey, &size, &value);
+    if (hr == DXGI_ERROR_NOT_FOUND) {
+      return false;
+    }
+    return FAILED(hr) || size != sizeof(value) || value != 0;
+  }
+
+  void veto(IDXGISwapChain *swapchain, const char *why) {
+    const std::uint32_t yes = 1;
+    if (FAILED(swapchain->SetPrivateData(kQueueAmbiguousKey, sizeof(yes), &yes))) {
+      g_d3d12_dead.store(true, std::memory_order_release);
+      log("Swapchain %p %s, and the veto could not be recorded: D3D12 capture stopped", static_cast<void *>(swapchain), why);
+      return;
+    }
+    log("Swapchain %p %s: not captured", static_cast<void *>(swapchain), why);
+  }
+
+  // Drops the swapchain's queue, to be learned again
+  void forget_queue(IDXGISwapChain *swapchain) {
+    if (FAILED(swapchain->SetPrivateDataInterface(kQueueKey, nullptr))) {
+      veto(swapchain, "changed its buffers and its queue could not be forgotten");
+    }
+  }
+
+  // Whether `queue` can take our copies for `swapchain`: a queue of the
+  // swapchain's own device, on a single-node adapter (our textures live on
+  // node 0). Only direct queues are ever passed here.
+  bool usable_queue(IDXGISwapChain *swapchain, ID3D12CommandQueue *queue) {
+    ID3D12Device *queue_device = nullptr, *swapchain_device = nullptr;
+    queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&queue_device));
+    swapchain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&swapchain_device));
+    const bool usable = queue->GetDesc().NodeMask <= 1 && queue_device && queue_device == swapchain_device;
+    safe_release(queue_device);
+    safe_release(swapchain_device);
+    return usable;
+  }
+
+  void remember_queue(IDXGISwapChain *swapchain, ID3D12CommandQueue *queue, const char *how) {
+    if (FAILED(swapchain->SetPrivateDataInterface(kQueueKey, queue))) {
+      log("Swapchain %p: its D3D12 queue %p could not be remembered", static_cast<void *>(swapchain), static_cast<void *>(queue));
+      return;
+    }
+    log("Swapchain %p presents from D3D12 queue %p (%s)", static_cast<void *>(swapchain), static_cast<void *>(queue), how);
   }
 
   // The queue this swapchain was seen presenting from (a new reference), or null
@@ -968,7 +1003,7 @@ namespace {
     IUnknown *stored = nullptr;
     UINT size = sizeof(stored);
     if (FAILED(swapchain->GetPrivateData(kQueueKey, &size, &stored)) || size != sizeof(stored) || !stored) {
-      return nullptr;
+      return nullptr;  // missing or unreadable: not captured until learned
     }
     ID3D12CommandQueue *queue = nullptr;
     stored->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&queue));
@@ -980,37 +1015,83 @@ namespace {
   // submitted on. Only D3D12 swapchains get here with something seen.
   void learn_present_queue(IDXGISwapChain *swapchain) {
     ID3D12CommandQueue *seen = t_seen_queue;
-    const bool several = t_seen_several;
     t_seen_queue = nullptr;
-    t_seen_several = false;
-    if (!seen || swapchain_flag(swapchain, kQueueAmbiguousKey)) {
+    if (vetoed(swapchain)) {
       safe_release(seen);
       return;
     }
-    const std::uint32_t yes = 1;
     ID3D12CommandQueue *known = known_queue(swapchain);
-    if (several || (known && known != seen)) {
-      swapchain->SetPrivateData(kQueueAmbiguousKey, sizeof(yes), &yes);
-      log("Swapchain %p presents from more than one D3D12 queue: not captured", static_cast<void *>(swapchain));
+    if (t_seen_several || (known && known != seen)) {
+      veto(swapchain, "presents from more than one D3D12 queue");
     } else if (!known) {
-      const auto desc = seen->GetDesc();
-      ID3D12Device *queue_device = nullptr, *swapchain_device = nullptr;
-      seen->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&queue_device));
-      swapchain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&swapchain_device));
-      const bool usable = desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && desc.NodeMask <= 1 && queue_device && queue_device == swapchain_device;
-      safe_release(queue_device);
-      safe_release(swapchain_device);
-      if (usable) {
-        swapchain->SetPrivateDataInterface(kQueueKey, seen);
-        log("Swapchain %p presents from D3D12 queue %p", static_cast<void *>(swapchain), static_cast<void *>(seen));
+      if (usable_queue(swapchain, seen)) {
+        remember_queue(swapchain, seen, "seen inside Present");
       } else {
-        swapchain->SetPrivateData(kQueueAmbiguousKey, sizeof(yes), &yes);
-        log("Swapchain %p presents from D3D12 queue %p (type %d, node mask %u), which is not a direct queue of its device on one node: not captured",
-            static_cast<void *>(swapchain), static_cast<void *>(seen), static_cast<int>(desc.Type), desc.NodeMask);
+        veto(swapchain, "presents from a D3D12 queue of another device or node");
       }
     }
     safe_release(known);
     safe_release(seen);
+  }
+
+  // Resizing may move a D3D12 swapchain to other queues: ResizeBuffers1 says
+  // which (null: unchanged, as far as the documentation says; we relearn).
+  // The swapchain is idle here (DXGI forbids a concurrent Present).
+  void note_resize(IDXGISwapChain *swapchain, UINT count, IUnknown *const *queues) {
+    ID3D12Device *device = nullptr;
+    if (FAILED(swapchain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device)))) {
+      return;  // not D3D12
+    }
+    device->Release();
+    if (vetoed(swapchain)) {
+      return;
+    }
+    if (!queues) {
+      forget_queue(swapchain);
+      return;
+    }
+    if (count == 0) {
+      DXGI_SWAP_CHAIN_DESC desc {};
+      count = SUCCEEDED(swapchain->GetDesc(&desc)) ? desc.BufferCount : 0;
+    }
+    ID3D12CommandQueue *queue = nullptr;
+    bool one = count > 0;
+    for (UINT i = 0; i < count && one; ++i) {
+      ID3D12CommandQueue *q = nullptr;
+      if (!queues[i] || FAILED(queues[i]->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&q)))) {
+        one = false;
+      } else if (!queue) {
+        queue = q;
+        q = nullptr;
+      } else if (q != queue) {
+        one = false;
+      }
+      safe_release(q);
+    }
+    if (!one || !queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT || !usable_queue(swapchain, queue)) {
+      forget_queue(swapchain);
+      veto(swapchain, "was resized onto several D3D12 queues, or one we cannot copy on");
+    } else {
+      remember_queue(swapchain, queue, "named by ResizeBuffers1");
+    }
+    safe_release(queue);
+  }
+
+  HRESULT STDMETHODCALLTYPE hook_resize_buffers(IDXGISwapChain *swapchain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
+    const HRESULT hr = g_real_resize_buffers(swapchain, count, width, height, format, flags);
+    if (SUCCEEDED(hr)) {
+      note_resize(swapchain, 0, nullptr);
+    }
+    return hr;
+  }
+
+  HRESULT STDMETHODCALLTYPE hook_resize_buffers1(IDXGISwapChain3 *swapchain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags,
+                                                 const UINT *node_masks, IUnknown *const *queues) {
+    const HRESULT hr = g_real_resize_buffers1(swapchain, count, width, height, format, flags, node_masks, queues);
+    if (SUCCEEDED(hr)) {
+      note_resize(swapchain, count, queues);
+    }
+    return hr;
   }
 
   void execute_on(ID3D12CommandQueue *queue, ID3D12CommandList *list) {
@@ -1038,10 +1119,6 @@ namespace {
     }
     return true;
   }
-
-  // Set when a Signal failed: our copies can no longer be tracked, so this
-  // process is not captured again (what they used is leaked, not freed)
-  bool g_d3d12_dead = false;
 
   bool list_ready(int slot) {
     return g_cap.lists[slot] && g_cap.fence12->GetCompletedValue() >= g_cap.list_fence[slot];
@@ -1160,13 +1237,16 @@ namespace {
     static std::uint64_t unseen_since = 0;
     static bool reported = false;
 
-    if (g_d3d12_dead) {
+    if (g_d3d12_dead.load(std::memory_order_acquire)) {
+      if (g_cap.api == gc::api_e::d3d12) {
+        release_capture(hwnd);
+      }
       return;
     }
-    if (!g_real_execute_command_lists) {
+    if (!g_real_execute_command_lists || !g_real_resize_buffers1) {
       if (!reported) {
         reported = true;
-        set_state(gc::hook_state_e::unsupported, "D3D12: ExecuteCommandLists is not detoured, so the presenting queue cannot be learned");
+        set_state(gc::hook_state_e::unsupported, "D3D12: ExecuteCommandLists or ResizeBuffers is not detoured, so the presenting queue cannot be tracked");
       }
       return;
     }
@@ -1174,7 +1254,10 @@ namespace {
       release_capture(hwnd);  // everything of the lost device goes (its fence reads complete)
       return;
     }
-    if (swapchain_flag(swapchain, kQueueAmbiguousKey)) {
+    if (vetoed(swapchain)) {
+      if (g_cap.swapchain == swapchain) {
+        release_capture(hwnd);
+      }
       if (!reported) {
         reported = true;
         set_state(gc::hook_state_e::unsupported, "D3D12: the swapchain presents from more than one queue, or not from a direct queue of its device");
@@ -1274,7 +1357,7 @@ namespace {
       // removed device ever reports complete: short of that they leak.
       g_cap.list_fence[slot] = fence_value;
       g_cap.highest_fence_value_used = fence_value;
-      g_d3d12_dead = true;
+      g_d3d12_dead.store(true, std::memory_order_release);
       release_capture(hwnd);
       char msg[80];
       std::snprintf(msg, sizeof(msg), "D3D12 Signal failed: 0x%08lx; capture stopped", signalled);
@@ -1291,13 +1374,47 @@ namespace {
     note_capturing(swapchain, "D3D12");
   }
 
+  HWND setup_hwnd() {
+    return reinterpret_cast<HWND>(g_block->setup.hwnd.load(std::memory_order_relaxed));
+  }
+
+  // The captured swapchain's device was lost (its Present said so): let go
+  // of it now, since no further capture may come to notice
+  void drop_lost_capture(IDXGISwapChain *swapchain) {
+    if (g_captured_swapchain.load(std::memory_order_acquire) != swapchain) {
+      return;
+    }
+    AcquireSRWLockExclusive(&g_capture_lock);
+    if (g_cap.swapchain == swapchain) {
+      log("The captured swapchain's device was lost: capture released");
+      release_capture(setup_hwnd());
+      collect_retired(false);
+    }
+    ReleaseSRWLockExclusive(&g_capture_lock);
+  }
+
+  // While not capturing: retired entries are still collected, and a lost
+  // D3D12 device is still let go of
+  void housekeeping() {
+    if (!TryAcquireSRWLockExclusive(&g_capture_lock)) {
+      return;
+    }
+    if (g_cap.device12 && FAILED(g_cap.device12->GetDeviceRemovedReason())) {
+      release_capture(setup_hwnd());
+    }
+    collect_retired(false);
+    ReleaseSRWLockExclusive(&g_capture_lock);
+  }
+
   void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc, std::uint64_t release_qpc) {
     g_block->frames_presented.fetch_add(1, std::memory_order_relaxed);
     if (!g_block->capture_enabled.load(std::memory_order_acquire)) {
+      housekeeping();
       return;
     }
     HWND hwnd = nullptr;
     if (!foreground_window(swapchain, hwnd)) {
+      housekeeping();
       return;
     }
 
@@ -1575,21 +1692,50 @@ namespace {
       limiter_give_back();
     }
 
+    // (scoped: a downstream hook's exception must not keep the token)
+    struct give_back_t {
+      bool paced;
+
+      ~give_back_t() {
+        if (paced) {
+          limiter_give_back();
+        }
+      }
+    } give_back {paced};
+
     capture_frame(swapchain, now, release);
+
     // Paced, the game must not also wait for the host display's vblank. For
     // a D3D12 swapchain the queue DXGI submits on during this call is the
-    // presenting queue (see the D3D12 section).
-    t_presenting = swapchain;
-    const HRESULT hr = real(paced ? 0 : sync_interval);
-    t_presenting = nullptr;
-    if (t_seen_queue) {
-      learn_present_queue(swapchain);
-    }
-    if (paced) {
-      if (SUCCEEDED(hr)) {
-        limiter_wait(period);
+    // presenting queue (see the D3D12 section). The observation is scoped
+    // so that nothing of it outlives the call, however it ends.
+    struct observation_t {
+      explicit observation_t(IDXGISwapChain *swapchain) {
+        t_presenting = swapchain;
       }
-      limiter_give_back();
+
+      ~observation_t() {
+        t_presenting = nullptr;
+        safe_release(t_seen_queue);
+        t_seen_several = false;
+        t_seen_contaminated = false;
+      }
+    };
+
+    HRESULT hr;
+    {
+      observation_t observing(swapchain);
+      hr = real(paced ? 0 : sync_interval);
+      t_presenting = nullptr;
+      if (t_seen_queue && SUCCEEDED(hr) && !t_seen_contaminated) {
+        learn_present_queue(swapchain);
+      }
+    }
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+      drop_lost_capture(swapchain);
+    }
+    if (paced && SUCCEEDED(hr)) {
+      limiter_wait(period);
     }
     return hr;
   }
@@ -1597,29 +1743,53 @@ namespace {
   // ---- detours -------------------------------------------------------------
 
   // DXGI may implement one Present entry point through the other; only the
-  // outermost call on a thread captures.
+  // outermost call on a thread captures. A nested Present of *another*
+  // swapchain spoils the outer one's queue observation.
+  struct in_present_t {
+    in_present_t() {
+      t_in_present = true;
+    }
+
+    ~in_present_t() {
+      t_in_present = false;
+    }
+  };
+
+  void note_nested(IDXGISwapChain *swapchain) {
+    if (!t_presenting || t_presenting == swapchain) {
+      return;
+    }
+    // (DXGI may call itself through another interface of the same object)
+    IUnknown *outer = nullptr, *inner = nullptr;
+    t_presenting->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void **>(&outer));
+    swapchain->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void **>(&inner));
+    if (!outer || outer != inner) {
+      t_seen_contaminated = true;
+    }
+    safe_release(outer);
+    safe_release(inner);
+  }
+
   HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags) {
     if (t_in_present) {
+      note_nested(swapchain);
       return g_real_present(swapchain, sync_interval, flags);
     }
-    t_in_present = true;
-    const HRESULT hr = present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
+    in_present_t in_present;
+    return present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
       return g_real_present(swapchain, interval, flags);
     });
-    t_in_present = false;
-    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swapchain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS *params) {
     if (t_in_present) {
+      note_nested(swapchain);
       return g_real_present1(swapchain, sync_interval, flags, params);
     }
-    t_in_present = true;
-    const HRESULT hr = present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
+    in_present_t in_present;
+    return present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
       return g_real_present1(swapchain, interval, flags, params);
     });
-    t_in_present = false;
-    return hr;
   }
 
   HRESULT STDMETHODCALLTYPE hook_set_color_space1(IDXGISwapChain3 *swapchain, DXGI_COLOR_SPACE_TYPE color_space) {
@@ -1727,6 +1897,14 @@ namespace {
         void **vtable3 = *reinterpret_cast<void ***>(swapchain3);
         if (MH_CreateHook(vtable3[kVtSetColorSpace1], reinterpret_cast<void *>(&hook_set_color_space1), reinterpret_cast<void **>(&g_real_set_color_space1)) != MH_OK) {
           log("SetColorSpace1 could not be detoured; 10-bit swapchains stay unknown");
+        }
+        // D3D12 capture needs both (a resize may change the presenting queue)
+        if (MH_CreateHook(vtable[kVtResizeBuffers], reinterpret_cast<void *>(&hook_resize_buffers), reinterpret_cast<void **>(&g_real_resize_buffers)) != MH_OK) {
+          g_real_resize_buffers = nullptr;
+          log("ResizeBuffers could not be detoured: D3D12 swapchains are not captured");
+        } else if (MH_CreateHook(vtable3[kVtResizeBuffers1], reinterpret_cast<void *>(&hook_resize_buffers1), reinterpret_cast<void **>(&g_real_resize_buffers1)) != MH_OK) {
+          g_real_resize_buffers1 = nullptr;
+          log("ResizeBuffers1 could not be detoured: D3D12 swapchains are not captured");
         }
         swapchain3->Release();
       }
