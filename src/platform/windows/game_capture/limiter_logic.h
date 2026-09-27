@@ -13,16 +13,17 @@
  * frame period late releases at once and keeps the grid (the next interval is
  * then shorter: limited recovery); a longer stall restarts the grid from now.
  *
- * Divisor: a game that cannot keep up with the period (its own frame cap, or
- * too slow) is paced at a whole multiple of it, so its frames still land on a
- * regular grid instead of restarting it every frame (a 60 fps-capped game in
- * a 120 fps stream reset the grid on 7499 of 7500 frames).
- *   up:   most of the last kHistory frames were late, and their median
- *         interval needs more periods than the current divisor
- *   down: every one of them left at least 0.9 period of wait
- * The up rule needs an interval above (divisor + 0.2) periods, the down rule
- * one below (divisor - 0.9); between the two nothing changes, so a game near
- * a boundary does not flap.
+ * Divisor: a game locked to a sub-multiple of the stream rate (its own 60 fps
+ * cap in a 120 fps stream reset the grid on 7499 of 7500 frames) is paced at
+ * that multiple of the period, so its frames land on a regular grid. Only a
+ * lock earns it: most of the last kHistory frames late, their median interval
+ * within kLockTolerance of a whole number of periods above the divisor, and
+ * their interquartile spread within kLockSpread of a period. A game that is
+ * merely slow or fluctuating (45-55 fps in a 60 fps stream, a heavy scene, a
+ * loading hitch) matches none of that and runs at its own rate: halving it
+ * to 30 fps for a stumble (Stellar Blade, 30 s at 30 fps) is worse than
+ * letting it run.
+ *   down: every one of the last frames left at least 0.9 period of wait
  *
  * Slack does not prove a game could go faster: one with its own cap never
  * sleeps while our (longer) grid is in charge, so a 60 fps-capped game with
@@ -47,6 +48,8 @@ namespace game_capture {
     static constexpr int kProbeAbortLate = 3;
     static constexpr double kProbeBackoffSeconds = 30;
     static constexpr double kProbeBackoffMaxSeconds = 240;
+    static constexpr double kLockTolerance = 0.08;
+    static constexpr double kLockSpread = 0.1;
 
     struct plan_t {
       double release;  ///< when to release the game (never more than two frame periods out)
@@ -169,10 +172,12 @@ namespace game_capture {
       _last_min_wait = min_wait;
       int next = _divisor;
       if (late > kHistory / 2) {
-        std::nth_element(intervals, intervals + kHistory / 2, intervals + kHistory);
-        const int need = static_cast<int>(std::ceil(intervals[kHistory / 2] / period - 0.2));
-        if (need > _divisor) {
-          next = std::min(need, kMaxDivisor);
+        std::sort(intervals, intervals + kHistory);
+        const double ratio = intervals[kHistory / 2] / period;
+        const double spread = (intervals[kHistory * 3 / 4] - intervals[kHistory / 4]) / period;
+        const int multiple = static_cast<int>(std::lround(ratio));
+        if (multiple > _divisor && std::abs(ratio - multiple) < kLockTolerance && spread < kLockSpread) {
+          next = std::min(multiple, kMaxDivisor);
         }
       } else if (_divisor > 1 && min_wait > period * 0.9 && now >= _no_probe_until) {
         next = _divisor - 1;

@@ -104,20 +104,52 @@ int main() {
     const auto r = simulate(g, p120, 120);
     std::printf("  resets=%d late=%d divisor changes=%d mean interval=%.4f ms\n", r.resets, r.late, r.divisor_changes, r.mean_interval * 1e3);
     CHECK(r.final_divisor == 2);
-    CHECK(r.resets < 40);  // every frame until the first 32 are in, then only at failed probes
+    CHECK(r.resets < 80);  // every frame until a settled history shows the lock (under a second), then only at failed probes
     CHECK(std::abs(r.mean_interval - p60) < 20e-6);
     // Its step-down probes fail and back off: a handful in two minutes, not one per history
     CHECK(r.divisor_changes <= 8);
   }
 
-  std::printf("95 fps game in a 120 fps stream: paced at 60, no flapping\n");
+  std::printf("95 fps game in a 120 fps stream: runs at its own rate (no lock)\n");
   {
     game_t g;
     g.work = 1.0 / 95;
     g.jitter = 0.0005;
     const auto r = simulate(g, p120, 60);
-    CHECK(r.final_divisor == 2);
-    CHECK(r.divisor_changes <= 4);
+    CHECK(r.final_divisor == 1);
+    CHECK(r.divisor_changes == 0);
+  }
+
+  std::printf("game fluctuating at 45-55 fps in a 60 fps stream: never halved to 30\n");
+  {
+    game_t g;
+    g.work = 1.0 / 50;
+    g.jitter = 0.004;
+    const auto r = simulate(g, p60, 60);
+    CHECK(r.final_divisor == 1);
+    CHECK(r.divisor_changes == 0);
+  }
+
+  std::printf("heavy stretch (35 ms frames for 1 s) in a 60 fps stream: never halved\n");
+  {
+    const auto r = simulate({}, p60, 30, 1, 10, 0);  // warm up
+    CHECK(r.final_divisor == 1);
+    game_capture::limiter_logic_t logic(1.0);
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<double> u01(0, 1);
+    double release = 0.1;
+    int changes = 0;
+    while (release < 20) {
+      const bool heavy = release > 10 && release < 11;
+      const double work = heavy ? 0.030 + u01(rng) * 0.010 : 0.006 + u01(rng) * 0.001;
+      const double present = release + work;
+      const auto plan = logic.plan(present, p60);
+      const double next = std::max(plan.release, present);
+      changes += logic.released(next, next - present, plan.late, p60) ? 1 : 0;
+      release = next;
+    }
+    CHECK(changes == 0);
+    CHECK(logic.divisor() == 1);
   }
 
   std::printf("game that fits after all (6 ms at 120): back to one period\n");
