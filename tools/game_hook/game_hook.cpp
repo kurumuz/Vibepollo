@@ -923,7 +923,7 @@ namespace {
     std::uint64_t last_present_qpc = 0;
     std::uint64_t release_qpc = 0;  // the release that started the frame now being rendered on `swapchain`
     HANDLE timer = nullptr;  // one timer: only the owner waits
-    gc::limiter_logic_t logic {static_cast<double>(qpc_frequency())};  // grid and divisor decisions (limiter_logic.h), in QPC ticks
+    gc::limiter_logic_t logic;  // the release grid (limiter_logic.h), in QPC ticks
   };
 
   limiter_t g_limiter;
@@ -956,9 +956,6 @@ namespace {
     g_limiter.swapchain = nullptr;
     g_limiter.release_qpc = 0;
     g_limiter.logic.forget();
-    if (g_block) {
-      g_block->limiter_divisor.store(1, std::memory_order_relaxed);
-    }
   }
 
   // Owner only: whether this swapchain is the paced one
@@ -1019,19 +1016,12 @@ namespace {
     }
     const auto target_qpc = static_cast<std::uint64_t>(plan.release);
     if (target_qpc > now) {
-      sleep_until(target_qpc, period * l.logic.divisor());
+      sleep_until(target_qpc, period);
     }
     const auto released = qpc_now();
     g_block->limiter_waits.fetch_add(1, std::memory_order_relaxed);
     g_block->limiter_wait_us.fetch_add((released - now) * 1'000'000ull / qpc_frequency(), std::memory_order_relaxed);
     l.release_qpc = released;
-
-    if (l.logic.released(static_cast<double>(released), static_cast<double>(released - now), plan.late, period)) {
-      const double ms = 1000.0 / static_cast<double>(qpc_frequency());
-      log("Limiter: pacing at %d x %.3f ms (%d of the last %d frames late, least wait %.2f ms)", l.logic.divisor(), period * ms,
-          l.logic.last_late_count(), gc::limiter_logic_t::kHistory, l.logic.last_min_wait() * ms);
-      g_block->limiter_divisor.store(static_cast<std::uint32_t>(l.logic.divisor()), std::memory_order_relaxed);
-    }
   }
 
   // What one outermost Present does around the real call
