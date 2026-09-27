@@ -898,6 +898,8 @@ namespace config {
     0,  // pacing_max_bitrate_kbps (0 = legacy 1 Gbps Ethernet assumption)
     0,  // packetsize (0 = off)
     1,  // prague_cc (0 = off, 1 = shadow mode)
+    false,  // slo_bayes
+    0,  // slo_bayes_deadline_us (0 = one frame interval)
   };
 
   nvhttp_t nvhttp {
@@ -1905,6 +1907,8 @@ namespace config {
     int_between_f(vars, "pacing_max_bitrate_kbps", stream.pacing_max_bitrate_kbps, {0, 10000000});
     int_between_f(vars, "packetsize", stream.packetsize, {0, PACKETSIZE_MAX});
     int_between_f(vars, "prague_cc", stream.prague_cc, {0, 1});
+    bool_f(vars, "slo_bayes", stream.slo_bayes);
+    int_between_f(vars, "slo_bayes_deadline_us", stream.slo_bayes_deadline_us, {0, 1000000});
     int_between_f(vars, "video_max_batch_size_kb", stream.video_max_batch_size_kb, {0, 64});
     if (stream.video_max_batch_size_kb == 0) {
       stream.video_max_batch_size_kb = 64;

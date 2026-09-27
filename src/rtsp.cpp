@@ -1265,6 +1265,11 @@ namespace rtsp_stream {
       // Advertise Prague CC support; a client that answers with
       // ML_FF_PRAGUE_CC gets per-datagram Prague headers on video.
       feature_flags |= prague::SS_FF_PRAGUE_CC;
+      if (config::stream.slo_bayes) {
+        // Frame reports ride Prague's feedback path; a client answering with
+        // ML_FF_FRAME_REPORTS gets its bitrate driven by slo-bayes.
+        feature_flags |= prague::SS_FF_FRAME_REPORTS;
+      }
     }
     ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
@@ -1464,6 +1469,7 @@ namespace rtsp_stream {
     args.try_emplace("x-ss-general.encryptionEnabled"sv, "0"sv);
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
+    args.try_emplace("x-ml-video.frameDeadlineUs"sv, "0"sv);
     args.try_emplace("x-nv-video[0].clientRefreshRateX100"sv, "0"sv);
 
     stream::config_t config {};
@@ -1503,6 +1509,7 @@ namespace rtsp_stream {
 
       config.minRequiredFecPackets = (int) util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
       config.mlFeatureFlags = (int) util::from_view(args.at("x-ml-general.featureFlags"sv));
+      config.frame_deadline_us = std::clamp((int) util::from_view(args.at("x-ml-video.frameDeadlineUs"sv)), 0, 1000000);
       config.audioQosType = (int) util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
       config.videoQosType = (int) util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));
       config.encryptionFlagsEnabled = (uint32_t) util::from_view(args.at("x-ss-general.encryptionEnabled"sv));

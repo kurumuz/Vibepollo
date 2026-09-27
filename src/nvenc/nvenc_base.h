@@ -83,9 +83,10 @@ namespace nvenc {
     /**
      * @brief Reconfigure the live encoder with a new average/max bitrate (no rebuild).
      * @param bitrate_kbps New bitrate in kbps.
+     * @param continuous No encoder reset / forced IDR on a raise, and no info log.
      * @return `true` if reconfigured in place; `false` if the caller must rebuild the encoder.
      */
-    bool set_bitrate(int bitrate_kbps);
+    bool set_bitrate(int bitrate_kbps, bool continuous = false);
 
     /**
      * @brief Replace HDR mastering-display and content-light metadata for subsequent frames.

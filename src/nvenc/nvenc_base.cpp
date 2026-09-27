@@ -475,7 +475,7 @@ namespace nvenc {
 
     if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
       enc_config.rcParams.vbvBufferSize = client_config.bitrate * 1000 / client_config.framerate;
-      if (config.vbv_percentage_increase > 0) {
+      if (config.vbv_percentage_increase > 0 && !client_config.single_frame_vbv) {
         enc_config.rcParams.vbvBufferSize += enc_config.rcParams.vbvBufferSize * config.vbv_percentage_increase / 100;
       }
     }
@@ -1068,7 +1068,7 @@ namespace nvenc {
     return true;
   }
 
-  bool nvenc_base::set_bitrate(int bitrate_kbps) {
+  bool nvenc_base::set_bitrate(int bitrate_kbps, bool continuous) {
     if (!encoder || !nvenc) {
       BOOST_LOG(warning) << "NvEnc: encoder not initialized; cannot change bitrate";
       return false;
@@ -1101,8 +1101,9 @@ namespace nvenc {
     reconfigure_params.reInitEncodeParams.encodeConfig = &enc_config;
 
     // When raising the ceiling, reset the rate controller and force an IDR so the higher bitrate
-    // takes effect immediately instead of draining the old VBV first.
-    if (new_bitrate_bps > prev_bitrate_bps) {
+    // takes effect immediately instead of draining the old VBV first. A continuous controller
+    // skips that: with a single-frame VBV the old buffer drains within a frame anyway.
+    if (new_bitrate_bps > prev_bitrate_bps && !continuous) {
       reconfigure_params.resetEncoder = 1;
       reconfigure_params.forceIDR = 1;
     }
@@ -1116,7 +1117,7 @@ namespace nvenc {
     current_enc_config.rcParams.maxBitRate = new_bitrate_bps;
     current_enc_config.rcParams.vbvBufferSize = enc_config.rcParams.vbvBufferSize;
 
-    BOOST_LOG(info) << "NvEnc: " << (is_hevc ? "HEVC" : "H.264/AV1") << " bitrate reconfigured to " << bitrate_kbps << " kbps";
+    BOOST_LOG(continuous ? debug : info) << "NvEnc: " << (is_hevc ? "HEVC" : "H.264/AV1") << " bitrate reconfigured to " << bitrate_kbps << " kbps";
     return true;
   }
 

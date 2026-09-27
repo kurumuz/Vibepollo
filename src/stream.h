@@ -82,6 +82,7 @@ namespace stream {
     int packetsize;
     int minRequiredFecPackets;
     int mlFeatureFlags;
+    int frame_deadline_us = 0;  ///< client's slo-bayes deadline (x-ml-video.frameDeadlineUs), 0 = host default
     int controlProtocolType;
     int audioQosType;
     int videoQosType;

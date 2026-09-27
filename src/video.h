@@ -68,6 +68,11 @@ namespace video {
     // subtracts FEC/audio/control overhead from `bitrate` for the encoder.
     // Same as `bitrate` for clients that don't send maximumBitrateKbps.
     int client_requested_bitrate;
+
+    // slo-bayes sizes every frame to a deadline, so the encoder's VBV must
+    // hold one frame: nvenc_vbv_increase is ignored (150% let single frames
+    // run to 2.5x their target, which was most of the late frames).
+    bool single_frame_vbv = false;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
@@ -246,10 +251,12 @@ namespace video {
     /**
      * @brief Apply a new encoder bitrate to the live encoder without rebuilding it.
      * @param bitrate_kbps New bitrate in kbps.
+     * @param continuous Keep the stream going: no encoder reset or IDR on a raise (for a
+     *        controller that moves the bitrate every few frames).
      * @return `true` if the encoder reconfigured itself in place; `false` if the caller must
      *         rebuild the encode session to apply the change.
      */
-    virtual bool set_bitrate(int bitrate_kbps) {
+    virtual bool set_bitrate(int bitrate_kbps, bool continuous) {
       return false;
     }
 

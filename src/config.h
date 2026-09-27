@@ -286,6 +286,15 @@ namespace config {
     // it would do, but actuates nothing. Requires a client that negotiates
     // ML_FF_PRAGUE_CC; costs 12 bytes per video datagram when active.
     int prague_cc;
+
+    // slo-bayes deadline bitrate control: size every frame to arrive within
+    // slo_bayes_deadline_us of being ready (0 = one frame interval) with 0.1%
+    // miss probability, from per-frame arrival reports, and drive the encoder
+    // bitrate from it (the client's requested bitrate becomes the ceiling).
+    // Needs prague_cc (for the per-datagram headers and the feedback path) and
+    // a client that negotiates frame reports.
+    bool slo_bayes;
+    int slo_bayes_deadline_us;
   };
 
   struct nvhttp_t {

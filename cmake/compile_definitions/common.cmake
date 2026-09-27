@@ -105,6 +105,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/prague/prague_cc.cpp"
         "${CMAKE_SOURCE_DIR}/src/prague/prague_cc.h"
         "${CMAKE_SOURCE_DIR}/src/prague/prague_wire.h"
+        "${CMAKE_SOURCE_DIR}/src/rate/slo_bayes.cpp"
+        "${CMAKE_SOURCE_DIR}/src/rate/slo_bayes.h"
         "${CMAKE_SOURCE_DIR}/src/video.cpp"
         "${CMAKE_SOURCE_DIR}/src/video.h"
         "${CMAKE_SOURCE_DIR}/src/video_colorspace.cpp"

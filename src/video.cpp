@@ -795,11 +795,11 @@ namespace video {
       }
     }
 
-    bool set_bitrate(int bitrate_kbps) override {
+    bool set_bitrate(int bitrate_kbps, bool continuous) override {
       if (!device || !device->nvenc) {
         return false;
       }
-      return device->nvenc->set_bitrate(bitrate_kbps);
+      return device->nvenc->set_bitrate(bitrate_kbps, continuous);
     }
 
     void set_hdr_metadata(const SS_HDR_METADATA &metadata) override {
@@ -3014,8 +3014,9 @@ namespace video {
       if (latest_bitrate) {
         config.bitrate = *latest_bitrate;
         config.client_requested_bitrate = *latest_bitrate;
-        if (session->set_bitrate(*latest_bitrate)) {
-          BOOST_LOG(info) << "Applied runtime bitrate "sv << *latest_bitrate << " kbps (live)"sv;
+        // slo-bayes moves the bitrate every few frames: no IDR per raise, no log line per change
+        if (session->set_bitrate(*latest_bitrate, config::stream.slo_bayes)) {
+          BOOST_LOG(config::stream.slo_bayes ? debug : info) << "Applied runtime bitrate "sv << *latest_bitrate << " kbps (live)"sv;
         } else if (frame_nr > 1) {
           BOOST_LOG(info) << "Rebuilding encoder to apply runtime bitrate "sv << *latest_bitrate << " kbps"sv;
           break;
@@ -3465,8 +3466,8 @@ namespace video {
             if (latest_bitrate) {
               ctx->config.bitrate = *latest_bitrate;
               ctx->config.client_requested_bitrate = *latest_bitrate;
-              if (pos->session->set_bitrate(*latest_bitrate)) {
-                BOOST_LOG(info) << "Applied runtime bitrate "sv << *latest_bitrate << " kbps (live, sync)"sv;
+              if (pos->session->set_bitrate(*latest_bitrate, config::stream.slo_bayes)) {
+                BOOST_LOG(config::stream.slo_bayes ? debug : info) << "Applied runtime bitrate "sv << *latest_bitrate << " kbps (live, sync)"sv;
               } else {
                 // avcodec encoder: rebuild synced sessions from their (now-updated) ctx config.
                 BOOST_LOG(info) << "Rebuilding encoder to apply runtime bitrate "sv << *latest_bitrate << " kbps (sync)"sv;

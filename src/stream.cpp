@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -42,6 +43,7 @@ extern "C" {
 #include "platform/common.h"
 #include "prague/prague_cc.h"
 #include "prague/prague_wire.h"
+#include "rate/slo_bayes.h"
 #include "process.h"
 #include "rtsp.h"
 #include "session_history.h"
@@ -326,6 +328,12 @@ namespace stream {
     std::uint8_t right[DS_EFFECT_PAYLOAD_SIZE];
   };
 
+  struct control_rate_status_t {
+    control_header_v2 header;
+
+    ::prague::rate_status_t status;
+  };
+
   struct control_hdr_mode_t {
     control_header_v2 header;
 
@@ -493,6 +501,65 @@ namespace stream {
           cc(max_packet_size, fps, frame_budget, init_rate, PRAGUE_INITWIN, min_rate, max_rate) {
       }
     };
+
+    // slo-bayes bitrate control, live: frames are recorded as they go on the
+    // wire (videoBroadcastThread), the client's per-frame arrival reports and
+    // the Prague RTT feed the controller (recv thread), and every report
+    // re-derives the encoder bitrate from the next frame's byte budget.
+    struct slo_ctx_t {
+      std::mutex lock;
+      slo_bayes::controller_t ctl;
+      int fps;
+      int ceiling_kbps;  ///< client-requested bitrate: never exceeded
+      int applied_kbps;  ///< last value raised to the encoder
+      double overhead;  ///< wire bytes / encoded bytes (FEC, headers), EWMA
+
+      // Client arrival clock (µs, uint32 on the wire) extended to 64 bits
+      bool have_arrival = false;
+      std::uint32_t arrival_last = 0;
+      std::int64_t arrival_ext = 0;
+
+      // Once-a-second log
+      std::chrono::steady_clock::time_point last_log {};
+      std::uint32_t reports = 0;
+      std::uint32_t changes = 0;
+      std::int64_t last_budget = 0;
+
+      // Status to the client (control stream)
+      std::chrono::steady_clock::time_point last_status {};
+
+      // Per-frame trace: config/logs/slo_frames.csv while config/slo_trace.flag
+      // exists (checked once a second)
+      std::ofstream csv;
+      std::chrono::steady_clock::time_point last_flag_check {};
+
+      // Pending encoder change waiting out the rate limit (0 = none)
+      std::chrono::steady_clock::time_point last_change {};
+
+      static slo_bayes::controller_t::options_t live_options() {
+        // Measured live on Wi-Fi (2026-09-27): the predictive-spread and
+        // wait-p99 options met the deadline but gave up 3/4 of the bitrate
+        // (10 ms: 0.10% late at 51 Mbps, against 0.26% at 185 Mbps without
+        // them); the trace replay that recommended them overstated lateness
+        // ~20x. Kept: the learned encoder correction, which with the
+        // single-frame VBV costs almost nothing (p99 size/target ~1.0).
+        slo_bayes::controller_t::options_t o;
+        o.encoder_quantile = 0.99;
+        return o;
+      }
+
+      slo_ctx_t(int fps, int ceiling_kbps, double overhead, std::int64_t deadline_us):
+          ctl(fps, ceiling_kbps * 125.0 * overhead, deadline_us, live_options()),
+          fps(fps),
+          ceiling_kbps(ceiling_kbps),
+          applied_kbps(ceiling_kbps),
+          overhead(overhead) {
+      }
+    };
+
+    inline std::int64_t steady_us() {
+      return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
   }  // namespace prague
 
   struct session_t {
@@ -533,6 +600,10 @@ namespace stream {
       // Present iff Prague CC was negotiated for this session (config enabled
       // + client sent ML_FF_PRAGUE_CC). Shadow mode in stage 1.
       std::unique_ptr<prague::session_ctx_t> prague;
+
+      // Present iff slo_bayes is enabled and the client negotiated frame
+      // reports (only offered on top of Prague). Drives the encoder bitrate.
+      std::unique_ptr<prague::slo_ctx_t> slo;
 
       std::unique_ptr<platf::deinit_t> qos;
     } video;
@@ -1294,6 +1365,38 @@ namespace stream {
     return 0;
   }
 
+  // What slo-bayes is doing, for the client's stats overlay. Called from the
+  // control broadcast loop; rate-limited here.
+  void send_rate_status(session_t *session) {
+    if (!session->video.slo || !session->control.peer) {
+      return;
+    }
+
+    control_rate_status_t plaintext {};
+    {
+      auto &sctx = *session->video.slo;
+      std::lock_guard sg {sctx.lock};
+      auto now = std::chrono::steady_clock::now();
+      if (now - sctx.last_status < 250ms) {
+        return;
+      }
+      sctx.last_status = now;
+      plaintext.status.bitrate_kbps = util::endian::little((std::uint32_t) sctx.applied_kbps);
+      plaintext.status.ceiling_kbps = util::endian::little((std::uint32_t) sctx.ceiling_kbps);
+      plaintext.status.deadline_us = util::endian::little((std::uint32_t) sctx.ctl.deadline_us());
+      plaintext.status.capacity_kbps = util::endian::little((std::uint32_t) std::min(sctx.ctl.capacity_Bps() * 8 / 1000, 4e9));
+      plaintext.status.sigma_permille = util::endian::little((std::uint32_t) (sctx.ctl.state().sigma * 1000));  // how well the link is known
+    }
+    plaintext.header.type = ::prague::SS_RATE_STATUS_PTYPE;
+    plaintext.header.payloadLength = sizeof(control_rate_status_t) - sizeof(control_header_v2);
+
+    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    session->broadcast_ref->control_server.send(payload, session->control.peer);
+  }
+
   int send_hdr_mode(session_t *session, video::hdr_info_t hdr_info) {
     if (!session->control.peer) {
       BOOST_LOG(warning) << "Couldn't send HDR mode, still waiting for PING from Moonlight"sv;
@@ -1714,6 +1817,8 @@ namespace stream {
 
               send_hdr_mode(session, std::move(hdr_info));
             }
+
+            send_rate_status(session);
           }
 
           ++pos;
@@ -1815,7 +1920,17 @@ namespace stream {
       // Reference sender order: PacketReceived() freezes the peer timestamp
       // (and measures RTT off our echoed one), then ACKReceived() runs the
       // congestion machinery on the cumulative counters.
-      pctx.cc.PacketReceived((time_tp) ack.timestamp, (time_tp) ack.echoed_timestamp);
+      const bool fresh = pctx.cc.PacketReceived((time_tp) ack.timestamp, (time_tp) ack.echoed_timestamp);
+      if (fresh && it->second->video.slo) {
+        // Half the RTT bounds the true one-way base delay (the controller
+        // keeps its windowed minimum)
+        auto rtt = pctx.cc.GetStatePtr()->m_rtt;
+        if (rtt > 0) {
+          auto &sctx = *it->second->video.slo;
+          std::lock_guard sg {sctx.lock};
+          sctx.ctl.on_base_owd(rtt / 2, steady_us());
+        }
+      }
 
       count_tp inflight = 0;
       pctx.cc.ACKReceived(
@@ -1827,6 +1942,110 @@ namespace stream {
         inflight
       );
       pctx.last_inflight = inflight;
+      return true;
+    }
+
+    // Returns true if the datagram was a frame report (whether or not a
+    // session claimed it), so the caller skips the ping paths.
+    bool try_apply_frame_report(const char *data, size_t bytes) {
+      if (bytes != sizeof(frame_report_t)) {
+        return false;
+      }
+
+      frame_report_t rep;
+      std::memcpy(&rep, data, sizeof(rep));
+      if (rep.magic != FRAME_REPORT_MAGIC) {
+        return false;
+      }
+
+      auto lg = registry().lock();
+      auto it = registry()->find(std::string {rep.payload, sizeof(rep.payload)});
+      if (it == registry()->end() || !it->second->video.slo) {
+        return true;
+      }
+
+      auto *session = it->second;
+      auto &sctx = *session->video.slo;
+      std::lock_guard sg {sctx.lock};
+
+      // Reports arrive in frame order but may be lost; the 32-bit client
+      // clock wraps every 71 minutes, far beyond any gap between reports.
+      if (!sctx.have_arrival) {
+        sctx.have_arrival = true;
+        sctx.arrival_ext = rep.first_arrival_us;
+      } else {
+        sctx.arrival_ext += (std::int32_t) (rep.first_arrival_us - sctx.arrival_last);
+      }
+      sctx.arrival_last = rep.first_arrival_us;
+      const std::int64_t first_us = sctx.arrival_ext;
+      const std::int64_t last_us = first_us + (std::uint32_t) (rep.last_arrival_us - rep.first_arrival_us);
+
+      const auto now = steady_us();
+      slo_bayes::controller_t::report_trace_t trace;
+      sctx.ctl.on_frame_report(rep.frame_index, first_us, last_us, rep.packets, rep.bytes, now, &trace);
+      sctx.reports++;
+
+      // Budget is bytes on the wire per frame; the encoder is told an
+      // average rate of encoded bytes, hence the overhead divide. Downward
+      // moves apply at once (a late frame is the failure), upward ones only
+      // once they are worth a reconfigure.
+      const auto budget = sctx.ctl.frame_budget(now);
+      sctx.last_budget = budget;
+      const double kbps = (double) budget * sctx.ctl.encoder_scale() * 8.0 * sctx.fps / 1000.0 / sctx.overhead;
+      const int target = std::clamp((int) kbps, 500, sctx.ceiling_kbps);
+      auto tnow = std::chrono::steady_clock::now();
+      // Rate-limited: a cut of 10% or more applies at once (a late frame is
+      // the failure), smaller cuts coalesce over 20 ms, raises wait 100 ms.
+      // Unlimited, the encoder was reconfigured ~90 times a second.
+      bool apply = target < sctx.applied_kbps * 98 / 100 || target > sctx.applied_kbps * 105 / 100 ||
+                   (target == sctx.ceiling_kbps && sctx.applied_kbps != sctx.ceiling_kbps);
+      if (apply && target > sctx.applied_kbps && tnow - sctx.last_change < 100ms) {
+        apply = false;
+      }
+      if (apply && target < sctx.applied_kbps && target > sctx.applied_kbps * 90 / 100 && tnow - sctx.last_change < 20ms) {
+        apply = false;
+      }
+      if (apply) {
+        sctx.applied_kbps = target;
+        sctx.last_change = tnow;
+        sctx.changes++;
+        session->video.bitrate_events->raise(target);
+      }
+
+      if (tnow - sctx.last_flag_check >= 1s) {
+        sctx.last_flag_check = tnow;
+        std::error_code ec;
+        const bool want = std::filesystem::exists(platf::appdata() / "slo_trace.flag", ec);
+        if (want && !sctx.csv.is_open()) {
+          sctx.csv.open(platf::appdata() / "logs" / "slo_frames.csv", std::ios::out | std::ios::app);
+          sctx.csv << "# session deadline_us=" << sctx.ctl.deadline_us() << " ceiling_kbps=" << sctx.ceiling_kbps << " fps=" << sctx.fps << '\n'
+                   << "now_us,frame,first_send_us,last_send_us,sent_bytes,probe,first_arr_us,last_arr_us,packets,rx_bytes,"
+                      "w_us,obs,cap_mbps,sigma,noise_k,period_us,queue_us,base_owd_us,self_queue_bytes,budget_bytes,target_kbps,applied_kbps,pred_sigma,enc_scale\n";
+        } else if (!want && sctx.csv.is_open()) {
+          sctx.csv.close();
+        }
+      }
+      if (sctx.csv.is_open()) {
+        const auto st = sctx.ctl.state();
+        sctx.csv << now << ',' << rep.frame_index << ',' << trace.first_send_us << ',' << trace.last_send_us << ','
+                 << trace.sent_bytes << ',' << (int) trace.probe << ',' << first_us << ',' << last_us << ','
+                 << rep.packets << ',' << rep.bytes << ',' << trace.w_us << ',' << trace.obs << ','
+                 << st.capacity_Bps * 8 / 1e6 << ',' << st.sigma << ',' << st.noise_k << ',' << st.period_us << ','
+                 << st.queue_us << ',' << st.base_owd_us << ',' << (std::int64_t) st.self_queue_bytes << ','
+                 << budget << ',' << target << ',' << sctx.applied_kbps << ',' << st.predictive_sigma << ',' << st.encoder_scale << '\n';
+      }
+      if (tnow - sctx.last_log >= 1s) {
+        sctx.last_log = tnow;
+        BOOST_LOG(info) << "slo-bayes: budget "sv << sctx.last_budget
+                        << " B/frame, bitrate "sv << sctx.applied_kbps
+                        << " kbps (ceiling "sv << sctx.ceiling_kbps
+                        << ", overhead "sv << sctx.overhead
+                        << "), reports "sv << sctx.reports
+                        << ", changes "sv << sctx.changes
+                        << ", "sv << sctx.ctl.trace_state();
+        sctx.reports = 0;
+        sctx.changes = 0;
+      }
       return true;
     }
   }  // namespace prague
@@ -1900,6 +2119,9 @@ namespace stream {
         // Prague ACKs ride the video socket; identified by exact size + magic
         // so they can never be mistaken for a ping (or vice versa).
         if (buf_elem == 0 && prague::try_apply_ack(buf[buf_elem].data(), bytes)) {
+          return;
+        }
+        if (buf_elem == 0 && prague::try_apply_frame_report(buf[buf_elem].data(), bytes)) {
           return;
         }
 
@@ -2197,6 +2419,13 @@ namespace stream {
         size_t ratecontrol_frame_packets_sent = 0;
         size_t ratecontrol_group_packets_sent = 0;
 
+        // The frame's send span and wire size, for slo-bayes
+        std::int64_t slo_first_send_us = 0;
+        std::int64_t slo_last_send_us = 0;
+        std::int64_t slo_wire_bytes = 0;
+        std::int64_t slo_frame_wire_bytes = 0;  // without probe padding
+        bool slo_probed = false;
+
         // When a timestamp isn't available (duplicate frames), the timestamp from
         // rate control is used instead. Determined before the per-block loop so
         // every block of a multi-block frame sees the same answer.
@@ -2353,6 +2582,9 @@ namespace stream {
                 }
               }
 
+              if (session->video.slo && slo_first_send_us == 0) {
+                slo_first_send_us = prague::steady_us();
+              }
               frame_send_batch_latency_logger.first_point_now();
               // Use a batched send if it's supported on this platform
               if (!platf::send_batch(batch_info)) {
@@ -2374,6 +2606,10 @@ namespace stream {
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
+              if (session->video.slo) {
+                slo_last_send_us = prague::steady_us();
+                slo_wire_bytes += (std::int64_t) current_batch_size * (std::int64_t) (shards.prefixsize + shards.blocksize);
+              }
 
               ratecontrol_group_packets_sent += current_batch_size;
               ratecontrol_frame_packets_sent += current_batch_size;
@@ -2400,6 +2636,90 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+
+        // Capacity probe: padding right behind the frame's data, paced like
+        // it, so the frame is never delayed by it; abandoned the moment a
+        // newer frame is waiting, so neither is the next one.
+        slo_frame_wire_bytes = slo_wire_bytes;
+        if (session->video.slo && session->video.prague && slo_first_send_us != 0) {
+          auto &sctx = *session->video.slo;
+          const std::int64_t datagram = (std::int64_t) (sizeof(prague::data_hdr_t) + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0) + blocksize);
+          // What the pacer emits in 40% of a frame interval
+          const std::int64_t max_bytes = (std::int64_t) ((double) pacing_bps / 8.0 * 0.4 / sctx.fps);
+          std::int64_t extra;
+          {
+            std::lock_guard sg {sctx.lock};
+            extra = sctx.ctl.probe_bytes(prague::steady_us(), slo_wire_bytes, max_bytes);
+          }
+          if (extra > 0) {
+            static thread_local std::vector<char> probe_buf;
+            probe_buf.assign((size_t) datagram, 0);
+            prague::probe_hdr_t ph {prague::PROBE_MAGIC0, prague::PROBE_MAGIC1, (std::uint32_t) packet->frame_index()};
+            std::memcpy(probe_buf.data() + sizeof(prague::data_hdr_t), &ph, sizeof(ph));
+            constexpr size_t probe_head = sizeof(prague::data_hdr_t) + sizeof(prague::probe_hdr_t);
+
+            auto probe_peer = session->video.peer.address();
+            const auto count = (extra + datagram - 1) / datagram;
+            for (std::int64_t i = 0; i < count; i++) {
+              if (packets->peek()) {
+                break;
+              }
+              if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms) {
+                auto due = ratecontrol_frame_start +
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+                auto now = std::chrono::steady_clock::now();
+                if (now < due) {
+                  timer->sleep_for(due - now);
+                }
+                ratecontrol_group_packets_sent = 0;
+              }
+              {
+                auto &pctx = *session->video.prague;
+                std::lock_guard pg {pctx.lock};
+                prague::data_hdr_t hdr;
+                time_tp ts, echoed_ts;
+                ecn_tp wire_ecn;
+                pctx.cc.GetTimeInfo(ts, echoed_ts, wire_ecn);
+                hdr.timestamp = ts;
+                hdr.echoed_timestamp = echoed_ts;
+                hdr.seq_nr = ++pctx.seq_nr;
+                std::memcpy(probe_buf.data(), &hdr, sizeof(hdr));
+              }
+              auto send_info = platf::send_info_t {
+                probe_buf.data(),
+                probe_head,
+                probe_buf.data() + probe_head,
+                (size_t) datagram - probe_head,
+                (uintptr_t) sock.native_handle(),
+                probe_peer,
+                session->video.peer.port(),
+                session->localAddress,
+              };
+              platf::send(send_info);
+              ratecontrol_group_packets_sent++;
+              ratecontrol_frame_packets_sent++;
+              slo_wire_bytes += datagram;
+              slo_last_send_us = prague::steady_us();
+              slo_probed = true;
+            }
+            ratecontrol_next_frame_start = ratecontrol_frame_start +
+                                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+                                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+          }
+        }
+
+        if (session->video.slo && slo_first_send_us != 0) {
+          auto &sctx = *session->video.slo;
+          std::lock_guard sg {sctx.lock};
+          // The encoder's per-frame target in wire bytes, to learn how far
+          // it overshoots
+          const auto target_bytes = (std::int64_t) (sctx.applied_kbps * 125.0 / sctx.fps * sctx.overhead);
+          sctx.ctl.on_frame_sent((std::uint32_t) packet->frame_index(), slo_first_send_us, slo_last_send_us, slo_wire_bytes, slo_probed, slo_frame_wire_bytes, target_bytes);
+          if (!payload.empty()) {
+            sctx.overhead += 0.05 * ((double) slo_frame_wire_bytes / (double) payload.size() - sctx.overhead);
+          }
+        }
 
         // Update per-session performance counters
         session->stats.frames_sent.fetch_add(1, std::memory_order_relaxed);
@@ -3267,6 +3587,23 @@ namespace stream {
         BOOST_LOG(info) << "Prague CC: shadow mode active (fps "sv << fps
                         << ", packet size "sv << blocksize
                         << " B, init rate "sv << bitrate_Bps * 8 / 1000 << " kbps)"sv;
+
+        if (config::stream.slo_bayes && (config.mlFeatureFlags & (int) prague::ML_FF_FRAME_REPORTS)) {
+          // The client's deadline wins (it is the user's setting there), then
+          // the host's, then one frame interval
+          const std::int64_t deadline_us = config.frame_deadline_us > 0      ? config.frame_deadline_us :
+                                           config::stream.slo_bayes_deadline_us > 0 ? config::stream.slo_bayes_deadline_us :
+                                                                                     1000000 / fps;
+          // Initial wire overhead guess (FEC parity plus headers); measured
+          // per frame from then on
+          const double overhead = (1.0 + config::stream.fec_percentage / 100.0) * 1.03;
+          session->video.slo = std::make_unique<prague::slo_ctx_t>(fps, config.monitor.bitrate, overhead, deadline_us);
+          session->config.monitor.single_frame_vbv = true;
+          BOOST_LOG(info) << "slo-bayes: live bitrate control (deadline "sv << deadline_us
+                          << " us, ceiling "sv << config.monitor.bitrate << " kbps, fps "sv << fps << ')';
+        } else if (config::stream.slo_bayes) {
+          BOOST_LOG(warning) << "slo-bayes: enabled but the client did not negotiate frame reports; bitrate stays static"sv;
+        }
       }
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
