@@ -84,6 +84,7 @@ namespace game_capture {
   enum class api_e : std::uint32_t {
     unknown = 0,
     d3d11 = 1,
+    d3d12 = 2,
   };
 
   // How the game's pixels are encoded

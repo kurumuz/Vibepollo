@@ -4,13 +4,15 @@
  *        into a focused fullscreen game. See
  *        src/platform/windows/game_capture/protocol.h for the protocol.
  *
- * Step 1 captures D3D11 swapchains. The DXGI entry points (Present, Present1,
- * SetColorSpace1) are inline-detoured with MinHook at their function
- * addresses, found from a throwaway swapchain: that catches every swapchain
- * in the process whatever its swap effect or creation API, and overlays that
- * keep private vtables (their cached "original" is the function we patched).
- * D3D12 swapchains present through the same functions and are reported as
- * unsupported for now, so the host falls back to desktop capture.
+ * D3D11 and D3D12 swapchains are captured. The DXGI entry points (Present,
+ * Present1, SetColorSpace1) are inline-detoured with MinHook at their
+ * function addresses, found from a throwaway swapchain: that catches every
+ * swapchain in the process whatever its swap effect or creation API, and
+ * overlays that keep private vtables (their cached "original" is the function
+ * we patched). D3D12 also needs the queue a swapchain presents from, which
+ * DXGI does not expose: ID3D12CommandQueue::ExecuteCommandLists is detoured
+ * too, and a frame is captured only when that queue is certain (see the D3D12
+ * section).
  *
  * Threading, so that nothing here can stall or crash the game:
  *  - All work on the game's D3D objects happens on the game's own thread
@@ -43,6 +45,7 @@
 #include <windows.h>
 #include <d3d11_4.h>
 #include <d3d11on12.h>
+#include <d3d12.h>
 #include <dxgi1_4.h>
 
 #include <algorithm>
@@ -190,7 +193,7 @@ namespace {
   std::uint64_t g_last_published_frame_id = 0;
 
   SRWLOCK g_capture_lock = SRWLOCK_INIT;  // held by the one thread capturing; Presents try-lock and skip
-  ID3D11Fence *current_fence();  // the captured device's fence; capture lock held
+  std::uint64_t fence_completed();  // the captured device's fence (D3D11 or D3D12); UINT64_MAX without one; capture lock held
 
   // Runs under the capture lock: nothing here can be retired or rewritten
   // by the render thread meanwhile (it skips the frame instead).
@@ -210,8 +213,7 @@ namespace {
     // firing late) is ignored and the real one publishes. A removed device
     // reports every value complete: nothing of it is trusted.
     if (fence_value) {
-      ID3D11Fence *fence = current_fence();
-      const auto completed = fence ? fence->GetCompletedValue() : UINT64_MAX;
+      const auto completed = fence_completed();
       if (completed < fence_value) {
         return;
       }
@@ -276,10 +278,11 @@ namespace {
   // one retirement longer than the textures so a host still opening them
   // never meets a recycled handle value.
   struct retired_t {
-    ID3D11Texture2D *textures[gc::kSlots] = {};
+    IUnknown *textures[gc::kSlots] = {};  // ID3D11Texture2D or ID3D12Resource
     IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
     HANDLE handles[gc::kSlots] = {};
-    ID3D11Fence *fence = nullptr;  // the fence its copies were signalled on (a reference)
+    ID3D11Fence *fence = nullptr;  // the fence its copies were signalled on (a reference; D3D11)
+    ID3D12Fence *fence12 = nullptr;  // ... or D3D12
     std::uint64_t highest_fence_value = 0;
     std::uint64_t retired_qpc = 0;
     bool textures_released = false;
@@ -299,7 +302,18 @@ namespace {
     std::uint64_t next_frame_id = 0;
     bool single_threaded = false;
     DWORD owner_thread = 0;
-    bool reported_d3d12 = false;
+    gc::api_e api = gc::api_e::unknown;
+
+    // D3D12: the game's device and presenting queue, our fence, and one
+    // command allocator/list per slot (reused only once its copy completed)
+    ID3D12Device *device12 = nullptr;
+    ID3D12CommandQueue *queue = nullptr;
+    ID3D12Fence *fence12 = nullptr;
+    ID3D12CommandAllocator *allocators[gc::kSlots] = {};
+    ID3D12GraphicsCommandList *lists[gc::kSlots] = {};
+    std::uint64_t list_fence[gc::kSlots] = {};  // fence value of each list's last submission
+    ID3D12Resource *textures12[gc::kSlots] = {};
+    bool simultaneous = false;  // textures12 allow simultaneous access (no explicit transitions)
 
     ID3D11Texture2D *textures[gc::kSlots] = {};
     IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
@@ -317,8 +331,15 @@ namespace {
   capture_t g_cap;
   std::atomic<IDXGISwapChain *> g_captured_swapchain {nullptr};  // g_cap.swapchain, readable without the capture lock
 
-  ID3D11Fence *current_fence() {
-    return g_cap.fence;
+  std::uint64_t fence_completed() {
+    if (g_cap.fence12) {
+      return g_cap.fence12->GetCompletedValue();
+    }
+    return g_cap.fence ? g_cap.fence->GetCompletedValue() : UINT64_MAX;
+  }
+
+  bool have_textures() {
+    return g_cap.textures[0] || g_cap.textures12[0];
   }
 
   void publish_setup(HWND hwnd, bool valid) {
@@ -326,7 +347,7 @@ namespace {
     const auto seq = b.setup_seq.load(std::memory_order_relaxed);
     b.setup_seq.store(seq + 1, std::memory_order_release);
     std::atomic_thread_fence(std::memory_order_release);
-    b.setup.api.store(static_cast<std::uint32_t>(gc::api_e::d3d11), std::memory_order_relaxed);
+    b.setup.api.store(static_cast<std::uint32_t>(g_cap.api), std::memory_order_relaxed);
     b.setup.width.store(valid ? g_cap.width : 0, std::memory_order_relaxed);
     b.setup.height.store(valid ? g_cap.height : 0, std::memory_order_relaxed);
     b.setup.format.store(static_cast<std::uint32_t>(valid ? g_cap.format : DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
@@ -337,7 +358,11 @@ namespace {
     }
     b.setup.sync.store(static_cast<std::uint32_t>(g_cap.owner_sync ? gc::sync_e::owner : gc::sync_e::keyed_mutex), std::memory_order_relaxed);
     b.setup.handle_kind.store(static_cast<std::uint32_t>(valid && g_cap.legacy_handles[0] ? gc::handle_kind_e::legacy : gc::handle_kind_e::nt), std::memory_order_relaxed);
-    if (valid && g_cap.device) {
+    if (valid && g_cap.device12) {
+      const LUID luid = g_cap.device12->GetAdapterLuid();
+      b.setup.adapter_luid_low.store(luid.LowPart, std::memory_order_relaxed);
+      b.setup.adapter_luid_high.store(luid.HighPart, std::memory_order_relaxed);
+    } else if (valid && g_cap.device) {
       IDXGIDevice *dxgi_device = nullptr;
       if (SUCCEEDED(g_cap.device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device)))) {
         IDXGIAdapter *adapter = nullptr;
@@ -371,6 +396,7 @@ namespace {
       safe_release(r.textures[i]);
     }
     safe_release(r.fence);
+    safe_release(r.fence12);
     r.textures_released = true;
   }
 
@@ -385,7 +411,8 @@ namespace {
       }
       if (!r.textures_released) {
         // (UINT64_MAX = device removed: nothing more will complete; release)
-        const bool done = !r.fence || r.fence->GetCompletedValue() >= r.highest_fence_value;
+        const auto completed = r.fence12 ? r.fence12->GetCompletedValue() : r.fence ? r.fence->GetCompletedValue() : UINT64_MAX;
+        const bool done = completed >= r.highest_fence_value;
         const bool old = now - r.retired_qpc > qpc_frequency();
         // A global handle is only as valid as its texture: keep the textures
         // for the whole grace period so a host that read the old setup never
@@ -407,7 +434,7 @@ namespace {
   // freed here on exactly the submissions they hold (a completion in flight
   // for one of them fails its CAS and does nothing).
   void retire_generation(HWND hwnd) {
-    if (!g_cap.textures[0]) {
+    if (!have_textures()) {
       return;
     }
     g_current_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -442,11 +469,18 @@ namespace {
       g_cap.fence->AddRef();
       slot->fence = g_cap.fence;
     }
-    std::memcpy(slot->textures, g_cap.textures, sizeof(g_cap.textures));
+    if (g_cap.fence12) {
+      g_cap.fence12->AddRef();
+      slot->fence12 = g_cap.fence12;
+    }
+    for (int i = 0; i < gc::kSlots; ++i) {
+      slot->textures[i] = g_cap.textures[i] ? static_cast<IUnknown *>(g_cap.textures[i]) : static_cast<IUnknown *>(g_cap.textures12[i]);
+    }
     std::memcpy(slot->mutexes, g_cap.mutexes, sizeof(g_cap.mutexes));
     std::memcpy(slot->handles, g_cap.shared_handles, sizeof(g_cap.shared_handles));
     slot->legacy = g_cap.legacy_handles[0] != 0;
     std::memset(g_cap.textures, 0, sizeof(g_cap.textures));
+    std::memset(g_cap.textures12, 0, sizeof(g_cap.textures12));
     std::memset(g_cap.mutexes, 0, sizeof(g_cap.mutexes));
     std::memset(g_cap.shared_handles, 0, sizeof(g_cap.shared_handles));
     std::memset(g_cap.legacy_handles, 0, sizeof(g_cap.legacy_handles));
@@ -472,6 +506,18 @@ namespace {
     safe_release(g_cap.context4);
     safe_release(g_cap.context);
     safe_release(g_cap.device);
+    // D3D12: the lists and allocators are reused only after their copies
+    // completed, so a retired set's fence also covers them; releasing them
+    // with copies in flight is safe (the runtime keeps what the GPU uses)
+    for (int i = 0; i < gc::kSlots; ++i) {
+      safe_release(g_cap.lists[i]);
+      safe_release(g_cap.allocators[i]);
+      g_cap.list_fence[i] = 0;
+    }
+    safe_release(g_cap.fence12);
+    safe_release(g_cap.queue);
+    safe_release(g_cap.device12);
+    g_cap.api = gc::api_e::unknown;
     g_cap.swapchain = nullptr;
     g_captured_swapchain.store(nullptr, std::memory_order_release);
     g_cap.owner_thread = 0;
@@ -483,6 +529,7 @@ namespace {
       return true;
     }
     release_capture(hwnd);
+    g_cap.api = gc::api_e::d3d11;
     g_cap.swapchain = swapchain;
     g_captured_swapchain.store(swapchain, std::memory_order_release);
     device->AddRef();
@@ -719,6 +766,55 @@ namespace {
     return hwnd == foreground || GetAncestor(hwnd, GA_ROOT) == foreground;
   }
 
+  // Rewrites a slot's shared record while this thread owns the slot (its
+  // keyed mutex or owner word), before the copy: a host that holds the slot
+  // and reads an even record reads the metadata of exactly its pixels.
+  // Returns the record's version.
+  std::uint32_t write_slot_record(int slot, std::uint32_t generation, std::uint32_t color_space, std::uint64_t frame_id,
+                                  std::uint64_t present_qpc, std::uint64_t release_qpc) {
+    auto &record = g_block->slots[slot];
+    const auto seq = record.seq.load(std::memory_order_relaxed);
+    record.seq.store(seq + 1, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    record.generation.store(generation, std::memory_order_relaxed);
+    record.color_space.store(color_space, std::memory_order_relaxed);
+    record.frame_id.store(frame_id, std::memory_order_relaxed);
+    record.present_qpc.store(present_qpc, std::memory_order_relaxed);
+    record.release_qpc.store(release_qpc, std::memory_order_relaxed);
+    record.gpu_done_qpc.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    record.seq.store(seq + 2, std::memory_order_release);
+    return (seq + 2) >> 1;
+  }
+
+  // Hands a submitted copy to the completion thread: the fields first, then
+  // the pending word (release). Returns its ticket.
+  std::uint64_t mark_pending(int slot, std::uint32_t version, std::uint32_t generation, std::uint64_t frame_id, std::uint64_t fence_value) {
+    auto &s = g_slots[slot];
+    s.version = version;
+    s.generation = generation;
+    s.frame_id = frame_id;
+    s.fence_value = fence_value;
+    const auto ticket = g_next_ticket++;
+    s.word.store(make_word(st_pending, ticket), std::memory_order_release);
+    return ticket;
+  }
+
+  // No completion will come for this submission: free its slot rather than
+  // leave it pending forever
+  void drop_pending(int slot, std::uint64_t ticket) {
+    auto pending = make_word(st_pending, ticket);
+    g_slots[slot].word.compare_exchange_strong(pending, make_word(st_free, ticket), std::memory_order_acq_rel);
+    g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void note_capturing(IDXGISwapChain *swapchain, const char *api) {
+    if (g_block->hook_state.load(std::memory_order_relaxed) != static_cast<std::uint32_t>(gc::hook_state_e::capturing)) {
+      set_state(gc::hook_state_e::capturing);
+      log("Capturing %s frames from swapchain %p", api, static_cast<void *>(swapchain));
+    }
+  }
+
   // A free slot whose keyed mutex is available now (the host may still hold
   // the previously published one); -1 if none, -2 if a mutex was abandoned
   // (the shared surface must be recreated)
@@ -745,6 +841,406 @@ namespace {
       }
     }
     return -1;
+  }
+
+  // ---- D3D12 ---------------------------------------------------------------
+  //
+  // A D3D12 copy must run on the queue the swapchain presents from: only that
+  // orders it after the game's rendering of the back buffer and before the
+  // flip. DXGI does not say which queue that is, so the hook watches
+  // ID3D12CommandQueue::ExecuteCommandLists and keeps the queues that submit
+  // work. A swapchain's queue is taken to be its device's direct queue only
+  // when exactly one direct queue of that device submitted in the last
+  // second; with none or several the frame is not captured (desktop capture),
+  // and after kQueueUndecidedMs of that the hook reports the game unsupported.
+  // Nothing is guessed.
+  //
+  // Per frame, on the presenting thread inside Present: the slot's own
+  // command list (reused only once its previous copy completed) moves the
+  // back buffer PRESENT -> COPY_SOURCE, copies it into the slot's shared
+  // texture, moves it back, and is executed on that queue; the queue then
+  // signals our fence, whose completion publishes the slot (owner words: D3D12
+  // has no keyed mutexes). The shared textures prefer simultaneous access
+  // (implicit promotion to COPY_DEST and decay back to COMMON, so the host's
+  // D3D11 reads see a common-state resource); without it the list moves them
+  // COMMON -> COPY_DEST -> COMMON itself.
+
+  using execute_command_lists_fn = void(STDMETHODCALLTYPE *)(ID3D12CommandQueue *, UINT, ID3D12CommandList *const *);
+  execute_command_lists_fn g_real_execute_command_lists = nullptr;
+
+  // ID3D12CommandQueue: IUnknown 0-2, ID3D12Object 3-6, ID3D12DeviceChild 7,
+  // UpdateTileMappings 8, CopyTileMappings 9, ExecuteCommandLists 10
+  constexpr int kVtExecuteCommandLists = 10;
+  constexpr int kQueueTable = 16;
+  constexpr std::uint64_t kQueueRecentMs = 1000;
+  constexpr std::uint64_t kQueueForgetMs = 10000;
+  constexpr std::uint64_t kQueueUndecidedMs = 3000;
+
+  struct queue_entry_t {
+    ID3D12CommandQueue *queue = nullptr;  // a reference, taken inside the queue's own ExecuteCommandLists (so it was alive)
+    ID3D12Device *device = nullptr;  // identity only (the queue keeps it alive)
+    bool direct = false;
+    std::atomic<std::uint64_t> last_seen_qpc {0};
+  };
+
+  queue_entry_t g_queues[kQueueTable];
+  SRWLOCK g_queues_lock = SRWLOCK_INIT;
+
+  std::uint64_t ms_to_qpc(std::uint64_t ms) {
+    return ms * qpc_frequency() / 1000;
+  }
+
+  // Called on every ExecuteCommandLists: a shared-lock scan when the queue is
+  // known (the hot path), an exclusive insert the first time
+  void note_queue(ID3D12CommandQueue *queue) {
+    const auto now = qpc_now();
+    AcquireSRWLockShared(&g_queues_lock);
+    for (auto &e : g_queues) {
+      if (e.queue == queue) {
+        e.last_seen_qpc.store(now, std::memory_order_relaxed);
+        ReleaseSRWLockShared(&g_queues_lock);
+        return;
+      }
+    }
+    ReleaseSRWLockShared(&g_queues_lock);
+
+    const auto desc = queue->GetDesc();
+    ID3D12Device *device = nullptr;
+    if (FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device)))) {
+      return;
+    }
+    device->Release();
+
+    ID3D12CommandQueue *evicted = nullptr;
+    AcquireSRWLockExclusive(&g_queues_lock);
+    queue_entry_t *slot = nullptr;
+    for (auto &e : g_queues) {
+      if (e.queue == queue) {
+        e.last_seen_qpc.store(now, std::memory_order_relaxed);  // another thread got here first
+        ReleaseSRWLockExclusive(&g_queues_lock);
+        return;
+      }
+      if (!e.queue && !slot) {
+        slot = &e;
+      }
+    }
+    if (!slot) {
+      slot = &g_queues[0];
+      for (auto &e : g_queues) {
+        if (e.last_seen_qpc.load(std::memory_order_relaxed) < slot->last_seen_qpc.load(std::memory_order_relaxed)) {
+          slot = &e;
+        }
+      }
+      evicted = slot->queue;
+    }
+    queue->AddRef();
+    slot->queue = queue;
+    slot->device = device;
+    slot->direct = desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+    slot->last_seen_qpc.store(now, std::memory_order_relaxed);
+    ReleaseSRWLockExclusive(&g_queues_lock);
+    if (evicted) {
+      evicted->Release();
+    }
+    log("D3D12 queue %p (type %d) on device %p", static_cast<void *>(queue), static_cast<int>(desc.Type), static_cast<void *>(device));
+  }
+
+  // Drops queues that stopped submitting (their references with them)
+  void forget_stale_queues() {
+    const auto now = qpc_now();
+    ID3D12CommandQueue *stale[kQueueTable] = {};
+    int count = 0;
+    AcquireSRWLockExclusive(&g_queues_lock);
+    for (auto &e : g_queues) {
+      if (e.queue && now - e.last_seen_qpc.load(std::memory_order_relaxed) > ms_to_qpc(kQueueForgetMs)) {
+        stale[count++] = e.queue;
+        e.queue = nullptr;
+        e.device = nullptr;
+      }
+    }
+    ReleaseSRWLockExclusive(&g_queues_lock);
+    for (int i = 0; i < count; ++i) {
+      stale[i]->Release();
+    }
+  }
+
+  // The swapchain's presenting queue (a new reference), when it is certain:
+  // the only direct queue of `device` that submitted recently
+  ID3D12CommandQueue *present_queue(ID3D12Device *device, int &direct) {
+    const auto now = qpc_now();
+    ID3D12CommandQueue *found = nullptr;
+    direct = 0;
+    AcquireSRWLockShared(&g_queues_lock);
+    for (auto &e : g_queues) {
+      if (e.queue && e.direct && e.device == device && now - e.last_seen_qpc.load(std::memory_order_relaxed) <= ms_to_qpc(kQueueRecentMs)) {
+        ++direct;
+        found = e.queue;
+      }
+    }
+    if (direct == 1) {
+      found->AddRef();
+    } else {
+      found = nullptr;
+    }
+    ReleaseSRWLockShared(&g_queues_lock);
+    return found;
+  }
+
+  void STDMETHODCALLTYPE hook_execute_command_lists(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists) {
+    if (g_block) {
+      note_queue(queue);
+    }
+    g_real_execute_command_lists(queue, count, lists);
+  }
+
+  void execute_on(ID3D12CommandQueue *queue, ID3D12CommandList *list) {
+    if (g_real_execute_command_lists) {
+      g_real_execute_command_lists(queue, 1, &list);
+    } else {
+      queue->ExecuteCommandLists(1, &list);
+    }
+  }
+
+  bool ensure_device12(IDXGISwapChain *swapchain, ID3D12Device *device, ID3D12CommandQueue *queue, HWND hwnd) {
+    if (g_cap.api == gc::api_e::d3d12 && g_cap.device12 == device && g_cap.queue == queue && g_cap.swapchain == swapchain) {
+      return true;
+    }
+    release_capture(hwnd);
+    g_cap.api = gc::api_e::d3d12;
+    g_cap.swapchain = swapchain;
+    g_captured_swapchain.store(swapchain, std::memory_order_release);
+    device->AddRef();
+    g_cap.device12 = device;
+    queue->AddRef();
+    g_cap.queue = queue;
+    g_cap.owner_thread = GetCurrentThreadId();
+    g_cap.single_threaded = false;  // D3D12 objects are free-threaded
+    g_cap.fence_value = 0;
+
+    const UINT node = queue->GetDesc().NodeMask;
+    const char *step = "fence";
+    HRESULT hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_cap.fence12));
+    for (int i = 0; i < gc::kSlots && SUCCEEDED(hr); ++i) {
+      step = "allocator";
+      hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void **>(&g_cap.allocators[i]));
+      if (SUCCEEDED(hr)) {
+        step = "list";
+        hr = device->CreateCommandList(node, D3D12_COMMAND_LIST_TYPE_DIRECT, g_cap.allocators[i], nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                       reinterpret_cast<void **>(&g_cap.lists[i]));
+      }
+      if (SUCCEEDED(hr)) {
+        hr = g_cap.lists[i]->Close();  // created recording; closed until used
+      }
+    }
+    if (FAILED(hr)) {
+      char msg[96];
+      std::snprintf(msg, sizeof(msg), "D3D12 setup failed at %s: 0x%08lx", step, hr);
+      release_capture(hwnd);
+      set_state(gc::hook_state_e::failed, msg);
+      return false;
+    }
+    log("D3D12 device %p, presenting queue %p: frames timestamped at GPU completion", static_cast<void *>(device), static_cast<void *>(queue));
+    return true;
+  }
+
+  bool ensure_textures12(const D3D12_RESOURCE_DESC &back, HWND hwnd) {
+    const DXGI_FORMAT format = shareable_format(back.Format);
+    const auto width = static_cast<UINT>(back.Width);
+    if (g_cap.textures12[0] && g_cap.width == width && g_cap.height == back.Height && g_cap.format == format) {
+      return true;
+    }
+    retire_generation(hwnd);
+
+    D3D12_HEAP_PROPERTIES heap {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = back.Width;
+    desc.Height = back.Height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    struct variant_t {
+      D3D12_RESOURCE_FLAGS flags;
+      const char *name;
+    };
+    constexpr variant_t variants[] = {
+      {D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, "simultaneous"},
+      {D3D12_RESOURCE_FLAG_NONE, "plain"},
+    };
+    char failures[gc::kErrorLength] = {};
+    const variant_t *used = nullptr;
+    for (const auto &v : variants) {
+      desc.Flags = v.flags;
+      const char *step = nullptr;
+      HRESULT hr = S_OK;
+      for (int i = 0; i < gc::kSlots && SUCCEEDED(hr); ++i) {
+        step = "create";
+        hr = g_cap.device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                     __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_cap.textures12[i]));
+        if (SUCCEEDED(hr)) {
+          step = "nthandle";
+          hr = g_cap.device12->CreateSharedHandle(g_cap.textures12[i], nullptr, GENERIC_ALL, nullptr, &g_cap.shared_handles[i]);
+        }
+      }
+      if (SUCCEEDED(hr)) {
+        used = &v;
+        break;
+      }
+      log("D3D12 capture texture variant %s (%ux%u fmt %d) failed at %s: 0x%08lx", v.name, width, back.Height, format, step, hr);
+      const auto len = std::strlen(failures);
+      std::snprintf(failures + len, sizeof(failures) - len, "%s%s@%s=%lx", len ? " " : "", v.name, step, hr);
+      for (int j = 0; j < gc::kSlots; ++j) {
+        safe_release(g_cap.textures12[j]);
+      }
+      close_handles(g_cap.shared_handles);
+    }
+    if (!used) {
+      char msg[gc::kErrorLength];
+      std::snprintf(msg, sizeof(msg), "D3D12 textures %ux%u f%d: %s", width, back.Height, format, failures);
+      set_state(gc::hook_state_e::failed, msg);
+      return false;
+    }
+    g_cap.simultaneous = used->flags == D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    g_cap.owner_sync = true;
+    g_cap.width = width;
+    g_cap.height = back.Height;
+    g_cap.format = format;
+    if (g_current_generation.load(std::memory_order_acquire) == 0) {
+      g_current_generation.store(1, std::memory_order_release);
+    }
+    publish_setup(hwnd, true);
+    log("D3D12 capture textures %ux%u format %d (%s), generation %u", width, back.Height, format, used->name, g_current_generation.load());
+    return true;
+  }
+
+  D3D12_RESOURCE_BARRIER transition(ID3D12Resource *resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER b {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = resource;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    return b;
+  }
+
+  // Capture lock held. `device` is the swapchain's (borrowed).
+  void capture_frame12(IDXGISwapChain *swapchain, ID3D12Device *device, HWND hwnd, std::uint64_t present_qpc, std::uint64_t release_qpc) {
+    static std::uint64_t undecided_since = 0;
+    static std::uint64_t last_forget = 0;
+    static bool reported_undecided = false;
+    const auto now = qpc_now();
+    if (now - last_forget > qpc_frequency()) {
+      last_forget = now;
+      forget_stale_queues();
+    }
+
+    int direct = 0;
+    ID3D12CommandQueue *queue = present_queue(device, direct);
+    if (!queue) {
+      // Not (yet) certain which queue presents: skip, and give up after a while
+      if (undecided_since == 0) {
+        undecided_since = now;
+      } else if (!reported_undecided && now - undecided_since > ms_to_qpc(kQueueUndecidedMs)) {
+        reported_undecided = true;
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "D3D12: %d direct queues submitted on the swapchain's device; which one presents is unknown", direct);
+        set_state(gc::hook_state_e::unsupported, msg);
+      }
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    undecided_since = 0;
+    const bool ready = ensure_device12(swapchain, device, queue, hwnd);
+    queue->Release();
+    if (!ready || FAILED(device->GetDeviceRemovedReason())) {
+      return;
+    }
+
+    IDXGISwapChain3 *swapchain3 = nullptr;
+    if (FAILED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
+      return;
+    }
+    const UINT index = swapchain3->GetCurrentBackBufferIndex();
+    swapchain3->Release();
+    ID3D12Resource *back = nullptr;
+    if (FAILED(swapchain->GetBuffer(index, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&back)))) {
+      return;
+    }
+    struct release_back_t {
+      ID3D12Resource *&r;
+      ~release_back_t() {
+        safe_release(r);
+      }
+    } release_back {back};
+
+    const auto back_desc = back->GetDesc();
+    if (back_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || back_desc.SampleDesc.Count != 1 || back_desc.DepthOrArraySize != 1) {
+      return;  // not a flip-model back buffer we know how to copy
+    }
+    if (!ensure_textures12(back_desc, hwnd)) {
+      return;
+    }
+    const std::uint32_t color_space = swapchain_color_space(swapchain, g_cap.format);
+
+    const int slot = acquire_free_slot();  // owner words: claims the slot
+    if (slot < 0) {
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    auto give_back = [&] {
+      g_block->owner[slot].store(gc::kOwnerNone, std::memory_order_release);
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+    };
+
+    // The slot's list may be re-recorded only once its last copy completed
+    if (g_cap.fence12->GetCompletedValue() < g_cap.list_fence[slot]) {
+      give_back();
+      return;
+    }
+    auto *list = g_cap.lists[slot];
+    if (FAILED(g_cap.allocators[slot]->Reset()) || FAILED(list->Reset(g_cap.allocators[slot], nullptr))) {
+      give_back();
+      return;
+    }
+    auto *target = g_cap.textures12[slot];
+    D3D12_RESOURCE_BARRIER before[2] = {transition(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                        transition(target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)};
+    D3D12_RESOURCE_BARRIER after[2] = {transition(back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+                                       transition(target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)};
+    // A simultaneous-access texture is promoted to COPY_DEST and decays back
+    // to COMMON by itself
+    const UINT barriers = g_cap.simultaneous ? 1 : 2;
+    list->ResourceBarrier(barriers, before);
+    list->CopyResource(target, back);
+    list->ResourceBarrier(barriers, after);
+    if (FAILED(list->Close())) {
+      give_back();
+      return;
+    }
+
+    const auto generation = g_current_generation.load(std::memory_order_acquire);
+    const auto frame_id = ++g_cap.next_frame_id;
+    const auto version = write_slot_record(slot, generation, color_space, frame_id, present_qpc, release_qpc);
+
+    execute_on(g_cap.queue, list);
+    // The copy is still in flight, but the host takes only a published slot,
+    // and this one publishes after the fence below completes
+    g_block->owner[slot].store(gc::kOwnerNone, std::memory_order_release);
+
+    const auto fence_value = ++g_cap.fence_value;
+    g_cap.list_fence[slot] = fence_value;
+    g_cap.highest_fence_value_used = fence_value;
+    const auto ticket = mark_pending(slot, version, generation, frame_id, fence_value);
+    const bool signalled = SUCCEEDED(g_cap.queue->Signal(g_cap.fence12, fence_value)) &&
+                           SUCCEEDED(g_cap.fence12->SetEventOnCompletion(fence_value, g_slots[slot].done_event));
+    if (!signalled) {
+      drop_pending(slot, ticket);
+    }
+    note_capturing(swapchain, "D3D12");
   }
 
   void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc, std::uint64_t release_qpc) {
@@ -787,10 +1283,17 @@ namespace {
 
     ID3D11Device *device = nullptr;
     if (FAILED(swapchain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void **>(&device)))) {
-      if (!g_cap.reported_d3d12) {
-        g_cap.reported_d3d12 = true;
-        set_state(gc::hook_state_e::unsupported, "The swapchain is not D3D11 (likely D3D12); not captured yet");
+      ID3D12Device *device12 = nullptr;
+      if (FAILED(swapchain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device12)))) {
+        static bool reported = false;
+        if (!reported) {
+          reported = true;
+          set_state(gc::hook_state_e::unsupported, "The swapchain is neither D3D11 nor D3D12");
+        }
+        return;
       }
+      capture_frame12(swapchain, device12, hwnd, present_qpc, release_qpc);
+      device12->Release();
       return;
     }
     ensure_device(swapchain, device, hwnd);
@@ -826,18 +1329,7 @@ namespace {
     // holding the mutex and reading an even record reads this frame's.
     const auto generation = g_current_generation.load(std::memory_order_acquire);
     const auto frame_id = ++g_cap.next_frame_id;
-    auto &record = g_block->slots[slot];
-    const auto seq = record.seq.load(std::memory_order_relaxed);
-    record.seq.store(seq + 1, std::memory_order_release);
-    std::atomic_thread_fence(std::memory_order_release);
-    record.generation.store(generation, std::memory_order_relaxed);
-    record.color_space.store(color_space, std::memory_order_relaxed);
-    record.frame_id.store(frame_id, std::memory_order_relaxed);
-    record.present_qpc.store(present_qpc, std::memory_order_relaxed);
-    record.release_qpc.store(release_qpc, std::memory_order_relaxed);
-    record.gpu_done_qpc.store(0, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-    record.seq.store(seq + 2, std::memory_order_release);
+    const auto version = write_slot_record(slot, generation, color_space, frame_id, present_qpc, release_qpc);
 
     if (back_desc.SampleDesc.Count > 1) {
       g_cap.context->ResolveSubresource(g_cap.textures[slot], 0, back, 0, g_cap.format);
@@ -853,14 +1345,8 @@ namespace {
     }
     back->Release();
 
-    // The submission: fields first, then the pending word (release)
     auto &s = g_slots[slot];
-    s.version = (seq + 2) >> 1;
-    s.generation = generation;
-    s.frame_id = frame_id;
-    s.fence_value = (g_cap.fence && g_cap.context4) ? ++g_cap.fence_value : 0;
-    const auto ticket = g_next_ticket++;
-    s.word.store(make_word(st_pending, ticket), std::memory_order_release);
+    const auto ticket = mark_pending(slot, version, generation, frame_id, (g_cap.fence && g_cap.context4) ? ++g_cap.fence_value : 0);
 
     // Completion always goes through the completion thread (single
     // publisher). Without a fence, or if registering its event fails, the
@@ -878,20 +1364,12 @@ namespace {
     }
     if (!signalled) {
       if (s.fence_value) {
-        // No completion will come for this value: drop the frame rather
-        // than leave its slot pending forever
-        auto pending = make_word(st_pending, ticket);
-        s.word.compare_exchange_strong(pending, make_word(st_free, ticket), std::memory_order_acq_rel);
-        g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+        drop_pending(slot, ticket);
       } else {
         SetEvent(s.done_event);
       }
     }
-
-    if (g_block->hook_state.load(std::memory_order_relaxed) != static_cast<std::uint32_t>(gc::hook_state_e::capturing)) {
-      set_state(gc::hook_state_e::capturing);
-      log("Capturing D3D11 frames from swapchain %p", static_cast<void *>(swapchain));
-    }
+    note_capturing(swapchain, "D3D11");
   }
 
 
@@ -1111,6 +1589,44 @@ namespace {
     return hr;
   }
 
+  // ID3D12CommandQueue::ExecuteCommandLists, found from a throwaway queue on
+  // a D3D12 device (the runtime hands back the process's existing device
+  // for the adapter). Only when the game has loaded d3d12.dll; its runtime
+  // (the Agility SDK's D3D12Core.dll if it ships one) is the one we reach.
+  void install_d3d12_hook() {
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (!d3d12) {
+      return;
+    }
+    using create_device_fn = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+    auto create_device = reinterpret_cast<create_device_fn>(reinterpret_cast<void *>(GetProcAddress(d3d12, "D3D12CreateDevice")));
+    if (!create_device) {
+      return;
+    }
+    ID3D12Device *device = nullptr;
+    ID3D12CommandQueue *queue = nullptr;
+    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&device));
+    if (SUCCEEDED(hr)) {
+      D3D12_COMMAND_QUEUE_DESC desc {};
+      desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+      hr = device->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&queue));
+    }
+    if (SUCCEEDED(hr)) {
+      void **vtable = *reinterpret_cast<void ***>(queue);
+      if (MH_CreateHook(vtable[kVtExecuteCommandLists], reinterpret_cast<void *>(&hook_execute_command_lists),
+                        reinterpret_cast<void **>(&g_real_execute_command_lists)) != MH_OK) {
+        g_real_execute_command_lists = nullptr;
+        log("ExecuteCommandLists could not be detoured; D3D12 swapchains cannot be captured");
+      } else {
+        log("Detoured ID3D12CommandQueue::ExecuteCommandLists");
+      }
+    } else {
+      log("No D3D12 device for the queue detour: 0x%08lx", hr);
+    }
+    safe_release(queue);
+    safe_release(device);
+  }
+
   // The entry points are found from a throwaway swapchain and inline-detoured
   // at their addresses, which every swapchain of the process shares.
   bool install_hooks() {
@@ -1160,6 +1676,7 @@ namespace {
         swapchain3->Release();
       }
       if (ok) {
+        install_d3d12_hook();
         ok = MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
       }
       if (!ok) {
