@@ -109,6 +109,21 @@ target_link_libraries(sunshine_wgc_capture
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
+# In-game capture hook, injected into a focused fullscreen game
+# (src/platform/windows/game_capture). Kept dependency-free: it runs inside
+# third-party processes.
+add_library(vibepollo_game_hook SHARED
+        game_hook/game_hook.cpp)
+set_target_properties(vibepollo_game_hook PROPERTIES
+        CXX_STANDARD 23
+        PREFIX ""
+        OUTPUT_NAME "vibepollo_game_hook")
+target_link_libraries(vibepollo_game_hook
+        d3d11
+        dxgi
+        user32)
+target_link_options(vibepollo_game_hook PRIVATE -static -static-libgcc -static-libstdc++)
+
 # Display settings helper: detached helper that applies/reverts display settings via IPC.
 # One exe hosts both engines (legacy + v2), selected by --engine= or persisted state.
 add_executable(sunshine_display_helper

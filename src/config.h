@@ -246,6 +246,14 @@ namespace config {
     bool wire_capture_timestamps;  ///< Send true capture timestamps in the RTP video timestamp instead of snapping them onto the encode grid, and mark host-generated duplicate frames in the packet header. Enables timestamp-aware pacing in clients; older clients ignore both. Disable for legacy grid-quantized timestamps.
     std::string fallback_mode;
     bool ignore_encoder_probe_failure;
+
+    // Capture a focused fullscreen/borderless game from inside the game (an
+    // injected Present hook, tools/game_hook) instead of from the desktop
+    // compositor: exact per-frame game timing, no compositor tick, no wait for
+    // composition. Desktop capture stays the fallback whenever the game is not
+    // focused and fullscreen, or presents through an API not captured yet.
+    // Appended with its default so the positional initializer is unaffected.
+    bool game_capture = false;
   };
 
   struct audio_t {

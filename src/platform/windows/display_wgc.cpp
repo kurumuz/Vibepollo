@@ -19,6 +19,8 @@
 #include "src/logging.h"
 #include "src/platform/windows/display.h"
 #include "src/platform/windows/display_vram.h"
+#include "src/platform/windows/game_activity.h"
+#include "src/platform/windows/game_capture/game_source.h"
 #include "src/platform/windows/misc.h"
 #include "src/utility.h"
 
@@ -211,6 +213,34 @@ namespace platf::dxgi {
       return capture_e::reinit;
     }
 
+    // Hybrid capture: frames come from inside the game while it is focused
+    // and fullscreen/borderless on this display, from the compositor otherwise
+    if (config::video.game_capture) {
+      if (!_game_source) {
+        _game_source = std::make_unique<game_capture::source_t>(device.get());
+        _game_converter = std::make_unique<game_capture::converter_t>();
+        _game_sdr_white_scale = game_capture::sdr_white_scale_for_output(captured_output_desc.DeviceName);
+        BOOST_LOG(info) << "Game capture: enabled (desktop SDR white " << _game_sdr_white_scale * 80.0f << " nits)";
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now - _game_foreground_checked >= std::chrono::milliseconds(100)) {
+        _game_foreground_checked = now;
+        _game_foreground = platf::game_activity::foreground_snapshot(captured_output_desc.DesktopCoordinates);
+      }
+      const bool game_active = _game_source->active(_game_foreground);
+      if (game_active != _game_mode) {
+        _game_mode = game_active;
+        BOOST_LOG(info) << "Game capture: " << (game_active ? "capturing from the game (" + _game_foreground.foreground_exe + ")" : std::string("back to desktop capture"));
+      }
+      if (game_active) {
+        bool fall_back = false;
+        const auto status = snapshot_game(pull_free_image_cb, img_out, effective_wgc_timeout(timeout, _config.framerate), fall_back);
+        if (!fall_back) {
+          return status;
+        }
+      }
+    }
+
     timeout = effective_wgc_timeout(timeout, _config.framerate);
 
     auto capture_status = _ipc_session->wait_for_frame(timeout);
@@ -346,6 +376,92 @@ namespace platf::dxgi {
     img_out = img;
     _last_cached_frame = img;
 
+    return capture_e::ok;
+  }
+
+  capture_e display_wgc_ipc_vram_t::snapshot_game(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool &fall_back) {
+    fall_back = false;
+
+    // The image pool's format is learned from the first compositor frame;
+    // until then the desktop path provides frames
+    if (capture_format == DXGI_FORMAT_UNKNOWN) {
+      fall_back = true;
+      return capture_e::ok;
+    }
+
+    auto status = _game_source->wait(timeout);
+    if (status == capture_e::timeout) {
+      if (is_wgc_constant_mode()) {
+        return forward_cached_wgc_frame(_last_cached_frame, img_out);
+      }
+      return status;
+    }
+    if (status != capture_e::ok) {
+      fall_back = true;
+      return capture_e::ok;
+    }
+
+    // Hold the published slot first: the hook never writes the published
+    // slot, so holding it while the encoder image frees up costs the game
+    // nothing
+    game_capture::frame_t frame;
+    status = _game_source->lock(frame);
+    if (status != capture_e::ok) {
+      return status;
+    }
+    auto unlock_game = util::fail_guard([&]() {
+      _game_source->unlock();
+    });
+
+    if (frame.width != static_cast<std::uint32_t>(width_before_rotation) || frame.height != static_cast<std::uint32_t>(height_before_rotation)) {
+      const auto key = (static_cast<std::uint64_t>(frame.width) << 32) | frame.height;
+      if (_game_mismatch_logged != key) {
+        _game_mismatch_logged = key;
+        BOOST_LOG(info) << "Game capture: the game renders " << frame.width << 'x' << frame.height << ", the display is "
+                        << width_before_rotation << 'x' << height_before_rotation << "; using desktop capture";
+      }
+      fall_back = true;
+      return capture_e::ok;
+    }
+
+    std::shared_ptr<platf::img_t> img;
+    if (!pull_free_image_cb(img)) {
+      return capture_e::interrupted;
+    }
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img);
+    if (complete_img(d3d_img.get(), false)) {
+      return capture_e::error;
+    }
+
+    HRESULT hr = d3d_img->capture_mutex->AcquireSync(0, 3000);
+    if (hr != S_OK && hr != static_cast<HRESULT>(WAIT_ABANDONED)) {
+      BOOST_LOG(error) << "Failed to lock capture texture [0x"sv << util::hex(hr).to_string_view() << ']';
+      return capture_e::error;
+    }
+    const bool converted = _game_converter->convert(device.get(), device_ctx.get(), frame, d3d_img->capture_texture.get(), d3d_img->capture_rt.get(), capture_format, _game_sdr_white_scale);
+    d3d_img->capture_mutex->ReleaseSync(0);
+    if (!converted) {
+      const auto key = (static_cast<std::uint64_t>(frame.format) << 32) | static_cast<std::uint32_t>(frame.color_space) | (1ull << 63);
+      if (_game_mismatch_logged != key) {
+        _game_mismatch_logged = key;
+        BOOST_LOG(info) << "Game capture: cannot map game format " << frame.format << " (color space "
+                        << static_cast<int>(frame.color_space) << ") onto capture format "
+                        << dxgi_format_to_string(capture_format) << "; using desktop capture";
+      }
+      fall_back = true;
+      return capture_e::ok;
+    }
+    d3d_img->blank = false;
+
+    // The frame is the game's: stamped when the GPU finished it (the fence
+    // completing the hook's copy), or at its Present without fence support
+    const auto host_processing_timestamp = std::chrono::steady_clock::now();
+    const std::uint64_t frame_qpc = frame.gpu_done_qpc ? frame.gpu_done_qpc : frame.present_qpc;
+    img->frame_timestamp = host_processing_timestamp - qpc_time_difference(qpc_counter(), static_cast<int64_t>(frame_qpc));
+    img->host_processing_timestamp = host_processing_timestamp;
+    img->capture_pacing_timestamp = host_processing_timestamp;
+    img_out = img;
+    _last_cached_frame = img;
     return capture_e::ok;
   }
 

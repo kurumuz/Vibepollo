@@ -25,6 +25,7 @@
 
 // local includes
 #include "src/platform/common.h"
+#include "src/platform/windows/foreground_app.h"
 #include "src/platform/windows/ipc/pipes.h"
 #include "src/platform/windows/ipc/process_handler.h"
 #include "src/utility.h"
@@ -408,6 +409,11 @@ namespace platf::dxgi {
    * This backend utilizes a separate capture process and synchronizes frames to Sunshine,
    * allowing screen capture even when running as a SYSTEM service.
    */
+  namespace game_capture {
+    class source_t;
+    class converter_t;
+  }  // namespace game_capture
+
   class display_wgc_ipc_vram_t: public display_vram_t {
   public:
     /**
@@ -477,6 +483,14 @@ namespace platf::dxgi {
     capture_e release_snapshot() override;
 
   private:
+    /**
+     * @brief Snapshot from the in-game capture hook (config game_capture).
+     * @param fall_back Set when this frame cannot come from the game (size or
+     *        encoding the capture texture cannot take); the caller then uses
+     *        desktop capture for it.
+     */
+    capture_e snapshot_game(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool &fall_back);
+
     std::unique_ptr<class ipc_session_t> _ipc_session;
     ::video::config_t _config;
     std::string _display_name;
@@ -485,6 +499,15 @@ namespace platf::dxgi {
     std::shared_ptr<platf::img_t> _last_cached_frame;
     std::chrono::steady_clock::time_point _wgc_stall_start {};  ///< Start of the current frame-wait stall (zero when frames are flowing).
     std::chrono::steady_clock::time_point _last_secure_desktop_probe {};  ///< Last secure-desktop probe performed during a stall.
+
+    // In-game capture (hybrid): used while a hooked game is focused and fullscreen
+    std::unique_ptr<game_capture::source_t> _game_source;
+    std::unique_ptr<game_capture::converter_t> _game_converter;
+    foreground_app::state_t _game_foreground;
+    std::chrono::steady_clock::time_point _game_foreground_checked {};
+    float _game_sdr_white_scale = 1.0f;
+    bool _game_mode = false;
+    std::uint64_t _game_mismatch_logged = 0;  ///< width << 32 | height last logged as unusable
   };
 
   class display_wgc_ipc_ram_t: public display_ram_t {
