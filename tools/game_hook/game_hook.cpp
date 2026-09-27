@@ -59,6 +59,17 @@
 #include <cwchar>
 #include <vector>
 
+// DXGI's private swapchain interface (see swapchain_color_space). Declared
+// outside the anonymous namespace on purpose: there GCC sees that no class
+// in the program implements it and compiles calls through it as unreachable
+// (a call to nowhere, which crashed Stellar Blade).
+struct IDXGISwapChainTest : IUnknown {
+  virtual bool STDMETHODCALLTYPE HasProxyFrontBufferSurface() = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetFrameStatisticsTest(void *) = 0;
+  virtual void STDMETHODCALLTYPE EmulateXBOXBehavior(BOOL) = 0;
+  virtual DXGI_COLOR_SPACE_TYPE STDMETHODCALLTYPE GetColorSpace1() = 0;
+};
+
 namespace {
 
   namespace gc = game_capture;
@@ -643,13 +654,7 @@ namespace {
   // and is unchanged by failed ones. Only DXGI's own swapchains reach our
   // detours (install_hooks checks), so one without it means Windows changed
   // under us: fatal, reported to the host, never guessed around.
-  struct IDXGISwapChainTest : IUnknown {
-    virtual bool STDMETHODCALLTYPE HasProxyFrontBufferSurface() = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetFrameStatisticsTest(void *) = 0;
-    virtual void STDMETHODCALLTYPE EmulateXBOXBehavior(BOOL) = 0;
-    virtual DXGI_COLOR_SPACE_TYPE STDMETHODCALLTYPE GetColorSpace1() = 0;
-  };
-
+  // (IDXGISwapChainTest is declared at file scope, above the namespace)
   // {8C803E30-9E41-4DDF-B206-46F28E90E405}
   constexpr GUID kIidSwapChainTest = {0x8c803e30, 0x9e41, 0x4ddf, {0xb2, 0x06, 0x46, 0xf2, 0x8e, 0x90, 0xe4, 0x05}};
 
