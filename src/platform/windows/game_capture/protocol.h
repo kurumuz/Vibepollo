@@ -57,7 +57,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 7;
+  constexpr std::uint32_t kVersion = 8;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 320;
 
@@ -178,6 +178,7 @@ namespace game_capture {
     std::atomic<std::uint64_t> limiter_late;  ///< ... that arrived after their release time (no wait)
     std::atomic<std::uint64_t> limiter_resets;  ///< ... so late the release grid restarted
     std::atomic<std::uint64_t> limiter_wait_us;  ///< total time spent waiting
+    std::atomic<std::uint32_t> limiter_divisor;  ///< the game is paced at this many periods per frame (it cannot keep up with one)
 
     char last_error[kErrorLength];  ///< the host copies at most kErrorLength bytes and terminates locally
   };

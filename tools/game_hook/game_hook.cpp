@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -922,6 +923,21 @@ namespace {
     double next_release = 0;  // QPC of the current release point; 0 = no grid yet
     std::uint64_t release_qpc = 0;  // the release that started the frame now being rendered on `swapchain`
     HANDLE timer = nullptr;  // one timer: only the owner waits
+
+    // A game that cannot keep up with the period (its own frame cap, or just
+    // too slow) is paced at a whole multiple of it instead, so its frames
+    // still land on a regular grid rather than resetting it every frame
+    int divisor = 1;
+    struct frame_t {
+      double interval;  // release to release, QPC
+      double wait;  // our wait before the release, QPC
+      bool late;  // arrived at or after its release point
+    };
+    static constexpr int kHistory = 32;
+    frame_t history[kHistory] = {};
+    int history_count = 0;
+    int history_head = 0;
+    double last_release = 0;
   };
 
   limiter_t g_limiter;
@@ -950,10 +966,57 @@ namespace {
     g_limiter.owner.store(0, std::memory_order_release);
   }
 
+  void limiter_forget_history() {
+    g_limiter.history_count = 0;
+    g_limiter.history_head = 0;
+  }
+
   void limiter_forget() {
     g_limiter.swapchain = nullptr;
     g_limiter.next_release = 0;
     g_limiter.release_qpc = 0;
+    g_limiter.last_release = 0;
+    g_limiter.divisor = 1;
+    limiter_forget_history();
+    if (g_block) {
+      g_block->limiter_divisor.store(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Owner only, once per paced frame. Up: most of the last frames arrived at
+  // or past their release point, so pace at the multiple of the period their
+  // interval needs. Down: every one of the last frames left us a whole spare
+  // period to wait out, so one fewer would still be met. Deciding on the
+  // game's own work time instead would oscillate: a game with its own cap
+  // shortens its sleep by exactly as long as we wait.
+  void limiter_adapt(double period) {
+    auto &l = g_limiter;
+    if (l.history_count < limiter_t::kHistory) {
+      return;
+    }
+    int late = 0;
+    double min_wait = 1e300;
+    double intervals[limiter_t::kHistory];
+    for (int i = 0; i < limiter_t::kHistory; ++i) {
+      late += l.history[i].late ? 1 : 0;
+      min_wait = std::min(min_wait, l.history[i].wait);
+      intervals[i] = l.history[i].interval;
+    }
+    int next = l.divisor;
+    if (late > limiter_t::kHistory / 2) {
+      std::nth_element(intervals, intervals + limiter_t::kHistory / 2, intervals + limiter_t::kHistory);
+      const double median = intervals[limiter_t::kHistory / 2];
+      next = std::clamp(static_cast<int>(std::ceil(median / period - 0.2)), l.divisor + 1, 4);
+    } else if (l.divisor > 1 && min_wait > period * 1.05) {
+      next = l.divisor - 1;
+    }
+    if (next != l.divisor) {
+      log("Limiter: pacing at %d x %.3f ms (%d of the last %d frames late, least wait %.2f ms)", next,
+          period * 1000 / static_cast<double>(qpc_frequency()), late, limiter_t::kHistory, min_wait * 1000 / static_cast<double>(qpc_frequency()));
+      l.divisor = next;
+      g_block->limiter_divisor.store(static_cast<std::uint32_t>(next), std::memory_order_relaxed);
+      limiter_forget_history();
+    }
   }
 
   // Owner only: whether this swapchain is the paced one
@@ -1005,26 +1068,40 @@ namespace {
   // at once and keeps the grid (the next interval is then shorter: limited
   // recovery); a longer stall restarts the grid from now.
   void limiter_wait(double period) {
+    auto &l = g_limiter;
+    const double frame_period = period * l.divisor;
     const auto now = qpc_now();
     const double nowd = static_cast<double>(now);
-    double target = g_limiter.next_release == 0 ? nowd : g_limiter.next_release + period;
-    if (nowd - target > period / 2) {
+    double target = l.next_release == 0 ? nowd : l.next_release + frame_period;
+    bool late = false;
+    if (nowd - target > frame_period / 2) {
       target = nowd;
+      late = true;
       g_block->limiter_resets.fetch_add(1, std::memory_order_relaxed);
     } else if (nowd >= target) {
+      late = true;
       g_block->limiter_late.fetch_add(1, std::memory_order_relaxed);
     }
-    g_limiter.next_release = target;
+    l.next_release = target;
 
-    // Never longer than two periods, whatever the grid says
-    const auto target_qpc = static_cast<std::uint64_t>(std::min(target, nowd + 2 * period));
+    // Never longer than two frame periods, whatever the grid says
+    const auto target_qpc = static_cast<std::uint64_t>(std::min(target, nowd + 2 * frame_period));
     if (target_qpc > now) {
-      sleep_until(target_qpc, period);
+      sleep_until(target_qpc, frame_period);
     }
     const auto released = qpc_now();
     g_block->limiter_waits.fetch_add(1, std::memory_order_relaxed);
     g_block->limiter_wait_us.fetch_add((released - now) * 1'000'000ull / qpc_frequency(), std::memory_order_relaxed);
-    g_limiter.release_qpc = released;
+    l.release_qpc = released;
+
+    const double releasedd = static_cast<double>(released);
+    if (l.last_release != 0) {
+      l.history[l.history_head] = {releasedd - l.last_release, releasedd - nowd, late};
+      l.history_head = (l.history_head + 1) % limiter_t::kHistory;
+      l.history_count = std::min(l.history_count + 1, limiter_t::kHistory);
+      limiter_adapt(period);
+    }
+    l.last_release = releasedd;
   }
 
   // What one outermost Present does around the real call

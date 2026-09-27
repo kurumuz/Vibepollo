@@ -744,7 +744,8 @@ namespace platf::dxgi::game_capture {
     return "hook presented=" + std::to_string(b->frames_presented.load()) + " published=" + std::to_string(b->frames_published.load()) +
            " skipped=" + std::to_string(b->frames_skipped.load()) + "; limiter waits=" + std::to_string(waits) +
            " late=" + std::to_string(b->limiter_late.load()) + " resets=" + std::to_string(b->limiter_resets.load()) +
-           " mean wait=" + std::to_string(waits ? b->limiter_wait_us.load() / waits : 0) + "us; " + _pacing.stats();
+           " mean wait=" + std::to_string(waits ? b->limiter_wait_us.load() / waits : 0) + "us periods/frame=" +
+           std::to_string(std::max<std::uint32_t>(1, b->limiter_divisor.load())) + "; " + _pacing.stats();
   }
 
   bool source_t::still_foreground(const RECT &capture_rect) const {
