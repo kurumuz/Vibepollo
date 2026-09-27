@@ -9,16 +9,19 @@
  *
  * Loop: the client sends pacing_feedback_t a few times a second over the
  * control stream (SS_PACING_FEEDBACK_PTYPE). controller_t turns the latest
- * report into a limiter period:
+ * report into a limiter period, a second-order phase-locked loop:
  *
  *   feedforward = vblanks_per_frame * refresh_period / (1 + skew)   (host clock)
- *   period      = feedforward * (1 + phase_error / kPhaseTimeConstant)
+ *   period      = feedforward * (1 + phase_error / tau + integral)
+ *   integral   += phase_error * dt / (4 tau^2)
  *
  * A positive phase error means frames are ready earlier than they need to be
  * (they wait for their vblank): a slightly longer period moves them later,
- * shaving that wait off the latency. Proportional only: the feedforward
- * carries the frequency, so a residual frequency error of e leaves a phase
- * offset of e * kPhaseTimeConstant (20 ppm -> 40 us).
+ * shaving that wait off the latency. With the phase error e obeying
+ * de/dt = -adjust + (frequency error), those gains make the loop critically
+ * damped (a double pole at 1 / (2 tau): ~4 s to settle a step); the integral removes what the feedforward
+ * gets wrong (clock slews it cannot see), so the phase settles on the margin
+ * rather than beside it.
  */
 #pragma once
 
@@ -65,6 +68,8 @@ namespace pacing_lock {
   public:
     // Phase error decays with this time constant
     static constexpr double kPhaseTimeConstant = 2.0;
+    // Bound on the integral (frequency the feedforward misses)
+    static constexpr double kMaxIntegral = 0.002;
     // Largest period change the loop applies, either way
     static constexpr double kMaxAdjust = 0.005;
     // A feedforward further than this from the nominal period is not a lock
@@ -93,6 +98,8 @@ namespace pacing_lock {
     double _nominal = 0;
     double _period = 0;
     std::uint64_t _seen_serial = 0;
+    std::chrono::steady_clock::time_point _last_report {};
+    double _integral = 0;
     bool _locked = false;
     double _last_phase_us = 0;
     double _last_adjust = 0;

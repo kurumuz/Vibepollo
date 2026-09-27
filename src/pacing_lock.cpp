@@ -36,6 +36,7 @@ namespace pacing_lock {
     if (nominal_period_s != _nominal) {
       _nominal = nominal_period_s;
       _period = nominal_period_s;
+      _integral = 0;
       _locked = false;
     }
   }
@@ -57,6 +58,7 @@ namespace pacing_lock {
     const auto now = std::chrono::steady_clock::now();
     if (serial == 0 || now - at > kFeedbackTimeout || feedback.version != kFeedbackVersion || !(feedback.flags & kFeedbackValid)) {
       _period = _nominal;
+      _integral = 0;
       _locked = false;
     } else if (serial != _seen_serial) {
       _seen_serial = serial;
@@ -70,9 +72,15 @@ namespace pacing_lock {
       if (feedforward <= 0 || std::abs(feedforward / _nominal - 1) > kMaxFeedforwardError || std::abs(phase) > refresh) {
         ++_rejected;
         _period = _nominal;
+        _integral = 0;
         _locked = false;
       } else {
-        const double adjust = std::clamp(phase / kPhaseTimeConstant, -kMaxAdjust, kMaxAdjust);
+        // Reports arrive every ~250 ms; a gap (or the first report) counts as one interval
+        double dt = _locked ? std::chrono::duration<double>(now - _last_report).count() : 0.25;
+        dt = std::clamp(dt, 0.0, 0.5);
+        _last_report = now;
+        _integral = std::clamp(_integral + phase * dt / (4 * kPhaseTimeConstant * kPhaseTimeConstant), -kMaxIntegral, kMaxIntegral);
+        const double adjust = std::clamp(phase / kPhaseTimeConstant + _integral, -kMaxAdjust, kMaxAdjust);
         _period = feedforward * (1 + adjust);
         _locked = true;
         _last_phase_us = phase * 1e6;
@@ -84,11 +92,11 @@ namespace pacing_lock {
   }
 
   std::string controller_t::stats() const {
-    char buffer[192];
+    char buffer[256];
     if (!_locked) {
       std::snprintf(buffer, sizeof(buffer), "pacing lock off (period %.4f ms, reports=%llu rejected=%llu)", _period * 1e3, static_cast<unsigned long long>(_reports), static_cast<unsigned long long>(_rejected));
     } else {
-      std::snprintf(buffer, sizeof(buffer), "pacing lock on (period %.4f ms, feedforward %+.1f ppm, phase %+.0f us, adjust %+.0f ppm, reports=%llu)", _period * 1e3, _last_feedforward_ppm, _last_phase_us, _last_adjust * 1e6, static_cast<unsigned long long>(_reports));
+      std::snprintf(buffer, sizeof(buffer), "pacing lock on (period %.4f ms, feedforward %+.1f ppm, phase %+.0f us, adjust %+.0f ppm, integral %+.0f ppm, reports=%llu)", _period * 1e3, _last_feedforward_ppm, _last_phase_us, _last_adjust * 1e6, _integral * 1e6, static_cast<unsigned long long>(_reports));
     }
     return buffer;
   }
