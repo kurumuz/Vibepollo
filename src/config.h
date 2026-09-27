@@ -254,7 +254,7 @@ namespace config {
     // focused and fullscreen, or presents through an API not captured yet.
     // Appended with its default so the positional initializer is unaffected.
     bool game_capture = false;
-    bool game_capture_limiter = true;  // pace hooked games from inside Present (front edge), locked to the client's display
+    bool game_capture_limiter = true;  // pace hooked games at the stream rate from inside Present (front edge), instead of RTSS
   };
 
   struct audio_t {

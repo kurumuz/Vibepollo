@@ -7,7 +7,6 @@
 #pragma once
 
 #include "protocol.h"
-#include "src/pacing_lock.h"
 #include "src/platform/common.h"
 #include "src/platform/windows/foreground_app.h"
 
@@ -80,13 +79,6 @@ namespace platf::dxgi::game_capture {
      */
     void set_frame_rate(double fps);
 
-    /**
-     * @brief Where the frame just delivered came from. The client's phase
-     *        reports describe the stream it receives: they steer the game's
-     *        limiter only while that stream is the game's.
-     */
-    void note_frame_source(bool from_game);
-
   private:
     struct attach_job_t;
     struct target_t;
@@ -98,7 +90,7 @@ namespace platf::dxgi::game_capture {
     target_t *current();
 
     std::uint64_t _instance_id = 0;  ///< our block->host_lock value
-    pacing_lock::controller_t _pacing;
+    std::uint64_t _limiter_period_ps = 0;  ///< 1 / stream frame rate
     winrt::com_ptr<ID3D11Device1> _device;
     winrt::com_ptr<ID3D11DeviceContext> _context;  // the capture thread's immediate context
     LUID _adapter_luid {};

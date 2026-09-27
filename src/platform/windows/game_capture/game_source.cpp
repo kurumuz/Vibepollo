@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -630,16 +631,7 @@ namespace platf::dxgi::game_capture {
       return false;
     }
     reap_exited();
-    // Who paces the game we capture: our limiter, or the game itself
-    if (auto *t = current(); t && t->attached && t->block && t->host_locked) {
-      const auto *b = t->block;
-      _pacing.note_limiter(b->limiter_waits.load(std::memory_order_relaxed),
-                           b->limiter_late.load(std::memory_order_relaxed) + b->limiter_resets.load(std::memory_order_relaxed),
-                           b->limiter_divisor.load(std::memory_order_relaxed),
-                           b->limiter_drift_ppm.load(std::memory_order_relaxed),
-                           b->limiter_game_period_ps.load(std::memory_order_relaxed));
-    }
-    const std::uint64_t limiter_period = config::video.game_capture_limiter ? _pacing.period_ps() : 0;
+    const std::uint64_t limiter_period = config::video.game_capture_limiter ? _limiter_period_ps : 0;
     const auto heartbeat = static_cast<std::uint64_t>(qpc_counter());
     for (auto &[pid, t] : _targets) {
       if (t->attached && t->block && t->host_locked) {
@@ -660,7 +652,6 @@ namespace platf::dxgi::game_capture {
         previous->block->capture_enabled.store(0, std::memory_order_release);
       }
       _current_pid = pid;
-      _pacing.forget_limiter();
     }
     if (!pid) {
       return false;
@@ -755,7 +746,7 @@ namespace platf::dxgi::game_capture {
            " skipped=" + std::to_string(b->frames_skipped.load()) + "; limiter waits=" + std::to_string(waits) +
            " late=" + std::to_string(b->limiter_late.load()) + " resets=" + std::to_string(b->limiter_resets.load()) +
            " mean wait=" + std::to_string(waits ? b->limiter_wait_us.load() / waits : 0) + "us periods/frame=" +
-           std::to_string(std::max<std::uint32_t>(1, b->limiter_divisor.load())) + "; " + _pacing.stats();
+           std::to_string(std::max<std::uint32_t>(1, b->limiter_divisor.load()));
   }
 
   bool source_t::still_foreground(const RECT &capture_rect) const {
@@ -1052,11 +1043,7 @@ namespace platf::dxgi::game_capture {
   }
 
   void source_t::set_frame_rate(double fps) {
-    _pacing.set_nominal(fps > 0 ? 1.0 / fps : 0);
-  }
-
-  void source_t::note_frame_source(bool from_game) {
-    _pacing.note_source(from_game);
+    _limiter_period_ps = fps > 0 ? static_cast<std::uint64_t>(std::llround(1e12 / fps)) : 0;
   }
 
   void source_t::release_reads(target_t &t, bool wait) {

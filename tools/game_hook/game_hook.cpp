@@ -923,7 +923,7 @@ namespace {
     std::uint64_t last_present_qpc = 0;
     std::uint64_t release_qpc = 0;  // the release that started the frame now being rendered on `swapchain`
     HANDLE timer = nullptr;  // one timer: only the owner waits
-    gc::limiter_logic_t logic;  // grid and divisor decisions (limiter_logic.h)
+    gc::limiter_logic_t logic {static_cast<double>(qpc_frequency())};  // grid and divisor decisions (limiter_logic.h), in QPC ticks
   };
 
   limiter_t g_limiter;
@@ -1024,14 +1024,9 @@ namespace {
     const auto released = qpc_now();
     g_block->limiter_waits.fetch_add(1, std::memory_order_relaxed);
     g_block->limiter_wait_us.fetch_add((released - now) * 1'000'000ull / qpc_frequency(), std::memory_order_relaxed);
-    // The frame just presented started at the previous release
-    const double turnaround = l.release_qpc != 0 && now > l.release_qpc ? static_cast<double>(now - l.release_qpc) : -1;
     l.release_qpc = released;
 
-    const bool divisor_changed = l.logic.released(static_cast<double>(released), static_cast<double>(released - now), plan.late, period, turnaround);
-    g_block->limiter_drift_ppm.store(static_cast<std::int32_t>(std::clamp(l.logic.drift() * 1e6, -1e6, 1e6)), std::memory_order_relaxed);
-    g_block->limiter_game_period_ps.store(static_cast<std::uint64_t>(std::max(0.0, l.logic.game_period()) * 1e12 / static_cast<double>(qpc_frequency())), std::memory_order_relaxed);
-    if (divisor_changed) {
+    if (l.logic.released(static_cast<double>(released), static_cast<double>(released - now), plan.late, period)) {
       const double ms = 1000.0 / static_cast<double>(qpc_frequency());
       log("Limiter: pacing at %d x %.3f ms (%d of the last %d frames late, least wait %.2f ms)", l.logic.divisor(), period * ms,
           l.logic.last_late_count(), gc::limiter_logic_t::kHistory, l.logic.last_min_wait() * ms);

@@ -101,8 +101,6 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/rtsp.cpp"
         "${CMAKE_SOURCE_DIR}/src/rtsp.h"
         "${CMAKE_SOURCE_DIR}/src/stream.cpp"
-        "${CMAKE_SOURCE_DIR}/src/pacing_lock.cpp"
-        "${CMAKE_SOURCE_DIR}/src/pacing_lock.h"
         "${CMAKE_SOURCE_DIR}/src/stream.h"
         "${CMAKE_SOURCE_DIR}/src/prague/prague_cc.cpp"
         "${CMAKE_SOURCE_DIR}/src/prague/prague_cc.h"
