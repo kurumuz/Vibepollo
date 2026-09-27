@@ -23,10 +23,10 @@ namespace platf::dxgi::game_capture {
 
   struct frame_t {
     ID3D11Texture2D *texture = nullptr;  ///< keyed mutex held until source_t::unlock()
-    std::uint32_t width = 0;
+    std::uint32_t width = 0;  ///< from the opened texture, not the shared block
     std::uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    ::game_capture::color_space_e color_space = ::game_capture::color_space_e::srgb;
+    ::game_capture::color_space_e color_space = ::game_capture::color_space_e::unknown;
     std::uint64_t frame_id = 0;
     std::uint64_t present_qpc = 0;
     std::uint64_t gpu_done_qpc = 0;  ///< 0 when the hook had no fence
@@ -42,12 +42,19 @@ namespace platf::dxgi::game_capture {
 
     /**
      * @brief Whether this snapshot should come from the game. Tracks the
-     *        foreground process, injects the hook the first time a candidate
-     *        is focused and fullscreen, and enables or disables copying in the
-     *        hooked processes. True only while the focused fullscreen window
-     *        belongs to a hooked process that has delivered a frame recently.
+     *        foreground process, attaches the hook (on a worker, never
+     *        blocking capture) the first time a candidate is focused and
+     *        fullscreen, and enables or disables copying in hooked processes.
+     *        True only while the focused fullscreen window belongs to a
+     *        hooked process that published a frame recently.
      */
     bool active(const foreground_app::state_t &foreground);
+
+    /**
+     * @brief Cheap re-check right before a frame is taken from the game:
+     *        the foreground window still belongs to the captured process.
+     */
+    bool still_foreground() const;
 
     /**
      * @brief Wait for the game to publish a frame newer than the last one used.
@@ -63,14 +70,16 @@ namespace platf::dxgi::game_capture {
   private:
     struct target_t;
 
-    bool open_textures(target_t &target);
+    void reap_exited();
+    bool open_generation(target_t &target);
     target_t *current();
 
     winrt::com_ptr<ID3D11Device1> _device;
+    LUID _adapter_luid {};
     std::map<DWORD, std::unique_ptr<target_t>> _targets;
     DWORD _current_pid = 0;
     int _locked_slot = -1;
-    std::chrono::steady_clock::time_point _last_log {};
+    std::chrono::steady_clock::time_point _last_reap {};
   };
 
   /**
@@ -89,6 +98,7 @@ namespace platf::dxgi::game_capture {
     bool init(ID3D11Device *device);
 
     bool _init_attempted = false;
+    bool _ready = false;  // every resource below created
     winrt::com_ptr<ID3D11VertexShader> _vs;
     winrt::com_ptr<ID3D11PixelShader> _ps;
     winrt::com_ptr<ID3D11Buffer> _params;
@@ -98,8 +108,8 @@ namespace platf::dxgi::game_capture {
   };
 
   /**
-   * @brief The desktop compositor's SDR white level for an output, as a scRGB
-   *        multiplier (1.0 = 80 nits). 1.0 when unavailable.
+   * @brief The desktop compositor's current SDR white level for an output, as
+   *        a scRGB multiplier (1.0 = 80 nits). 1.0 when unavailable.
    */
   float sdr_white_scale_for_output(const wchar_t *gdi_device_name);
 

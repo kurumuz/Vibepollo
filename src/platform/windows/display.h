@@ -506,6 +506,7 @@ namespace platf::dxgi {
     foreground_app::state_t _game_foreground;
     std::chrono::steady_clock::time_point _game_foreground_checked {};
     float _game_sdr_white_scale = 1.0f;
+    std::chrono::steady_clock::time_point _game_sdr_white_checked {};
     bool _game_mode = false;
     std::uint64_t _game_mismatch_logged = 0;  ///< width << 32 | height last logged as unusable
   };

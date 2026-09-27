@@ -113,11 +113,16 @@ target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 # (src/platform/windows/game_capture). Kept dependency-free: it runs inside
 # third-party processes.
 add_library(vibepollo_game_hook SHARED
-        game_hook/game_hook.cpp)
+        game_hook/game_hook.cpp
+        ${CMAKE_SOURCE_DIR}/third-party/minhook/src/buffer.c
+        ${CMAKE_SOURCE_DIR}/third-party/minhook/src/hook.c
+        ${CMAKE_SOURCE_DIR}/third-party/minhook/src/trampoline.c
+        ${CMAKE_SOURCE_DIR}/third-party/minhook/src/hde/hde64.c)
 set_target_properties(vibepollo_game_hook PROPERTIES
         CXX_STANDARD 23
         PREFIX ""
         OUTPUT_NAME "vibepollo_game_hook")
+target_include_directories(vibepollo_game_hook PRIVATE ${CMAKE_SOURCE_DIR}/third-party/minhook/include)
 target_link_libraries(vibepollo_game_hook
         d3d11
         dxgi

@@ -4,19 +4,28 @@
  *        into a focused fullscreen game. See
  *        src/platform/windows/game_capture/protocol.h for the protocol.
  *
- * Step 1 captures D3D11 swapchains. It hooks IDXGISwapChain::Present and
- * IDXGISwapChain1::Present1 by patching the DXGI swapchain vtable (found from
- * a throwaway swapchain), plus IDXGISwapChain3::SetColorSpace1 to learn how
- * the pixels are encoded. D3D12 swapchains present through the same vtable and
- * are detected and reported as unsupported for now, so the host falls back to
- * desktop capture.
+ * Step 1 captures D3D11 swapchains. The DXGI entry points (Present, Present1,
+ * ResizeBuffers, SetColorSpace1) are inline-detoured with MinHook at their
+ * function addresses, found from a throwaway swapchain: that catches every
+ * swapchain in the process whatever its swap effect or creation API, and
+ * overlays that keep private vtables (their cached "original" is the function
+ * we patched). D3D12 swapchains present through the same functions and are
+ * reported as unsupported for now, so the host falls back to desktop capture.
  *
- * Everything the Present hook does runs on the game's own render thread,
- * inside its Present call: that is the only place the game's (possibly
- * single-threaded) immediate context may be used. The hook never waits on the
- * host: a slot whose keyed mutex is not immediately available is skipped.
+ * Threading, so that nothing here can stall or crash the game:
+ *  - All D3D calls happen on the game's own thread inside its Present (or
+ *    ResizeBuffers) call. The completion thread only waits on events, reads
+ *    the clock and writes the shared block.
+ *  - One swapchain is captured at a time; a Present on another thread that
+ *    finds the capture busy skips (try-lock), never waits.
+ *  - A free slot's keyed mutex is taken with a zero timeout; if the host still
+ *    holds it, the frame is skipped.
+ *  - The pending-frame bookkeeping is a fixed per-slot array, no allocation,
+ *    no lock shared with the completion thread.
  */
 #include "src/platform/windows/game_capture/protocol.h"
+
+#include <MinHook.h>
 
 #include <windows.h>
 #include <d3d11_4.h>
@@ -25,58 +34,62 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
-#include <deque>
-#include <mutex>
+#include <cstring>
 
 namespace {
 
+  namespace gc = game_capture;
+
   using present_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
   using present1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
+  using resize_buffers_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
   using set_color_space1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
 
   // IDXGISwapChain vtable slots (IUnknown 0-2, IDXGIObject 3-6, IDXGIDeviceSubObject 7)
   constexpr int kVtPresent = 8;
+  constexpr int kVtResizeBuffers = 13;
   constexpr int kVtPresent1 = 22;  // IDXGISwapChain1
   constexpr int kVtSetColorSpace1 = 38;  // IDXGISwapChain3
 
   present_fn g_real_present = nullptr;
   present1_fn g_real_present1 = nullptr;
+  resize_buffers_fn g_real_resize_buffers = nullptr;
   set_color_space1_fn g_real_set_color_space1 = nullptr;
 
-  game_capture::shared_block_t *g_block = nullptr;
-  std::atomic<std::uint32_t> g_color_space {static_cast<std::uint32_t>(game_capture::color_space_e::srgb)};
+  gc::shared_block_t *g_block = nullptr;
   thread_local bool t_in_present = false;
 
+  // ---- logging -----------------------------------------------------------
+
   FILE *g_log = nullptr;
-  std::mutex g_log_lock;
+  SRWLOCK g_log_lock = SRWLOCK_INIT;
 
   void log(const char *fmt, ...) {
-    std::lock_guard lg {g_log_lock};
+    AcquireSRWLockExclusive(&g_log_lock);
     if (!g_log) {
       wchar_t dir[MAX_PATH];
       const DWORD n = GetTempPathW(MAX_PATH, dir);
-      if (n == 0 || n >= MAX_PATH) {
-        return;
-      }
-      wchar_t path[MAX_PATH];
-      std::swprintf(path, MAX_PATH, L"%svibepollo_game_hook_%lu.log", dir, GetCurrentProcessId());
-      g_log = _wfopen(path, L"a");
-      if (!g_log) {
-        return;
+      if (n != 0 && n < MAX_PATH) {
+        wchar_t path[MAX_PATH];
+        std::swprintf(path, MAX_PATH, L"%svibepollo_game_hook_%lu.log", dir, GetCurrentProcessId());
+        g_log = _wfopen(path, L"a");
       }
     }
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    std::fprintf(g_log, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    va_list ap;
-    va_start(ap, fmt);
-    std::vfprintf(g_log, fmt, ap);
-    va_end(ap);
-    std::fputc('\n', g_log);
-    std::fflush(g_log);
+    if (g_log) {
+      SYSTEMTIME st;
+      GetLocalTime(&st);
+      std::fprintf(g_log, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+      va_list ap;
+      va_start(ap, fmt);
+      std::vfprintf(g_log, fmt, ap);
+      va_end(ap);
+      std::fputc('\n', g_log);
+      std::fflush(g_log);
+    }
+    ReleaseSRWLockExclusive(&g_log_lock);
   }
 
-  void set_state(game_capture::hook_state_e state, const char *error = nullptr) {
+  void set_state(gc::hook_state_e state, const char *error = nullptr) {
     if (!g_block) {
       return;
     }
@@ -101,152 +114,190 @@ namespace {
     }
   }
 
-  // Resources for the swapchain being captured. Touched only on the game's
-  // present thread, except the fence and the pending list (fence thread).
+  // ---- slots ---------------------------------------------------------------
+
+  enum slot_state_e : int {
+    slot_free = 0,
+    slot_pending = 1,
+    slot_published = 2,
+  };
+
+  // Per-slot frame metadata: written by the render thread before the slot's
+  // completion event is set, read by the completion thread after it fires.
+  struct slot_t {
+    std::atomic<int> state {slot_free};
+    std::atomic<std::uint32_t> version {0};
+    std::uint32_t generation = 0;
+    std::uint32_t color_space = 0;
+    std::uint64_t frame_id = 0;
+    std::uint64_t present_qpc = 0;
+    HANDLE done_event = nullptr;  // for the life of the DLL
+  };
+
+  slot_t g_slots[gc::kSlots];
+  HANDLE g_frame_event = nullptr;
+  HANDLE g_completion_thread = nullptr;
+  std::atomic<std::uint32_t> g_current_generation {0};
+
+  void publish(int slot, std::uint64_t gpu_done_qpc) {
+    auto &s = g_slots[slot];
+    auto &b = *g_block;
+    const auto seq = b.frame_seq.load(std::memory_order_relaxed);
+    b.frame_seq.store(seq + 1, std::memory_order_release);  // odd: writing
+    std::atomic_thread_fence(std::memory_order_release);
+    b.slot.store(static_cast<std::uint32_t>(slot), std::memory_order_relaxed);
+    b.slot_version.store(s.version.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    b.generation.store(s.generation, std::memory_order_relaxed);
+    b.color_space.store(s.color_space, std::memory_order_relaxed);
+    b.frame_id.store(s.frame_id, std::memory_order_relaxed);
+    b.present_qpc.store(s.present_qpc, std::memory_order_relaxed);
+    b.gpu_done_qpc.store(gpu_done_qpc, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    b.frame_seq.store(seq + 2, std::memory_order_release);  // even: stable
+    b.publish_qpc.store(qpc_now(), std::memory_order_release);
+    b.frames_published.fetch_add(1, std::memory_order_relaxed);
+    SetEvent(g_frame_event);
+  }
+
+  // Moves a completed slot to published (and the previously published slot
+  // to free). Only this function writes slot_published/slot_free for a
+  // pending slot, so the render thread's free-slot search is consistent.
+  void complete_slot(int slot, std::uint64_t gpu_done_qpc) {
+    auto &s = g_slots[slot];
+    int expected = slot_pending;
+    if (!s.state.compare_exchange_strong(expected, slot_published, std::memory_order_acq_rel)) {
+      return;  // reset (generation change) took it back
+    }
+    for (int i = 0; i < gc::kSlots; ++i) {
+      if (i != slot) {
+        int published = slot_published;
+        g_slots[i].state.compare_exchange_strong(published, slot_free, std::memory_order_acq_rel);
+      }
+    }
+    if (s.generation != g_current_generation.load(std::memory_order_acquire)) {
+      return;  // textures of a retired generation: not offered to the host
+    }
+    publish(slot, gpu_done_qpc);
+  }
+
+  // Waits for the GPU to finish each slot's copy. Touches no D3D object.
+  DWORD WINAPI completion_thread_main(void *) {
+    HANDLE events[gc::kSlots];
+    for (int i = 0; i < gc::kSlots; ++i) {
+      events[i] = g_slots[i].done_event;
+    }
+    for (;;) {
+      const DWORD r = WaitForMultipleObjects(gc::kSlots, events, FALSE, INFINITE);
+      if (r < WAIT_OBJECT_0 || r >= WAIT_OBJECT_0 + gc::kSlots) {
+        return 1;
+      }
+      complete_slot(static_cast<int>(r - WAIT_OBJECT_0), qpc_now());
+    }
+  }
+
+  // ---- the captured swapchain ---------------------------------------------
+
   struct capture_t {
+    IDXGISwapChain *swapchain = nullptr;  // identity only, never dereferenced without a Present in progress
     ID3D11Device *device = nullptr;
     ID3D11DeviceContext *context = nullptr;
     ID3D11DeviceContext4 *context4 = nullptr;  // null without fence support
     ID3D11Fence *fence = nullptr;
-    HANDLE fence_event = nullptr;
-    HANDLE frame_event = nullptr;
-    ID3D11Texture2D *textures[game_capture::kSlots] = {};
-    IDXGIKeyedMutex *mutexes[game_capture::kSlots] = {};
-    HANDLE shared_handles[game_capture::kSlots] = {};
+    std::uint64_t fence_value = 0;
+    std::uint64_t next_frame_id = 0;
+    std::uint64_t last_present_qpc = 0;
+    std::uint32_t color_space = static_cast<std::uint32_t>(gc::color_space_e::unknown);
+    bool color_space_set = false;  // SetColorSpace1 seen on this swapchain
+    bool reported_d3d12 = false;
+
+    // Current generation's textures, plus the previous generation's shared
+    // handles kept open so the host never meets a recycled handle value
+    ID3D11Texture2D *textures[gc::kSlots] = {};
+    IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
+    HANDLE shared_handles[gc::kSlots] = {};
+    HANDLE previous_handles[gc::kSlots] = {};
     UINT width = 0;
     UINT height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    std::uint32_t generation = 0;
-    std::uint64_t fence_value = 0;
-    std::uint64_t next_frame_id = 0;
-    std::atomic<int> published_slot {-1};  // written by the fence thread
-    bool reported_d3d12 = false;
-  } g_cap;
-
-  struct pending_t {
-    std::uint64_t fence_value;
-    std::uint32_t slot;
-    std::uint32_t generation;
-    std::uint64_t frame_id;
-    std::uint64_t present_qpc;
   };
 
-  std::mutex g_pending_lock;
-  std::deque<pending_t> g_pending;
-  HANDLE g_fence_thread = nullptr;
+  capture_t g_cap;
+  SRWLOCK g_capture_lock = SRWLOCK_INIT;  // held by the one thread capturing; others skip
 
-  void publish(const pending_t &frame, std::uint64_t gpu_done_qpc) {
-    auto &b = *g_block;
-    const auto seq = b.seq.load(std::memory_order_relaxed);
-    b.seq.store(seq + 1, std::memory_order_release);  // odd: writing
-    std::atomic_thread_fence(std::memory_order_release);
-    b.latest_slot.store(frame.slot, std::memory_order_relaxed);
-    b.latest_generation.store(frame.generation, std::memory_order_relaxed);
-    b.frame_id.store(frame.frame_id, std::memory_order_relaxed);
-    b.present_qpc.store(frame.present_qpc, std::memory_order_relaxed);
-    b.gpu_done_qpc.store(gpu_done_qpc, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-    b.seq.store(seq + 2, std::memory_order_release);  // even: stable
-    b.frames_published.fetch_add(1, std::memory_order_relaxed);
-    SetEvent(g_cap.frame_event);
+  void reset_slots() {
+    g_current_generation.fetch_add(1, std::memory_order_acq_rel);
+    for (auto &s : g_slots) {
+      s.state.store(slot_free, std::memory_order_release);
+    }
   }
 
-  // Publishes frames once the GPU has finished copying them, stamped with that
-  // moment: the game's frame is complete when its copy is.
-  DWORD WINAPI fence_thread_main(void *) {
-    for (;;) {
-      if (WaitForSingleObject(g_cap.fence_event, 100) == WAIT_FAILED) {
-        return 1;
-      }
-      ID3D11Fence *fence = g_cap.fence;
-      if (!fence) {
-        continue;
-      }
-      const std::uint64_t completed = fence->GetCompletedValue();
-      const std::uint64_t now = qpc_now();
-
-      pending_t newest {};
-      bool have = false;
-      {
-        std::lock_guard lg {g_pending_lock};
-        while (!g_pending.empty() && g_pending.front().fence_value <= completed) {
-          newest = g_pending.front();
-          have = true;
-          g_pending.pop_front();
-        }
-      }
-      if (have) {
-        g_cap.published_slot.store(static_cast<int>(newest.slot));
-        publish(newest, now);
+  void close_handles(HANDLE *handles) {
+    for (int i = 0; i < gc::kSlots; ++i) {
+      if (handles[i]) {
+        CloseHandle(handles[i]);
+        handles[i] = nullptr;
       }
     }
   }
 
   void release_textures() {
-    for (int i = 0; i < game_capture::kSlots; ++i) {
+    reset_slots();
+    for (int i = 0; i < gc::kSlots; ++i) {
       safe_release(g_cap.mutexes[i]);
       safe_release(g_cap.textures[i]);
-      if (g_cap.shared_handles[i]) {
-        CloseHandle(g_cap.shared_handles[i]);
-        g_cap.shared_handles[i] = nullptr;
-      }
     }
-    std::lock_guard lg {g_pending_lock};
-    g_pending.clear();
-    g_cap.published_slot.store(-1);
+    close_handles(g_cap.previous_handles);
+    std::memcpy(g_cap.previous_handles, g_cap.shared_handles, sizeof(g_cap.shared_handles));
+    std::memset(g_cap.shared_handles, 0, sizeof(g_cap.shared_handles));
+    g_cap.width = g_cap.height = 0;
+    g_cap.format = DXGI_FORMAT_UNKNOWN;
   }
 
-  void release_device() {
+  void release_capture() {
     release_textures();
     safe_release(g_cap.fence);
     safe_release(g_cap.context4);
     safe_release(g_cap.context);
     safe_release(g_cap.device);
+    g_cap.swapchain = nullptr;
+    g_cap.color_space_set = false;
+    g_cap.color_space = static_cast<std::uint32_t>(gc::color_space_e::unknown);
   }
 
-  bool ensure_device(ID3D11Device *device) {
-    if (g_cap.device == device) {
+  bool ensure_device(IDXGISwapChain *swapchain, ID3D11Device *device) {
+    if (g_cap.device == device && g_cap.swapchain == swapchain) {
       return true;
     }
-    release_device();
+    release_capture();
+    g_cap.swapchain = swapchain;
     device->AddRef();
     g_cap.device = device;
     device->GetImmediateContext(&g_cap.context);
 
-    // A fence tells us when the GPU has finished each copy; without one
-    // (pre-1703 runtimes, some drivers) frames publish at Present time.
-    ID3D11Device5 *device5 = nullptr;
-    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&device5)))) {
-      if (SUCCEEDED(g_cap.context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g_cap.context4))) &&
-          SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&g_cap.fence)))) {
-        g_cap.fence_value = 0;
-      } else {
-        safe_release(g_cap.context4);
+    // A fence tells us when the GPU finished each copy; the render thread
+    // signals it and registers the slot's completion event, the completion
+    // thread only waits on that event. A device created single-threaded is
+    // still left alone (no fence, frames publish at Present time), as are
+    // runtimes without fences.
+    const bool single_threaded = (device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED) != 0;
+    if (!single_threaded) {
+      ID3D11Device5 *device5 = nullptr;
+      if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&device5)))) {
+        if (FAILED(g_cap.context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g_cap.context4))) ||
+            FAILED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&g_cap.fence)))) {
+          safe_release(g_cap.fence);
+          safe_release(g_cap.context4);
+        }
+        device5->Release();
       }
-      device5->Release();
     }
-    if (!g_cap.fence) {
-      log("No D3D11 fence support; frames are timestamped at Present");
-    }
-
-    IDXGIDevice *dxgi_device = nullptr;
-    if (SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device)))) {
-      IDXGIAdapter *adapter = nullptr;
-      if (SUCCEEDED(dxgi_device->GetAdapter(&adapter))) {
-        DXGI_ADAPTER_DESC desc {};
-        adapter->GetDesc(&desc);
-        g_block->adapter_luid_low.store(desc.AdapterLuid.LowPart, std::memory_order_relaxed);
-        g_block->adapter_luid_high.store(desc.AdapterLuid.HighPart, std::memory_order_relaxed);
-        adapter->Release();
-      }
-      dxgi_device->Release();
-    }
+    g_cap.fence_value = 0;
+    log("Device %p (%s): frames timestamped at %s", static_cast<void *>(device), single_threaded ? "single-threaded" : "multithreaded",
+        g_cap.fence ? "GPU completion" : "Present");
     return true;
   }
 
   DXGI_FORMAT shareable_format(DXGI_FORMAT format) {
-    // Swapchain buffers are never typeless in practice, but map the families
-    // anyway so a CopyResource-compatible concrete format is always created
     switch (format) {
       case DXGI_FORMAT_R8G8B8A8_TYPELESS:
         return DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -261,7 +312,54 @@ namespace {
     }
   }
 
-  bool ensure_textures(const D3D11_TEXTURE2D_DESC &back) {
+  // The documented defaults: an FP16 swapchain is scRGB, 8-bit is sRGB, 10-bit
+  // is sRGB unless SetColorSpace1 made it HDR10 (which we may have missed if
+  // injected late), so it is unknown until we see that call.
+  std::uint32_t default_color_space(DXGI_FORMAT format) {
+    switch (format) {
+      case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return static_cast<std::uint32_t>(gc::color_space_e::scrgb);
+      case DXGI_FORMAT_R8G8B8A8_UNORM:
+      case DXGI_FORMAT_B8G8R8A8_UNORM:
+      case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+      case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return static_cast<std::uint32_t>(gc::color_space_e::srgb);
+      default:
+        return static_cast<std::uint32_t>(gc::color_space_e::unknown);
+    }
+  }
+
+  void publish_setup(HWND hwnd) {
+    auto &b = *g_block;
+    const auto seq = b.setup_seq.load(std::memory_order_relaxed);
+    b.setup_seq.store(seq + 1, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    b.setup.api.store(static_cast<std::uint32_t>(gc::api_e::d3d11), std::memory_order_relaxed);
+    b.setup.width.store(g_cap.width, std::memory_order_relaxed);
+    b.setup.height.store(g_cap.height, std::memory_order_relaxed);
+    b.setup.format.store(static_cast<std::uint32_t>(g_cap.format), std::memory_order_relaxed);
+    b.setup.hwnd.store(reinterpret_cast<std::uint64_t>(hwnd), std::memory_order_relaxed);
+    for (int i = 0; i < gc::kSlots; ++i) {
+      b.setup.textures[i].store(reinterpret_cast<std::uint64_t>(g_cap.shared_handles[i]), std::memory_order_relaxed);
+    }
+    IDXGIDevice *dxgi_device = nullptr;
+    if (SUCCEEDED(g_cap.device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device)))) {
+      IDXGIAdapter *adapter = nullptr;
+      if (SUCCEEDED(dxgi_device->GetAdapter(&adapter))) {
+        DXGI_ADAPTER_DESC desc {};
+        adapter->GetDesc(&desc);
+        b.setup.adapter_luid_low.store(desc.AdapterLuid.LowPart, std::memory_order_relaxed);
+        b.setup.adapter_luid_high.store(desc.AdapterLuid.HighPart, std::memory_order_relaxed);
+        adapter->Release();
+      }
+      dxgi_device->Release();
+    }
+    b.setup.generation.store(g_current_generation.load(std::memory_order_acquire), std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    b.setup_seq.store(seq + 2, std::memory_order_release);
+  }
+
+  bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd) {
     const DXGI_FORMAT format = shareable_format(back.Format);
     if (g_cap.textures[0] && g_cap.width == back.Width && g_cap.height == back.Height && g_cap.format == format) {
       return true;
@@ -279,26 +377,23 @@ namespace {
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
-    for (int i = 0; i < game_capture::kSlots; ++i) {
+    for (int i = 0; i < gc::kSlots; ++i) {
       HRESULT hr = g_cap.device->CreateTexture2D(&desc, nullptr, &g_cap.textures[i]);
-      if (FAILED(hr)) {
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "CreateTexture2D(%ux%u fmt %d) failed: 0x%08lx", desc.Width, desc.Height, desc.Format, hr);
-        set_state(game_capture::hook_state_e::failed, msg);
-        release_textures();
-        return false;
+      if (SUCCEEDED(hr)) {
+        hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&g_cap.mutexes[i]));
       }
-      g_cap.textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&g_cap.mutexes[i]));
       IDXGIResource1 *resource = nullptr;
-      hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&resource));
+      if (SUCCEEDED(hr)) {
+        hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&resource));
+      }
       if (SUCCEEDED(hr)) {
         hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &g_cap.shared_handles[i]);
         resource->Release();
       }
-      if (FAILED(hr) || !g_cap.mutexes[i]) {
+      if (FAILED(hr)) {
         char msg[128];
-        std::snprintf(msg, sizeof(msg), "Sharing the capture texture failed: 0x%08lx", hr);
-        set_state(game_capture::hook_state_e::failed, msg);
+        std::snprintf(msg, sizeof(msg), "Creating capture texture %d (%ux%u fmt %d) failed: 0x%08lx", i, desc.Width, desc.Height, desc.Format, hr);
+        set_state(gc::hook_state_e::failed, msg);
         release_textures();
         return false;
       }
@@ -307,48 +402,64 @@ namespace {
     g_cap.width = back.Width;
     g_cap.height = back.Height;
     g_cap.format = format;
-    ++g_cap.generation;
-
-    auto &b = *g_block;
-    for (int i = 0; i < game_capture::kSlots; ++i) {
-      b.textures[i].store(reinterpret_cast<std::uint64_t>(g_cap.shared_handles[i]), std::memory_order_relaxed);
+    if (!g_cap.color_space_set) {
+      g_cap.color_space = default_color_space(format);
     }
-    b.width.store(back.Width, std::memory_order_relaxed);
-    b.height.store(back.Height, std::memory_order_relaxed);
-    b.format.store(static_cast<std::uint32_t>(format), std::memory_order_relaxed);
-    b.api.store(static_cast<std::uint32_t>(game_capture::api_e::d3d11), std::memory_order_relaxed);
-    b.frame_event.store(reinterpret_cast<std::uint64_t>(g_cap.frame_event), std::memory_order_relaxed);
-    b.generation.store(g_cap.generation, std::memory_order_release);
-    log("Capture textures %ux%u format %d (generation %u, %s)", back.Width, back.Height, format, g_cap.generation,
-        g_cap.fence ? "fenced" : "unfenced");
+    publish_setup(hwnd);
+    log("Capture textures %ux%u format %d, generation %u, color space %u", back.Width, back.Height, format,
+        g_current_generation.load(), g_cap.color_space);
     return true;
   }
 
-  bool is_foreground(IDXGISwapChain *swapchain) {
+  bool foreground_window(IDXGISwapChain *swapchain, HWND &hwnd) {
     DXGI_SWAP_CHAIN_DESC desc {};
     if (FAILED(swapchain->GetDesc(&desc)) || !desc.OutputWindow) {
       return false;
     }
-    g_block->hwnd.store(reinterpret_cast<std::uint64_t>(desc.OutputWindow), std::memory_order_relaxed);
+    hwnd = desc.OutputWindow;
     const HWND foreground = GetForegroundWindow();
-    return desc.OutputWindow == foreground || GetAncestor(desc.OutputWindow, GA_ROOT) == foreground;
+    return hwnd == foreground || GetAncestor(hwnd, GA_ROOT) == foreground;
+  }
+
+  int find_free_slot() {
+    for (int i = 0; i < gc::kSlots; ++i) {
+      if (g_slots[i].state.load(std::memory_order_acquire) == slot_free) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc) {
     g_block->frames_presented.fetch_add(1, std::memory_order_relaxed);
-    if (!g_block->capture_enabled.load(std::memory_order_acquire) || !is_foreground(swapchain)) {
+    if (!g_block->capture_enabled.load(std::memory_order_acquire)) {
       return;
     }
+    HWND hwnd = nullptr;
+    if (!foreground_window(swapchain, hwnd)) {
+      return;
+    }
+
+    // One capture at a time; a concurrent Present elsewhere just skips
+    if (!TryAcquireSRWLockExclusive(&g_capture_lock)) {
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    struct unlock_t {
+      ~unlock_t() {
+        ReleaseSRWLockExclusive(&g_capture_lock);
+      }
+    } unlock;
 
     ID3D11Device *device = nullptr;
     if (FAILED(swapchain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void **>(&device)))) {
       if (!g_cap.reported_d3d12) {
         g_cap.reported_d3d12 = true;
-        set_state(game_capture::hook_state_e::unsupported, "The swapchain is not D3D11 (likely D3D12); not captured yet");
+        set_state(gc::hook_state_e::unsupported, "The swapchain is not D3D11 (likely D3D12); not captured yet");
       }
       return;
     }
-    ensure_device(device);
+    ensure_device(swapchain, device);
     device->Release();
 
     ID3D11Texture2D *back = nullptr;
@@ -357,16 +468,14 @@ namespace {
     }
     D3D11_TEXTURE2D_DESC back_desc {};
     back->GetDesc(&back_desc);
-    if (!ensure_textures(back_desc)) {
+    if (!ensure_textures(back_desc, hwnd)) {
       back->Release();
       return;
     }
-    g_block->color_space.store(g_color_space.load(std::memory_order_relaxed), std::memory_order_relaxed);
 
-    // Only the slot the host is not reading from, and only without waiting
-    const int slot = g_cap.published_slot.load() == 0 ? 1 : 0;
-    if (g_cap.mutexes[slot]->AcquireSync(0, 0) != S_OK) {
-      g_block->frames_skipped_busy.fetch_add(1, std::memory_order_relaxed);
+    const int slot = find_free_slot();
+    if (slot < 0 || g_cap.mutexes[slot]->AcquireSync(0, 0) != S_OK) {
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       back->Release();
       return;
     }
@@ -378,30 +487,30 @@ namespace {
     g_cap.mutexes[slot]->ReleaseSync(0);
     back->Release();
 
-    const pending_t frame {0, static_cast<std::uint32_t>(slot), g_cap.generation, ++g_cap.next_frame_id, present_qpc};
+    auto &s = g_slots[slot];
+    s.version.fetch_add(1, std::memory_order_acq_rel);
+    s.generation = g_current_generation.load(std::memory_order_acquire);
+    s.color_space = g_cap.color_space;
+    s.frame_id = ++g_cap.next_frame_id;
+    s.present_qpc = present_qpc;
+    s.state.store(slot_pending, std::memory_order_release);
+
     if (g_cap.fence && g_cap.context4) {
-      pending_t fenced = frame;
-      fenced.fence_value = ++g_cap.fence_value;
-      g_cap.context4->Signal(g_cap.fence, fenced.fence_value);
-      {
-        std::lock_guard lg {g_pending_lock};
-        // A frame still in flight in this slot is overwritten by this one
-        for (auto it = g_pending.begin(); it != g_pending.end();) {
-          it = it->slot == fenced.slot ? g_pending.erase(it) : it + 1;
-        }
-        g_pending.push_back(fenced);
+      g_cap.context4->Signal(g_cap.fence, ++g_cap.fence_value);
+      if (FAILED(g_cap.fence->SetEventOnCompletion(g_cap.fence_value, s.done_event))) {
+        complete_slot(slot, 0);
       }
-      g_cap.fence->SetEventOnCompletion(fenced.fence_value, g_cap.fence_event);
     } else {
-      g_cap.published_slot.store(slot);
-      publish(frame, 0);
+      complete_slot(slot, 0);
     }
 
-    if (g_block->hook_state.load(std::memory_order_relaxed) != static_cast<std::uint32_t>(game_capture::hook_state_e::capturing)) {
-      set_state(game_capture::hook_state_e::capturing);
-      log("Capturing D3D11 frames");
+    if (g_block->hook_state.load(std::memory_order_relaxed) != static_cast<std::uint32_t>(gc::hook_state_e::capturing)) {
+      set_state(gc::hook_state_e::capturing);
+      log("Capturing D3D11 frames from swapchain %p", static_cast<void *>(swapchain));
     }
   }
+
+  // ---- detours -------------------------------------------------------------
 
   // DXGI may implement one Present entry point through the other; only the
   // outermost call on a thread captures.
@@ -431,38 +540,44 @@ namespace {
     return hr;
   }
 
+  // We hold no back-buffer references outside Present, so ResizeBuffers is
+  // free to proceed; our textures are dropped here so the next Present
+  // recreates them at the new size (and the memory is not held meanwhile).
+  HRESULT STDMETHODCALLTYPE hook_resize_buffers(IDXGISwapChain *swapchain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
+    if (swapchain == g_cap.swapchain && TryAcquireSRWLockExclusive(&g_capture_lock)) {
+      release_textures();
+      ReleaseSRWLockExclusive(&g_capture_lock);
+    }
+    return g_real_resize_buffers(swapchain, count, width, height, format, flags);
+  }
+
   HRESULT STDMETHODCALLTYPE hook_set_color_space1(IDXGISwapChain3 *swapchain, DXGI_COLOR_SPACE_TYPE color_space) {
     const HRESULT hr = g_real_set_color_space1(swapchain, color_space);
-    if (SUCCEEDED(hr)) {
-      auto cs = game_capture::color_space_e::srgb;
-      if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) {
-        cs = game_capture::color_space_e::scrgb;
-      } else if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-        cs = game_capture::color_space_e::hdr10;
+    if (SUCCEEDED(hr) && TryAcquireSRWLockExclusive(&g_capture_lock)) {
+      IDXGISwapChain *base = nullptr;
+      if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain), reinterpret_cast<void **>(&base)))) {
+        if (base == g_cap.swapchain) {
+          auto cs = gc::color_space_e::unknown;
+          if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+            cs = gc::color_space_e::srgb;
+          } else if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) {
+            cs = gc::color_space_e::scrgb;
+          } else if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+            cs = gc::color_space_e::hdr10;
+          }
+          g_cap.color_space = static_cast<std::uint32_t>(cs);
+          g_cap.color_space_set = true;
+          log("Swapchain %p color space %d", static_cast<void *>(base), static_cast<int>(color_space));
+        }
+        base->Release();
       }
-      g_color_space.store(static_cast<std::uint32_t>(cs), std::memory_order_relaxed);
-      log("Swapchain color space %d", static_cast<int>(color_space));
+      ReleaseSRWLockExclusive(&g_capture_lock);
     }
     return hr;
   }
 
-  template<class Fn>
-  bool patch_slot(void **vtable, int index, void *hook, Fn &original) {
-    DWORD old_protect = 0;
-    if (!VirtualProtect(&vtable[index], sizeof(void *), PAGE_READWRITE, &old_protect)) {
-      return false;
-    }
-    original = reinterpret_cast<Fn>(vtable[index]);
-    vtable[index] = hook;
-    VirtualProtect(&vtable[index], sizeof(void *), old_protect, &old_protect);
-    FlushInstructionCache(GetCurrentProcess(), &vtable[index], sizeof(void *));
-    return true;
-  }
-
-  // The DXGI swapchain implementation's vtable is shared by every swapchain
-  // in the process, so patching it through a throwaway flip-model swapchain
-  // hooks the game's too. Overlays that inline-hook Present are unaffected:
-  // our entry calls through the original pointer, into their hook.
+  // The entry points are found from a throwaway swapchain and inline-detoured
+  // at their addresses, which every swapchain of the process shares.
   bool install_hooks() {
     WNDCLASSW wc {};
     wc.lpfnWndProc = DefWindowProcW;
@@ -471,7 +586,7 @@ namespace {
     RegisterClassW(&wc);
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", WS_OVERLAPPEDWINDOW, 0, 0, 16, 16, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) {
-      set_state(game_capture::hook_state_e::failed, "Could not create the dummy window");
+      set_state(gc::hook_state_e::failed, "Could not create the dummy window");
       return false;
     }
 
@@ -498,18 +613,26 @@ namespace {
     }
     if (SUCCEEDED(hr)) {
       void **vtable = *reinterpret_cast<void ***>(swapchain);
-      ok = patch_slot(vtable, kVtPresent, reinterpret_cast<void *>(&hook_present), g_real_present) &&
-           patch_slot(vtable, kVtPresent1, reinterpret_cast<void *>(&hook_present1), g_real_present1);
+      ok = MH_Initialize() == MH_OK &&
+           MH_CreateHook(vtable[kVtPresent], reinterpret_cast<void *>(&hook_present), reinterpret_cast<void **>(&g_real_present)) == MH_OK &&
+           MH_CreateHook(vtable[kVtPresent1], reinterpret_cast<void *>(&hook_present1), reinterpret_cast<void **>(&g_real_present1)) == MH_OK &&
+           MH_CreateHook(vtable[kVtResizeBuffers], reinterpret_cast<void *>(&hook_resize_buffers), reinterpret_cast<void **>(&g_real_resize_buffers)) == MH_OK;
       IDXGISwapChain3 *swapchain3 = nullptr;
       if (ok && SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
         void **vtable3 = *reinterpret_cast<void ***>(swapchain3);
-        patch_slot(vtable3, kVtSetColorSpace1, reinterpret_cast<void *>(&hook_set_color_space1), g_real_set_color_space1);
+        MH_CreateHook(vtable3[kVtSetColorSpace1], reinterpret_cast<void *>(&hook_set_color_space1), reinterpret_cast<void **>(&g_real_set_color_space1));
         swapchain3->Release();
+      }
+      if (ok) {
+        ok = MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
+      }
+      if (!ok) {
+        set_state(gc::hook_state_e::failed, "Installing the DXGI detours failed");
       }
     } else {
       char msg[96];
       std::snprintf(msg, sizeof(msg), "Could not create the dummy swapchain: 0x%08lx", hr);
-      set_state(game_capture::hook_state_e::failed, msg);
+      set_state(gc::hook_state_e::failed, msg);
     }
     safe_release(swapchain);
     safe_release(factory);
@@ -521,40 +644,48 @@ namespace {
 
   DWORD WINAPI init_thread_main(void *) {
     wchar_t name[96];
-    game_capture::shared_block_name(name, 96, GetCurrentProcessId());
+    gc::shared_block_name(name, 96, GetCurrentProcessId());
     HANDLE mapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
     if (!mapping) {
       log("No shared block %ls (error %lu); not capturing", name, GetLastError());
       return 1;
     }
-    g_block = static_cast<game_capture::shared_block_t *>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(game_capture::shared_block_t)));
-    if (!g_block || g_block->magic != game_capture::kMagic || g_block->version != game_capture::kVersion) {
+    g_block = static_cast<gc::shared_block_t *>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(gc::shared_block_t)));
+    if (!g_block || g_block->magic != gc::kMagic || g_block->version != gc::kVersion) {
       log("Shared block missing or version mismatch; not capturing");
       g_block = nullptr;
       return 1;
     }
 
-    g_cap.frame_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_cap.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_cap.frame_event || !g_cap.fence_event) {
-      set_state(game_capture::hook_state_e::failed, "Could not create events");
+    g_frame_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    bool events_ok = g_frame_event != nullptr;
+    for (auto &s : g_slots) {
+      s.done_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      events_ok = events_ok && s.done_event != nullptr;
+    }
+    if (!events_ok) {
+      set_state(gc::hook_state_e::failed, "Could not create events");
       return 1;
     }
-    g_block->frame_event.store(reinterpret_cast<std::uint64_t>(g_cap.frame_event), std::memory_order_relaxed);
-    g_fence_thread = CreateThread(nullptr, 0, fence_thread_main, nullptr, 0, nullptr);
+    g_block->frame_event.store(reinterpret_cast<std::uint64_t>(g_frame_event), std::memory_order_release);
+    g_completion_thread = CreateThread(nullptr, 0, completion_thread_main, nullptr, 0, nullptr);
+    if (!g_completion_thread) {
+      set_state(gc::hook_state_e::failed, "Could not create the completion thread");
+      return 1;
+    }
 
     if (!install_hooks()) {
       return 1;
     }
-    set_state(game_capture::hook_state_e::hooked);
-    log("Hooked DXGI Present/Present1 in pid %lu", GetCurrentProcessId());
+    set_state(gc::hook_state_e::hooked);
+    log("Detoured DXGI Present/Present1/ResizeBuffers in pid %lu", GetCurrentProcessId());
     return 0;
   }
 
 }  // namespace
 
-// The DLL stays loaded for the life of the process: the patched vtable points
-// into it, and there is no safe moment to take that back mid-frame.
+// The DLL stays loaded for the life of the process: the detours point into
+// it, and there is no safe moment to take them back mid-frame.
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(instance);

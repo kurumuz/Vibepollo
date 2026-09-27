@@ -1,0 +1,4 @@
+MinHook, vendored for tools/game_hook (inline detours of the DXGI Present entry points).
+Upstream: https://github.com/TsudaKageyu/minhook
+Commit: 8af6b4a (Update and fix Hacker Disassembler Engine (2))
+License: BSD-2-Clause (LICENSE.txt). Unmodified.

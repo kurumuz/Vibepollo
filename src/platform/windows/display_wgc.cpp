@@ -227,7 +227,17 @@ namespace platf::dxgi {
         _game_foreground_checked = now;
         _game_foreground = platf::game_activity::foreground_snapshot(captured_output_desc.DesktopCoordinates);
       }
-      const bool game_active = _game_source->active(_game_foreground);
+      // The Windows SDR brightness setting can change mid-stream; the
+      // compositor follows it, so must our conversion
+      if (now - _game_sdr_white_checked >= std::chrono::seconds(2)) {
+        _game_sdr_white_checked = now;
+        const float scale = game_capture::sdr_white_scale_for_output(captured_output_desc.DeviceName);
+        if (scale != _game_sdr_white_scale) {
+          BOOST_LOG(info) << "Game capture: desktop SDR white now " << scale * 80.0f << " nits";
+          _game_sdr_white_scale = scale;
+        }
+      }
+      const bool game_active = _game_source->active(_game_foreground) && _game_source->still_foreground();
       if (game_active != _game_mode) {
         _game_mode = game_active;
         BOOST_LOG(info) << "Game capture: " << (game_active ? "capturing from the game (" + _game_foreground.foreground_exe + ")" : std::string("back to desktop capture"));
@@ -391,6 +401,13 @@ namespace platf::dxgi {
 
     auto status = _game_source->wait(timeout);
     if (status == capture_e::timeout) {
+      // Nothing from the game: if it is no longer the foreground fullscreen
+      // window (alt-tab during the wait), this snapshot comes from the
+      // desktop instead of being skipped
+      if (!_game_source->still_foreground()) {
+        fall_back = true;
+        return capture_e::ok;
+      }
       if (is_wgc_constant_mode()) {
         return forward_cached_wgc_frame(_last_cached_frame, img_out);
       }

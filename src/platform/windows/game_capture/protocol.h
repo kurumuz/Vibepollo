@@ -6,21 +6,28 @@
  *
  * Flow:
  *  1. The host creates the shared block `Global\VibepolloGameCapture_<pid>`
- *     (so the SYSTEM-owned name is valid across sessions and the game process
- *     never needs SeCreateGlobalPrivilege), then injects the hook DLL.
- *  2. The hook patches the DXGI swapchain vtable. On Present it copies the
- *     back buffer into one of kSlots shared textures, each guarded by a DXGI
- *     keyed mutex (GPU-ordered across devices, so the host can never read a
- *     half-written texture), and publishes the frame once the GPU has finished
- *     the copy (D3D11 fence), with the game's timing.
- *  3. The host duplicates the hook's NT handles (texture per slot, frame
- *     event) out of the game process and reads the latest slot.
+ *     (writable by SYSTEM, administrators and the game's own user; medium
+ *     integrity label so the game can write it) and injects the hook DLL.
+ *  2. The hook detours the DXGI Present entry points. On Present it copies the
+ *     back buffer into a free slot (a shared texture guarded by a DXGI keyed
+ *     mutex, GPU-ordered across devices) and, once the GPU has finished the
+ *     copy, publishes that slot with the game's timing.
+ *  3. The host duplicates the hook's NT handles out of the game process and
+ *     reads the published slot.
  *
- * Slot rule that makes this race-free without ever blocking the game: the
- * hook only writes the slot that is NOT currently published, and only if it
- * gets that slot's keyed mutex with a zero timeout; the host only reads the
- * published slot. A frame the hook cannot place is skipped (counted), never
- * waited for.
+ * Slot protocol (three slots: free, pending, published):
+ *  - The hook writes only a FREE slot, taking its keyed mutex with a zero
+ *    timeout; if none is free or the mutex is held, the frame is skipped.
+ *    A frame is never waited for and Present is never blocked.
+ *  - A written slot is PENDING until its copy completes, then PUBLISHED; the
+ *    previously published slot becomes free.
+ *  - Every write bumps the slot's version. The published metadata names
+ *    (slot, version); the host re-reads it after taking the keyed mutex and
+ *    uses the frame only if both still match, so pixels and metadata can
+ *    never be mixed between frames.
+ *
+ * Everything the host reads from this block is untrusted: the game's user
+ * can write it. The host bounds and validates every field.
  */
 #pragma once
 
@@ -31,8 +38,9 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 1;
-  constexpr int kSlots = 2;
+  constexpr std::uint32_t kVersion = 2;
+  constexpr int kSlots = 3;
+  constexpr std::size_t kErrorLength = 160;
 
   inline void shared_block_name(wchar_t *buffer, std::size_t count, std::uint32_t pid) {
     std::swprintf(buffer, count, L"Global\\VibepolloGameCapture_%u", pid);
@@ -40,7 +48,7 @@ namespace game_capture {
 
   enum class hook_state_e : std::uint32_t {
     none = 0,  ///< not loaded yet
-    hooked = 1,  ///< vtable patched, no frame captured yet
+    hooked = 1,  ///< detours installed, no frame captured yet
     capturing = 2,  ///< frames are being published
     unsupported = 3,  ///< this process presents through an API the hook does not capture (see last_error)
     failed = 4,  ///< setup failed (see last_error)
@@ -51,11 +59,28 @@ namespace game_capture {
     d3d11 = 1,
   };
 
-  // How the game's pixels are encoded (from IDXGISwapChain3::SetColorSpace1)
+  // How the game's pixels are encoded
   enum class color_space_e : std::uint32_t {
-    srgb = 0,  ///< DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 (the default)
-    scrgb = 1,  ///< DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, linear, 1.0 = 80 nits
-    hdr10 = 2,  ///< DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, PQ
+    unknown = 0,  ///< not established (a 10-bit swapchain whose SetColorSpace1 the hook never saw): do not use the frame
+    srgb = 1,  ///< DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    scrgb = 2,  ///< DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, linear, 1.0 = 80 nits
+    hdr10 = 3,  ///< DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, PQ
+  };
+
+  // Texture setup for one generation (rewritten on every resize / device
+  // change). Published as a unit under setup_seq; handles of the previous
+  // generation stay open in the hook until the one after it, so a host still
+  // opening them never meets a recycled handle value.
+  struct setup_t {
+    std::atomic<std::uint32_t> generation;
+    std::atomic<std::uint32_t> api;  ///< api_e
+    std::atomic<std::uint32_t> width;
+    std::atomic<std::uint32_t> height;
+    std::atomic<std::uint32_t> format;  ///< DXGI_FORMAT (informational; the host uses the opened texture's own description)
+    std::atomic<std::uint32_t> adapter_luid_low;
+    std::atomic<std::int32_t> adapter_luid_high;
+    std::atomic<std::uint64_t> hwnd;  ///< the swapchain's output window
+    std::atomic<std::uint64_t> textures[kSlots];  ///< NT handle values in the game process
   };
 
   struct shared_block_t {
@@ -65,36 +90,31 @@ namespace game_capture {
     // Host -> hook
     std::atomic<std::uint32_t> capture_enabled;  ///< the hook copies only while non-zero
 
-    // Hook -> host: setup, rewritten when the textures are recreated. The host
-    // re-duplicates the texture handles whenever `generation` changes.
+    // Hook -> host
     std::atomic<std::uint32_t> hook_state;  ///< hook_state_e
-    std::atomic<std::uint32_t> api;  ///< api_e
-    std::atomic<std::uint32_t> generation;
-    std::atomic<std::uint64_t> frame_event;  ///< auto-reset event (handle value in the game process)
-    std::atomic<std::uint64_t> textures[kSlots];  ///< NT handles (values in the game process)
-    std::atomic<std::uint32_t> width;
-    std::atomic<std::uint32_t> height;
-    std::atomic<std::uint32_t> format;  ///< DXGI_FORMAT
-    std::atomic<std::uint32_t> color_space;  ///< color_space_e
-    std::atomic<std::uint64_t> hwnd;  ///< the swapchain's output window
-    std::atomic<std::uint32_t> adapter_luid_low;
-    std::atomic<std::int32_t> adapter_luid_high;
+    std::atomic<std::uint64_t> frame_event;  ///< auto-reset event (handle value in the game process), set on each publish
+    std::atomic<std::uint64_t> publish_qpc;  ///< QueryPerformanceCounter of the last publish (for staleness)
 
-    // Hook -> host: the latest completed frame, seqlock-published (odd while
-    // being written). Read `seq`, the fields, then `seq` again.
-    std::atomic<std::uint32_t> seq;
-    std::atomic<std::uint32_t> latest_slot;
-    std::atomic<std::uint32_t> latest_generation;
+    // Setup, seqlocked: odd setup_seq while being rewritten
+    std::atomic<std::uint32_t> setup_seq;
+    setup_t setup;
+
+    // The latest completed frame, seqlocked: odd frame_seq while being written
+    std::atomic<std::uint32_t> frame_seq;
+    std::atomic<std::uint32_t> slot;
+    std::atomic<std::uint32_t> slot_version;
+    std::atomic<std::uint32_t> generation;
+    std::atomic<std::uint32_t> color_space;  ///< color_space_e, of this frame
     std::atomic<std::uint64_t> frame_id;
     std::atomic<std::uint64_t> present_qpc;  ///< QueryPerformanceCounter at the game's Present()
-    std::atomic<std::uint64_t> gpu_done_qpc;  ///< when the GPU finished the copy (0 = no fence support)
+    std::atomic<std::uint64_t> gpu_done_qpc;  ///< when the hook observed the copy complete (0 = no fence support)
 
-    // Hook -> host: statistics
+    // Statistics
     std::atomic<std::uint64_t> frames_presented;
     std::atomic<std::uint64_t> frames_published;
-    std::atomic<std::uint64_t> frames_skipped_busy;  ///< both slots held: frame not captured
+    std::atomic<std::uint64_t> frames_skipped;  ///< no free slot / mutex held / another thread capturing
 
-    char last_error[160];
+    char last_error[kErrorLength];  ///< the host copies at most kErrorLength bytes and terminates locally
   };
 
   static_assert(std::atomic<std::uint64_t>::is_always_lock_free, "shared block atomics must be lock-free");
