@@ -80,9 +80,10 @@ namespace game_capture {
   };
 
   // Texture setup for one generation (rewritten on every resize / device
-  // change), published as a unit under setup_seq. Handles of the previous
-  // generation stay open in the hook until the one after it, so a host still
-  // opening them never meets a recycled handle value.
+  // change), published as a unit under setup_seq. The hook keeps a retired
+  // generation's handles (NT) or textures (legacy) for a two-second grace
+  // period, and the host re-checks the generation after opening, so a host
+  // still opening an old setup does not commit a recycled handle value.
   struct setup_t {
     std::atomic<std::uint32_t> generation;
     std::atomic<std::uint32_t> api;  ///< api_e

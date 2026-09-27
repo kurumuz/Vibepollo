@@ -41,9 +41,11 @@
 
 #include <windows.h>
 #include <d3d11_4.h>
+#include <d3d11on12.h>
 #include <dxgi1_4.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -76,17 +78,23 @@ namespace {
   // ---- logging -----------------------------------------------------------
 
   FILE *g_log = nullptr;
+  bool g_log_failed = false;  // under g_log_lock
   SRWLOCK g_log_lock = SRWLOCK_INIT;
 
   void log(const char *fmt, ...) {
     AcquireSRWLockExclusive(&g_log_lock);
-    if (!g_log) {
+    if (!g_log && !g_log_failed) {
+      // %ls: MinGW's libstdc++ selects ISO printf, where %s is a narrow string
       wchar_t dir[MAX_PATH];
+      wchar_t path[MAX_PATH + 64];
       const DWORD n = GetTempPathW(MAX_PATH, dir);
-      if (n != 0 && n < MAX_PATH) {
-        wchar_t path[MAX_PATH];
-        std::swprintf(path, MAX_PATH, L"%svibepollo_game_hook_%lu.log", dir, GetCurrentProcessId());
-        g_log = _wfopen(path, L"a");
+      const int len = (n != 0 && n < MAX_PATH) ? std::swprintf(path, sizeof(path) / sizeof(path[0]), L"%lsvibepollo_game_hook_%lu.log", dir, GetCurrentProcessId()) : -1;
+      g_log = len > 0 ? _wfopen(path, L"a") : nullptr;
+      if (!g_log) {
+        g_log_failed = true;  // once: report it where a debugger can see it
+        wchar_t msg[MAX_PATH + 128];
+        std::swprintf(msg, sizeof(msg) / sizeof(msg[0]), L"vibepollo_game_hook: cannot open the log (temp path %lu, format %d, errno %d)\n", n, len, errno);
+        OutputDebugStringW(msg);
       }
     }
     if (g_log) {
@@ -272,6 +280,7 @@ namespace {
     std::uint64_t highest_fence_value = 0;
     std::uint64_t retired_qpc = 0;
     bool textures_released = false;
+    bool legacy = false;  // shared through global handles: the textures themselves keep the values valid
     bool in_use = false;
   };
 
@@ -372,7 +381,11 @@ namespace {
         // (UINT64_MAX = device removed: nothing more will complete; release)
         const bool done = !r.fence || r.fence->GetCompletedValue() >= r.highest_fence_value;
         const bool old = now - r.retired_qpc > qpc_frequency();
-        if (done || old || force) {
+        // A global handle is only as valid as its texture: keep the textures
+        // for the whole grace period so a host that read the old setup never
+        // opens a recycled value
+        const bool hold = r.legacy && now - r.retired_qpc <= 2 * qpc_frequency();
+        if (((done || old) && !hold) || force) {
           release_retired(r);
         }
       }
@@ -426,6 +439,7 @@ namespace {
     std::memcpy(slot->textures, g_cap.textures, sizeof(g_cap.textures));
     std::memcpy(slot->mutexes, g_cap.mutexes, sizeof(g_cap.mutexes));
     std::memcpy(slot->handles, g_cap.shared_handles, sizeof(g_cap.shared_handles));
+    slot->legacy = g_cap.legacy_handles[0] != 0;
     std::memset(g_cap.textures, 0, sizeof(g_cap.textures));
     std::memset(g_cap.mutexes, 0, sizeof(g_cap.mutexes));
     std::memset(g_cap.shared_handles, 0, sizeof(g_cap.shared_handles));
@@ -586,7 +600,9 @@ namespace {
       desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | (v.nt ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0);
       const char *step = nullptr;
       HRESULT hr = S_OK;
+      int failed_slot = 0;
       for (int i = 0; i < gc::kSlots && SUCCEEDED(hr); ++i) {
+        failed_slot = i;
         step = "create";
         hr = g_cap.device->CreateTexture2D(&desc, nullptr, &g_cap.textures[i]);
         if (SUCCEEDED(hr)) {
@@ -594,19 +610,21 @@ namespace {
           hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(&g_cap.mutexes[i]));
         }
         if (SUCCEEDED(hr) && v.nt) {
-          step = "nthandle";
+          step = "qi-res1";
           IDXGIResource1 *resource = nullptr;
           hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&resource));
           if (SUCCEEDED(hr)) {
+            step = "nthandle";
             hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &g_cap.shared_handles[i]);
             resource->Release();
           }
         } else if (SUCCEEDED(hr)) {
-          step = "sharedhandle";
+          step = "qi-res";
           IDXGIResource *resource = nullptr;
           hr = g_cap.textures[i]->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&resource));
           HANDLE handle = nullptr;
           if (SUCCEEDED(hr)) {
+            step = "kmthandle";
             hr = resource->GetSharedHandle(&handle);
             resource->Release();
           }
@@ -620,12 +638,37 @@ namespace {
         used = &v;
         break;
       }
-      log("Capture texture variant %s (%ux%u fmt %d) failed at %s: 0x%08lx", v.name, desc.Width, desc.Height, desc.Format, step, hr);
+      log("Capture texture variant %s (%ux%u fmt %d) failed at %s of slot %d: 0x%08lx", v.name, desc.Width, desc.Height, desc.Format, step, failed_slot, hr);
       const auto len = std::strlen(failures);
-      std::snprintf(failures + len, sizeof(failures) - len, "%s%s@%s=0x%08lx", len ? " " : "", v.name, step, hr);
+      std::snprintf(failures + len, sizeof(failures) - len, "%s%s@%s%d=%lx", len ? " " : "", v.name, step, failed_slot, hr);
       release_partial();
     }
     if (!used) {
+      // Narrow down what this device rejects (log only)
+      auto probe = [&](const char *name, UINT bind, UINT misc) {
+        D3D11_TEXTURE2D_DESC d = desc;
+        d.BindFlags = bind;
+        d.MiscFlags = misc;
+        ID3D11Texture2D *t = nullptr;
+        const HRESULT hr = g_cap.device->CreateTexture2D(&d, nullptr, &t);
+        safe_release(t);
+        log("Probe %s: 0x%08lx", name, hr);
+      };
+      probe("plain srv", D3D11_BIND_SHADER_RESOURCE, 0);
+      probe("plain none", 0, 0);
+      probe("shared srv", D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED);
+      probe("shared srv/rtv", D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_RESOURCE_MISC_SHARED);
+      UINT support = 0;
+      const HRESULT fs = g_cap.device->CheckFormatSupport(format, &support);
+      D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support2 {format, 0};
+      const HRESULT fs2 = g_cap.device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support2, sizeof(support2));
+      IUnknown *on12 = nullptr;
+      const HRESULT on12_hr = g_cap.device->QueryInterface(__uuidof(ID3D11On12Device), reinterpret_cast<void **>(&on12));
+      safe_release(on12);
+      log("Format %d support 0x%08x (0x%08lx) support2 0x%08x (0x%08lx, shareable %d); 11on12 0x%08lx; back buffer bind 0x%x misc 0x%x usage %d",
+          format, support, fs, support2.OutFormatSupport2, fs2, (support2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_SHAREABLE) != 0,
+          on12_hr, back.BindFlags, back.MiscFlags, back.Usage);
+
       char msg[gc::kErrorLength];
       std::snprintf(msg, sizeof(msg), "Textures %ux%u f%d FL%x cf%x: %s", desc.Width, desc.Height, desc.Format, g_cap.device->GetFeatureLevel(), g_cap.device->GetCreationFlags(), failures);
       set_state(gc::hook_state_e::failed, msg);

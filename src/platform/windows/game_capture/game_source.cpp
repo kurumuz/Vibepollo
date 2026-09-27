@@ -62,7 +62,18 @@ namespace platf::dxgi::game_capture {
       return s;
     }
 
-    // Never inject into Windows itself or into Vibepollo's own processes
+    // Launchers, their embedded browsers, browsers and overlay tools: full
+    // screen now and then, never a game
+    constexpr const char *kNotGames[] = {
+      "steam.exe", "steamwebhelper.exe", "gameoverlayui.exe", "gameoverlayui64.exe",
+      "epicgameslauncher.exe", "epicwebhelper.exe", "battle.net.exe", "agent.exe",
+      "eadesktop.exe", "eabackgroundservice.exe", "galaxyclient.exe", "ubisoftconnect.exe", "upc.exe",
+      "discord.exe", "chrome.exe", "msedge.exe", "msedgewebview2.exe", "firefox.exe", "brave.exe",
+      "obs64.exe", "rtss.exe", "msiafterburner.exe", "nvcontainer.exe", "nvidia app.exe", "nvidia overlay.exe",
+    };
+
+    // Never inject into Windows itself, Vibepollo's own processes or known
+    // non-games
     bool is_candidate_process(DWORD pid, const std::string &exe) {
       if (pid == 0 || pid == GetCurrentProcessId() || exe.empty()) {
         return false;
@@ -77,6 +88,12 @@ namespace platf::dxgi::game_capture {
       }
       for (const auto *own : {"sunshine", "vibepollo", "apollo\\tools"}) {
         if (path.find(own) != std::string::npos) {
+          return false;
+        }
+      }
+      const auto name = std::filesystem::path(path).filename().string();
+      for (const auto *not_game : kNotGames) {
+        if (name == not_game) {
           return false;
         }
       }
@@ -663,6 +680,11 @@ namespace platf::dxgi::game_capture {
       return out;
     };
 
+    if (handle_kind != static_cast<std::uint32_t>(gc::handle_kind_e::nt) && handle_kind != static_cast<std::uint32_t>(gc::handle_kind_e::legacy)) {
+      t.give_up("the hook reported an unknown texture handle kind");
+      return false;
+    }
+
     if (!t.frame_event) {
       t.frame_event.attach(duplicate(t.block->frame_event.load(std::memory_order_relaxed)));
       if (!t.frame_event) {
@@ -692,8 +714,12 @@ namespace platf::dxgi::game_capture {
         }
         hr = _device->OpenSharedResource1(shared.get(), __uuidof(ID3D11Texture2D), textures[i].put_void());
       }
-      if (FAILED(hr) || FAILED(textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), mutexes[i].put_void()))) {
+      if (FAILED(hr)) {
         BOOST_LOG(warning) << "Game capture: cannot open shared texture " << i << " [0x" << util::hex(hr).to_string_view() << ']';
+        return false;
+      }
+      if (const HRESULT qi = textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), mutexes[i].put_void()); FAILED(qi)) {
+        BOOST_LOG(warning) << "Game capture: shared texture " << i << " has no keyed mutex [0x" << util::hex(qi).to_string_view() << ']';
         return false;
       }
       D3D11_TEXTURE2D_DESC this_desc {};
