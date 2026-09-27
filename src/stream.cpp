@@ -36,6 +36,7 @@ extern "C" {
 #include "crypto.h"
 #include "display_device.h"
 #include "display_helper_integration.h"
+#include "frame_timing.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -2425,6 +2426,7 @@ namespace stream {
         std::int64_t slo_wire_bytes = 0;
         std::int64_t slo_frame_wire_bytes = 0;  // without probe padding
         bool slo_probed = false;
+        std::optional<std::chrono::steady_clock::time_point> timing_first_send;  // for frame_timing
 
         // When a timestamp isn't available (duplicate frames), the timestamp from
         // rate control is used instead. Determined before the per-block loop so
@@ -2585,6 +2587,9 @@ namespace stream {
               if (session->video.slo && slo_first_send_us == 0) {
                 slo_first_send_us = prague::steady_us();
               }
+              if (!timing_first_send) {
+                timing_first_send = std::chrono::steady_clock::now();
+              }
               frame_send_batch_latency_logger.first_point_now();
               // Use a batched send if it's supported on this platform
               if (!platf::send_batch(batch_info)) {
@@ -2719,6 +2724,21 @@ namespace stream {
           if (!payload.empty()) {
             sctx.overhead += 0.05 * ((double) slo_frame_wire_bytes / (double) payload.size() - sctx.overhead);
           }
+        }
+
+        // Where this frame's time went (real frames only: a duplicate's
+        // timestamp is rate control's)
+        if (!frame_is_dupe && timing_first_send) {
+          const auto sent = std::chrono::steady_clock::now();
+          if (packet->host_processing_timestamp) {
+            frame_timing::record(frame_timing::pickup_to_encoded, packet->packet_enqueue_timestamp - *packet->host_processing_timestamp);
+          }
+          frame_timing::record(frame_timing::encoded_to_send, *timing_first_send - packet->packet_enqueue_timestamp);
+          frame_timing::record(frame_timing::send_span, sent - *timing_first_send);
+          frame_timing::record(frame_timing::start_to_sent, sent - *packet->frame_timestamp);
+        }
+        if (auto report = frame_timing::take_report_if_due(); !report.empty()) {
+          BOOST_LOG(info) << report;
         }
 
         // Update per-session performance counters

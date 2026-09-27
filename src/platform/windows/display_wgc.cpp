@@ -14,6 +14,7 @@
 
 // local includes
 #include "src/config.h"
+#include "src/frame_timing.h"
 #include "ipc/ipc_session.h"
 #include "ipc/misc_utils.h"
 #include "src/logging.h"
@@ -511,6 +512,13 @@ namespace platf::dxgi {
     const std::uint64_t frame_qpc = frame.release_qpc ? frame.release_qpc : frame.gpu_done_qpc ? frame.gpu_done_qpc : frame.present_qpc;
     img->frame_timestamp = host_processing_timestamp - qpc_time_difference(qpc_counter(), static_cast<int64_t>(frame_qpc));
     img->host_processing_timestamp = host_processing_timestamp;
+    if (frame.gpu_done_qpc) {
+      const auto now_qpc = qpc_counter();
+      if (frame.release_qpc) {
+        frame_timing::record(frame_timing::start_to_gpu, qpc_time_difference(static_cast<int64_t>(frame.gpu_done_qpc), static_cast<int64_t>(frame.release_qpc)));
+      }
+      frame_timing::record(frame_timing::gpu_to_pickup, qpc_time_difference(now_qpc, static_cast<int64_t>(frame.gpu_done_qpc)));
+    }
     img->capture_pacing_timestamp = host_processing_timestamp;
     img_out = img;
     _last_cached_frame = img;
