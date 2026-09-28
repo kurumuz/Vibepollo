@@ -720,7 +720,9 @@ namespace {
     owner_kmt,
   };
 
-  bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd, sharing_e sharing = sharing_e::any) {
+  // `terminal`: whether a failure is reported to the host as final (not
+  // when the caller still has another sharing kind to try)
+  bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd, sharing_e sharing = sharing_e::any, bool terminal = true) {
     const DXGI_FORMAT format = shareable_format(back.Format);
     if (g_cap.textures[0] && g_cap.width == back.Width && g_cap.height == back.Height && g_cap.format == format) {
       return true;
@@ -855,7 +857,11 @@ namespace {
 
       char msg[gc::kErrorLength];
       std::snprintf(msg, sizeof(msg), "Textures %ux%u f%d FL%x cf%x: %s", desc.Width, desc.Height, desc.Format, g_cap.device->GetFeatureLevel(), g_cap.device->GetCreationFlags(), failures);
-      set_state(gc::hook_state_e::failed, msg);
+      if (terminal) {
+        set_state(gc::hook_state_e::failed, msg);
+      } else {
+        log("%s (another sharing kind is tried next)", msg);
+      }
       return false;
     }
     if (used != &variants[0]) {
@@ -2967,9 +2973,15 @@ namespace {
             Sleep(10);  // (out of memory: the copy is not finished, try again)
           }
         }
-        if (lost && p.device == g_vk_current_device.load(std::memory_order_acquire)) {
-          g_vk_completed.store(UINT64_MAX, std::memory_order_release);  // (nothing more completes)
-        } else if (!lost) {
+        if (lost) {
+          // (under the queue lock: a device switch, which re-bases the
+          // completed value, cannot slip between the check and the store)
+          AcquireSRWLockExclusive(&g_vk_queue_lock);
+          if (p.device == g_vk_current_device.load(std::memory_order_relaxed)) {
+            g_vk_completed.store(UINT64_MAX, std::memory_order_release);  // (nothing more completes)
+          }
+          ReleaseSRWLockExclusive(&g_vk_queue_lock);
+        } else {
           auto done = g_vk_completed.load(std::memory_order_relaxed);
           while (done != UINT64_MAX && done < p.value && !g_vk_completed.compare_exchange_weak(done, p.value, std::memory_order_acq_rel)) {
           }
@@ -3097,7 +3109,9 @@ namespace {
     if (!idle) {
       log("Vulkan: copies still in flight after 2 s; their objects wait for the device's end");
     }
-    g_vk_current_device.store(VK_NULL_HANDLE, std::memory_order_release);
+    AcquireSRWLockExclusive(&g_vk_queue_lock);
+    g_vk_current_device.store(VK_NULL_HANDLE, std::memory_order_relaxed);
+    ReleaseSRWLockExclusive(&g_vk_queue_lock);
     if (device_gone) {
       for (auto it = g_vk_leftovers.begin(); it != g_vk_leftovers.end(); ++it) {
         if (it->device == v.dev.device) {
@@ -3358,12 +3372,14 @@ namespace {
       v.cmd[i] = cmd[i];
       v.fence[i] = fences[i];
     }
-    g_vk_current_device.store(d.device, std::memory_order_release);
     // A device lost earlier left the completed value at "everything": what
     // this one submits starts from where the values are now
+    AcquireSRWLockExclusive(&g_vk_queue_lock);
+    g_vk_current_device.store(d.device, std::memory_order_relaxed);
     if (g_vk_completed.load(std::memory_order_acquire) == UINT64_MAX) {
       g_vk_completed.store(g_vk_next_value.load(std::memory_order_acquire), std::memory_order_release);
     }
+    ReleaseSRWLockExclusive(&g_vk_queue_lock);
     log("Vulkan: capturing swapchain 0x%llx (%ux%u, format %d, colour space %d) on queue family %u; D3D11 textures imported as %s handles",
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(p.swapchain->swapchain)), p.swapchain->extent.width, p.swapchain->extent.height,
         static_cast<int>(p.swapchain->format), static_cast<int>(p.swapchain->color_space), p.queue_family, nt ? "NT" : "global");
@@ -3607,8 +3623,10 @@ namespace {
         char msg[192];
         std::snprintf(msg, sizeof(msg), "Vulkan: %s", why);
         if (setup == vk_setup_e::permanent) {
+          // (not reported to the host as final: another device of the
+          // process may be captured; until then it shows the desktop)
           rejected_device = p.device->device;
-          set_state(gc::hook_state_e::unsupported, msg);
+          log("%s; this device is not captured", msg);
         } else {
           rejected_swapchain = p.swapchain->swapchain;
           retry_after = now + 5 * qpc_frequency();
@@ -3628,7 +3646,8 @@ namespace {
     back.Height = p.swapchain->extent.height;
     back.Format = dxgi;
     back.SampleDesc.Count = 1;
-    if (!ensure_textures(back, hwnd, v.handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT ? sharing_e::owner_nt : sharing_e::owner_kmt)) {
+    const bool nt_first = v.handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    if (!ensure_textures(back, hwnd, nt_first ? sharing_e::owner_nt : sharing_e::owner_kmt, !(nt_first && v.kmt_importable))) {
       if (v.handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT && v.kmt_importable) {
         log("Vulkan: NT-handle textures could not be created; switching to global handles");
         v.handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;

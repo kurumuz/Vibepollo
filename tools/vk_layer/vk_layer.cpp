@@ -576,28 +576,31 @@ namespace {
     bool recorded = false;
     {
       exclusive_t lg(g_lock);
+      // The owning entry goes in empty (`sc` stays ours if that throws),
+      // then the images; the record moves in last, which cannot throw
       std::size_t images_in = 0;
-      bool swapchain_in = false;
+      bool entry_in = false;
       try {
         if (rec->instance) {
           const auto it = rec->instance->surfaces.find(info->surface);
           raw->pub.hwnd = it == rec->instance->surfaces.end() ? nullptr : it->second;
         }
+        auto &slot = rec->swapchains[*out];
+        entry_in = true;
         if (widened) {
           for (VkImage image : raw->images) {
             rec->swapchain_images.emplace(image, raw);
             ++images_in;
           }
         }
-        rec->swapchains.emplace(*out, std::move(sc));
-        swapchain_in = true;
+        slot = std::move(sc);
         recorded = true;
       } catch (...) {
         // Undo what went in: nothing may point at a record that is not kept
         for (std::size_t i = 0; i < images_in; ++i) {
           rec->swapchain_images.erase(raw->images[i]);
         }
-        if (swapchain_in) {
+        if (entry_in) {
           rec->swapchains.erase(*out);
         }
       }
