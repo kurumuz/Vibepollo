@@ -8,6 +8,7 @@
  */
 #include "game_source.h"
 #include "dxgi_symbols.h"
+#include "vk_layer_registration.h"
 
 #include "src/config.h"
 #include "src/logging.h"
@@ -528,6 +529,7 @@ namespace platf::dxgi::game_capture {
 
   source_t::source_t(ID3D11Device *device) {
     gc::start_dxgi_symbol_resolution();
+    gc::ensure_vk_layer_registered();
     {
       std::lock_guard lg(g_instances_lock);
       _instance_id = (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32) | ++g_next_instance;

@@ -77,7 +77,8 @@ foreach(_packaged_target IN ITEMS
         playnite-launcher
         sunshine_wgc_capture
         sunshine_display_helper
-        vibepollo_game_hook)
+        vibepollo_game_hook
+        vibepollo_vk_layer)
     if(TARGET "${_packaged_target}")
         list(APPEND SUNSHINE_WINDOWS_PACKAGED_TARGETS "${_packaged_target}")
     endif()
@@ -85,6 +86,9 @@ endforeach()
 # sunshine.exe loads the hook DLL from tools/ at runtime: build them together
 if(TARGET vibepollo_game_hook)
     add_dependencies(sunshine vibepollo_game_hook)
+endif()
+if(TARGET vibepollo_vk_layer)
+    add_dependencies(sunshine vibepollo_vk_layer)
 endif()
 
 # Convenience target to build MSI via CPack (WiX)
