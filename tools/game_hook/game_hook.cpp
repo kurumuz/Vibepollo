@@ -1862,6 +1862,16 @@ namespace {
   thread_local armed11_t t_armed11;
   thread_local int t_nested_presents = 0;  // public Presents re-entered inside the outermost one (an overlay's test Present, say)
 
+  struct nested_present_t {  // (scoped: a nested Present that throws must not leave the count off)
+    nested_present_t() {
+      ++t_nested_presents;
+    }
+
+    ~nested_present_t() {
+      --t_nested_presents;
+    }
+  };
+
   void give_back_prepared11(prepared11_t &p) {
     if (!p.valid) {
       return;
@@ -2589,8 +2599,19 @@ namespace {
     }
   };
 
-  void note_nested(IDXGISwapChain *swapchain) {
-    if (!t_presenting || t_presenting == swapchain) {
+  void note_nested(IDXGISwapChain *swapchain, UINT flags) {
+    if (!t_presenting) {
+      return;
+    }
+    if (t_presenting == swapchain) {
+      // The same swapchain presented again inside its Present (an overlay
+      // forwarding through the public entry): a real presentation rotates
+      // the back buffer under an armed copy, so the copy is dropped; a test
+      // Present (nothing presented) leaves it
+      if (!(flags & DXGI_PRESENT_TEST)) {
+        give_back_prepared(t_armed.prepared);
+        give_back_armed11();
+      }
       return;
     }
     // (DXGI may call itself through another interface of the same object)
@@ -2608,11 +2629,9 @@ namespace {
 
   HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags) {
     if (t_in_present) {
-      note_nested(swapchain);
-      ++t_nested_presents;
-      const HRESULT hr = g_real_present(swapchain, sync_interval, flags);
-      --t_nested_presents;
-      return hr;
+      note_nested(swapchain, flags);
+      nested_present_t nested;
+      return g_real_present(swapchain, sync_interval, flags);
     }
     in_present_t in_present;
     return present_with_capture(swapchain, sync_interval, flags, false, [&](UINT interval) {
@@ -2622,11 +2641,9 @@ namespace {
 
   HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swapchain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS *params) {
     if (t_in_present) {
-      note_nested(swapchain);
-      ++t_nested_presents;
-      const HRESULT hr = g_real_present1(swapchain, sync_interval, flags, params);
-      --t_nested_presents;
-      return hr;
+      note_nested(swapchain, flags);
+      nested_present_t nested;
+      return g_real_present1(swapchain, sync_interval, flags, params);
     }
     in_present_t in_present;
     const bool partial = params && (params->DirtyRectsCount > 0 || params->pScrollRect != nullptr);

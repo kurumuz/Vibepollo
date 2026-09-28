@@ -214,8 +214,22 @@ namespace game_capture {
         why = "SymInitialize failed (" + std::to_string(GetLastError()) + ")";
         return false;
       }
+      // (the session ends and the options come back however this returns)
+      struct session_t {
+        HANDLE process;
+        DWORD options;
+        DWORD64 base = 0;
+
+        ~session_t() {
+          if (base) {
+            SymUnloadModule64(process, base);
+          }
+          SymCleanup(process);
+          SymSetOptions(options);
+        }
+      } session {process, old_options};
       bool ok = false;
-      const DWORD64 base = SymLoadModuleExW(process, nullptr, dxgi.wstring().c_str(), nullptr, 0x10000000, 0, nullptr, 0);
+      const DWORD64 base = session.base = SymLoadModuleExW(process, nullptr, dxgi.wstring().c_str(), nullptr, 0x10000000, 0, nullptr, 0);
       if (!base) {
         why = "SymLoadModuleEx failed (" + std::to_string(GetLastError()) + ")";
       } else {
@@ -234,10 +248,7 @@ namespace game_capture {
           rva = ctx.matches[0].second;
           ok = true;
         }
-        SymUnloadModule64(process, base);
       }
-      SymCleanup(process);
-      SymSetOptions(old_options);
       return ok;
     }
 
@@ -338,15 +349,19 @@ namespace game_capture {
     if (g_started.exchange(true)) {
       return;
     }
-    std::thread([] {
-      try {
-        resolve();
-      } catch (const std::exception &e) {
-        BOOST_LOG(warning) << "Game capture: resolving dxgi.dll's PresentImpl failed: " << e.what() << "; D3D11 frames are copied before Present";
-      } catch (...) {
-        BOOST_LOG(warning) << "Game capture: resolving dxgi.dll's PresentImpl failed; D3D11 frames are copied before Present";
-      }
-    }).detach();
+    try {
+      std::thread([] {
+        try {
+          resolve();
+        } catch (const std::exception &e) {
+          BOOST_LOG(warning) << "Game capture: resolving dxgi.dll's PresentImpl failed: " << e.what() << "; D3D11 frames are copied before Present";
+        } catch (...) {
+          BOOST_LOG(warning) << "Game capture: resolving dxgi.dll's PresentImpl failed; D3D11 frames are copied before Present";
+        }
+      }).detach();
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "Game capture: cannot start resolving dxgi.dll's PresentImpl: " << e.what() << "; D3D11 frames are copied before Present";
+    }
   }
 
   std::optional<dxgi_symbols_t> dxgi_symbols() {
