@@ -297,6 +297,16 @@ namespace platf::dxgi::game_capture {
       return block->magic == gc::kMagic && block->version == gc::kVersion;
     }
 
+    // Hands the hook the address of dxgi!CDXGISwapChain::PresentImpl, once the
+    // host has resolved it (dxgi_symbols.h); nothing until then
+    void publish_dxgi_symbols(gc::shared_block_t *block) {
+      if (const auto symbols = gc::dxgi_symbols(); symbols && block->dxgi_present_impl_rva.load(std::memory_order_relaxed) == 0) {
+        block->dxgi_timestamp.store(symbols->timestamp, std::memory_order_relaxed);
+        block->dxgi_image_size.store(symbols->image_size, std::memory_order_relaxed);
+        block->dxgi_present_impl_rva.store(symbols->present_impl_rva, std::memory_order_release);
+      }
+    }
+
     bool inject(HANDLE process, const std::wstring &dll, std::string &error) {
       if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
         error = "hook DLL not found";
@@ -516,18 +526,8 @@ namespace platf::dxgi::game_capture {
     }
   };
 
-  // Hands the hook the address of dxgi!CDXGISwapChain::PresentImpl, once the
-  // host has resolved it (dxgi_symbols.h); nothing until then
-  void publish_dxgi_symbols(gc::shared_block_t *block) {
-    if (const auto symbols = dxgi_symbols(); symbols && block->dxgi_present_impl_rva.load(std::memory_order_relaxed) == 0) {
-      block->dxgi_timestamp.store(symbols->timestamp, std::memory_order_relaxed);
-      block->dxgi_image_size.store(symbols->image_size, std::memory_order_relaxed);
-      block->dxgi_present_impl_rva.store(symbols->present_impl_rva, std::memory_order_release);
-    }
-  }
-
   source_t::source_t(ID3D11Device *device) {
-    start_dxgi_symbol_resolution();
+    gc::start_dxgi_symbol_resolution();
     {
       std::lock_guard lg(g_instances_lock);
       _instance_id = (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32) | ++g_next_instance;
