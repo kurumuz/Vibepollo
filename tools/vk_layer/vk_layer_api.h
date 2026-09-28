@@ -31,7 +31,7 @@
 
 namespace vvk {
 
-  constexpr std::uint32_t kApiVersion = 2;
+  constexpr std::uint32_t kApiVersion = 3;
   constexpr const wchar_t *kModuleName = L"vibepollo_vk_layer.dll";
   constexpr const char *kEntryPoint = "vibepollo_vk_api";
 
@@ -84,8 +84,10 @@ namespace vvk {
     /// `*waits` set (an array the hook owns, valid until post_present) to
     /// have the layer forward those instead.
     bool (*pre_present)(void *ctx, const present_t &present, std::uint32_t *wait_count, const VkSemaphore **waits);
-    /// After forwarding, with its result (always called if pre_present was)
-    void (*post_present)(void *ctx, const present_t &present, VkResult result);
+    /// After forwarding, with its result (always called if pre_present
+    /// was); returns the result the application gets (the hook may turn a
+    /// failure it could not undo into one the application cannot retry)
+    VkResult (*post_present)(void *ctx, const present_t &present, VkResult result);
     /// Before the swapchain is destroyed: the hook finishes with its images
     void (*swapchain_destroyed)(void *ctx, const device_t &device, VkSwapchainKHR swapchain);
     /// Before the device is destroyed: the hook releases everything it made on it

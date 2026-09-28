@@ -130,9 +130,9 @@ namespace game_capture {
   }
 
   void ensure_vk_layer_registered() {
-    if (!g_done.load()) {
-      sync_vk_layer_registration(true);
-    }
+    // (checked again at every capture start: another layer registered
+    // since, an update re-registering Steam's say, moves ours back to the end)
+    sync_vk_layer_registration(true);
   }
 
 }  // namespace game_capture

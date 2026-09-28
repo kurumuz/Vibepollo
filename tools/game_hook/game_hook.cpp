@@ -2886,6 +2886,7 @@ namespace {
     std::vector<VkFence> fences;
     std::vector<VkCommandPool> pools;
     std::vector<VkSemaphore> semaphores;
+    std::vector<ID3D11Texture2D *> textures;  // pinned for global-handle imports (released after the images)
   };
 
   struct vk_state_t {
@@ -2901,6 +2902,9 @@ namespace {
     VkDeviceMemory memory[gc::kSlots] = {};
     bool acquired_once[gc::kSlots] = {};  // the image went through its first (discarding) acquisition
     ID3D11Texture2D *imported_from[gc::kSlots] = {};  // (identity: which texture set the images alias)
+    // A global-handle import does not keep the texture alive: we do, until
+    // the image is destroyed (NT imports hold a reference of their own)
+    ID3D11Texture2D *pinned[gc::kSlots] = {};
     std::vector<VkSemaphore> present_waits;  // one per swapchain image, signalled by our copy, waited by the Present
     VkFormat vk_format = VK_FORMAT_UNDEFINED;
     VkExternalMemoryHandleTypeFlagBits handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
@@ -2931,6 +2935,7 @@ namespace {
   // Fence values: handed out by vk_pre_present, never reused (a stale
   // completion event of an earlier device cannot vouch for a newer copy)
   std::atomic<std::uint64_t> g_vk_next_value {0};
+  std::atomic<VkDevice> g_vk_current_device {VK_NULL_HANDLE};  // the device captured on now (a loss of another says nothing about this one's copies)
 
   DWORD WINAPI vk_waiter_main(void *) {
     for (;;) {
@@ -2962,9 +2967,9 @@ namespace {
             Sleep(10);  // (out of memory: the copy is not finished, try again)
           }
         }
-        if (lost) {
+        if (lost && p.device == g_vk_current_device.load(std::memory_order_acquire)) {
           g_vk_completed.store(UINT64_MAX, std::memory_order_release);  // (nothing more completes)
-        } else {
+        } else if (!lost) {
           auto done = g_vk_completed.load(std::memory_order_relaxed);
           while (done != UINT64_MAX && done < p.value && !g_vk_completed.compare_exchange_weak(done, p.value, std::memory_order_acq_rel)) {
           }
@@ -3031,6 +3036,9 @@ namespace {
     for (VkSemaphore s : l.semaphores) {
       l.fn.DestroySemaphore(l.device, s, nullptr);
     }
+    for (ID3D11Texture2D *t : l.textures) {
+      t->Release();
+    }
     l = vk_leftovers_t {};
   }
 
@@ -3059,7 +3067,12 @@ namespace {
           if (v.fence[i]) {
             v.fn.DestroyFence(v.dev.device, v.fence[i], nullptr);
           }
+          safe_release(v.pinned[i]);
         } else if (left) {
+          if (v.pinned[i]) {
+            left->textures.push_back(v.pinned[i]);
+            v.pinned[i] = nullptr;
+          }
           if (v.image[i]) {
             left->images.push_back(v.image[i]);
           }
@@ -3084,6 +3097,7 @@ namespace {
     if (!idle) {
       log("Vulkan: copies still in flight after 2 s; their objects wait for the device's end");
     }
+    g_vk_current_device.store(VK_NULL_HANDLE, std::memory_order_release);
     if (device_gone) {
       for (auto it = g_vk_leftovers.begin(); it != g_vk_leftovers.end(); ++it) {
         if (it->device == v.dev.device) {
@@ -3155,14 +3169,21 @@ namespace {
     return module ? reinterpret_cast<F>(reinterpret_cast<void *>(GetProcAddress(module, name))) : nullptr;
   }
 
+  enum class vk_setup_e {
+    ok,
+    transient,  ///< may work on a later Present
+    permanent,  ///< this device cannot be captured
+  };
+
   // Our D3D11 device on the Vulkan device's adapter, the objects the copies
-  // need and which handle kind Vulkan can import. Capture lock held.
-  bool vk_setup(const vvk::present_t &p, HWND hwnd, std::string &why) {
+  // need and which handle kind Vulkan can import. All or nothing: the
+  // capture is installed only once everything exists. Capture lock held.
+  vk_setup_e vk_setup(const vvk::present_t &p, HWND hwnd, char (&why)[160]) {
     auto &v = g_vk;
     const auto &d = *p.device;
     if (!d.external_memory_win32 || d.api_version < VK_API_VERSION_1_1) {
-      why = "the device has no VK_KHR_external_memory_win32 or is older than Vulkan 1.1";
-      return false;
+      std::snprintf(why, sizeof(why), "the device has no VK_KHR_external_memory_win32 or is older than Vulkan 1.1");
+      return vk_setup_e::permanent;
     }
     vk_fn_t fn;
     bool all = true;
@@ -3196,8 +3217,8 @@ namespace {
     const auto format_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(d.next_gipa(d.instance, "vkGetPhysicalDeviceImageFormatProperties2"));
     const auto memory_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(d.next_gipa(d.instance, "vkGetPhysicalDeviceMemoryProperties"));
     if (!all || !props2 || !format_props2 || !memory_properties) {
-      why = "a Vulkan function the copy needs is missing";
-      return false;
+      std::snprintf(why, sizeof(why), "a Vulkan function the copy needs is missing");
+      return vk_setup_e::permanent;
     }
 
     // The adapter: D3D11 textures must live on the GPU that copies into them
@@ -3208,8 +3229,8 @@ namespace {
     props.pNext = &id;
     props2(d.physical_device, &props);
     if (!id.deviceLUIDValid) {
-      why = "the device reports no adapter LUID";
-      return false;
+      std::snprintf(why, sizeof(why), "the device reports no adapter LUID");
+      return vk_setup_e::permanent;
     }
     LUID luid;
     std::memcpy(&luid, id.deviceLUID, sizeof(luid));
@@ -3218,8 +3239,8 @@ namespace {
     DXGI_FORMAT dxgi = DXGI_FORMAT_UNKNOWN;
     VkFormat unorm = VK_FORMAT_UNDEFINED;
     if (!vk_formats(p.swapchain->format, dxgi, unorm)) {
-      why = "the swapchain format has no D3D11 equivalent the host reads";
-      return false;
+      std::snprintf(why, sizeof(why), "swapchain format %d has no D3D11 equivalent the host reads", static_cast<int>(p.swapchain->format));
+      return vk_setup_e::transient;  // (another swapchain may be fine)
     }
     auto importable = [&](VkExternalMemoryHandleTypeFlagBits type) {
       VkPhysicalDeviceExternalImageFormatInfo ext {};
@@ -3243,8 +3264,8 @@ namespace {
     const bool nt = importable(VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT);
     const bool kmt = importable(VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT);
     if (!nt && !kmt) {
-      why = "the device cannot import D3D11 textures";
-      return false;
+      std::snprintf(why, sizeof(why), "the device cannot import D3D11 textures of format %d", static_cast<int>(unorm));
+      return vk_setup_e::transient;
     }
 
     // Our D3D11 device (it only creates the shared textures)
@@ -3252,8 +3273,8 @@ namespace {
     const auto create_factory = system_function<create_factory_fn>(L"dxgi.dll", "CreateDXGIFactory1");
     const auto create_device = system_function<PFN_D3D11_CREATE_DEVICE>(L"d3d11.dll", "D3D11CreateDevice");
     if (!create_factory || !create_device) {
-      why = "Windows' d3d11.dll or dxgi.dll could not be loaded";
-      return false;
+      std::snprintf(why, sizeof(why), "Windows' d3d11.dll or dxgi.dll could not be loaded");
+      return vk_setup_e::permanent;
     }
     IDXGIFactory4 *factory = nullptr;
     IDXGIAdapter *adapter = nullptr;
@@ -3268,13 +3289,51 @@ namespace {
     safe_release(adapter);
     safe_release(factory);
     if (FAILED(hr)) {
-      char msg[96];
-      std::snprintf(msg, sizeof(msg), "no D3D11 device on the Vulkan device's adapter (0x%08lx)", hr);
-      why = msg;
-      return false;
+      std::snprintf(why, sizeof(why), "no D3D11 device on the Vulkan device's adapter (0x%08lx)", hr);
+      return vk_setup_e::transient;
     }
 
-    // The capture itself: our device is the one textures are made on
+    // The copy's objects, into locals first
+    VkCommandPool pool_handle = VK_NULL_HANDLE;
+    VkCommandBuffer cmd[gc::kSlots] = {};
+    VkFence fences[gc::kSlots] = {};
+    VkCommandPoolCreateInfo pool {};
+    pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool.queueFamilyIndex = p.queue_family;
+    VkResult r = fn.CreateCommandPool(d.device, &pool, nullptr, &pool_handle);
+    if (r == VK_SUCCESS) {
+      VkCommandBufferAllocateInfo alloc {};
+      alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+      alloc.commandPool = pool_handle;
+      alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+      alloc.commandBufferCount = gc::kSlots;
+      r = fn.AllocateCommandBuffers(d.device, &alloc, cmd);
+    }
+    for (int i = 0; i < gc::kSlots && r == VK_SUCCESS; ++i) {
+      // Command buffers are dispatchable: the loader sets the device's
+      // dispatch table in those the application allocates; ours come from
+      // below it, so we set it (as the layer interface documents)
+      *reinterpret_cast<void **>(cmd[i]) = *reinterpret_cast<void **>(d.device);
+      VkFenceCreateInfo fence {};
+      fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+      r = fn.CreateFence(d.device, &fence, nullptr, &fences[i]);
+    }
+    if (r != VK_SUCCESS) {
+      for (VkFence f : fences) {
+        if (f) {
+          fn.DestroyFence(d.device, f, nullptr);
+        }
+      }
+      if (pool_handle) {
+        fn.DestroyCommandPool(d.device, pool_handle, nullptr);
+      }
+      device->Release();
+      std::snprintf(why, sizeof(why), "creating the copy's command objects failed (%d)", static_cast<int>(r));
+      return vk_setup_e::transient;
+    }
+
+    // Commit: the capture is ours, on our device
     const auto identity = reinterpret_cast<IDXGISwapChain *>(p.swapchain->swapchain);
     release_capture(hwnd);
     g_cap.api = gc::api_e::vulkan;
@@ -3285,6 +3344,7 @@ namespace {
     g_cap.owner_thread = GetCurrentThreadId();
     g_cap.single_threaded = false;
 
+    v = vk_state_t {};
     v.dev = d;
     v.fn = fn;
     v.memory_properties = memory_properties;
@@ -3293,46 +3353,21 @@ namespace {
     v.vk_format = unorm;
     v.handle_type = nt ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT : VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
     v.kmt_importable = kmt;
+    v.pool = pool_handle;
+    for (int i = 0; i < gc::kSlots; ++i) {
+      v.cmd[i] = cmd[i];
+      v.fence[i] = fences[i];
+    }
+    g_vk_current_device.store(d.device, std::memory_order_release);
     // A device lost earlier left the completed value at "everything": what
     // this one submits starts from where the values are now
     if (g_vk_completed.load(std::memory_order_acquire) == UINT64_MAX) {
       g_vk_completed.store(g_vk_next_value.load(std::memory_order_acquire), std::memory_order_release);
     }
-
-    VkCommandPoolCreateInfo pool {};
-    pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pool.queueFamilyIndex = p.queue_family;
-    VkResult r = fn.CreateCommandPool(d.device, &pool, nullptr, &v.pool);
-    if (r == VK_SUCCESS) {
-      VkCommandBufferAllocateInfo alloc {};
-      alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-      alloc.commandPool = v.pool;
-      alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-      alloc.commandBufferCount = gc::kSlots;
-      r = fn.AllocateCommandBuffers(d.device, &alloc, v.cmd);
-    }
-    for (int i = 0; i < gc::kSlots && r == VK_SUCCESS; ++i) {
-      // Command buffers are dispatchable: the loader sets the device's
-      // dispatch table in those the application allocates; ours come from
-      // below it, so we set it (as the layer interface documents)
-      *reinterpret_cast<void **>(v.cmd[i]) = *reinterpret_cast<void **>(d.device);
-      VkFenceCreateInfo fence {};
-      fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-      r = fn.CreateFence(d.device, &fence, nullptr, &v.fence[i]);
-    }
-    if (r != VK_SUCCESS) {
-      char msg[96];
-      std::snprintf(msg, sizeof(msg), "creating the copy's command objects failed (%d)", static_cast<int>(r));
-      why = msg;
-      vk_release(false);
-      release_capture(hwnd);
-      return false;
-    }
     log("Vulkan: capturing swapchain 0x%llx (%ux%u, format %d, colour space %d) on queue family %u; D3D11 textures imported as %s handles",
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(p.swapchain->swapchain)), p.swapchain->extent.width, p.swapchain->extent.height,
         static_cast<int>(p.swapchain->format), static_cast<int>(p.swapchain->color_space), p.queue_family, nt ? "NT" : "global");
-    return true;
+    return vk_setup_e::ok;
   }
 
   // The slot's texture as a Vulkan image (imported once per texture set).
@@ -3348,6 +3383,7 @@ namespace {
       v.image[slot] = VK_NULL_HANDLE;
       v.memory[slot] = VK_NULL_HANDLE;
     }
+    safe_release(v.pinned[slot]);
     v.acquired_once[slot] = false;
     v.imported_from[slot] = nullptr;
     const HANDLE handle = v.handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT ? g_cap.shared_handles[slot] : reinterpret_cast<HANDLE>(g_cap.legacy_handles[slot]);
@@ -3438,6 +3474,10 @@ namespace {
     v.image[slot] = image;
     v.memory[slot] = memory;
     v.imported_from[slot] = g_cap.textures[slot];
+    if (v.handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT) {
+      g_cap.textures[slot]->AddRef();
+      v.pinned[slot] = g_cap.textures[slot];
+    }
     return true;
   }
 
@@ -3463,9 +3503,12 @@ namespace {
   thread_local PFN_vkQueueSubmit t_vk_submit = nullptr;  // set when our copy consumed the Present's waits
 
   bool vk_pre_present_impl(const vvk::present_t &p, std::uint32_t *wait_count, const VkSemaphore **waits) {
-    t_vk_submit = nullptr;
-    if (!g_block || !p.swapchain || !p.swapchain->hwnd || p.swapchain_slot != 0) {
+    if (p.swapchain_slot != 0) {
       return false;  // (a Present of several swapchains: the first is the one captured)
+    }
+    t_vk_submit = nullptr;
+    if (!g_block || !p.swapchain || !p.swapchain->hwnd) {
+      return false;
     }
     const auto now = qpc_now();
     const auto identity = reinterpret_cast<IDXGISwapChain *>(p.swapchain->swapchain);
@@ -3544,17 +3587,33 @@ namespace {
     }
 
     auto &v = g_vk;
-    static bool unsupported = false;
-    if (unsupported) {
-      return false;
+    // Swapchains and devices that failed: not tried again (a permanent
+    // device-level failure also tells the host, which then uses desktop capture)
+    static VkDevice rejected_device = VK_NULL_HANDLE;
+    static VkSwapchainKHR rejected_swapchain = VK_NULL_HANDLE;
+    static std::uint64_t retry_after = 0;
+    if (p.device->device == rejected_device || p.swapchain->swapchain == rejected_swapchain) {
+      if (p.device->device == rejected_device || now < retry_after) {
+        return false;
+      }
+      rejected_swapchain = VK_NULL_HANDLE;  // (a transient failure: tried again every few seconds)
     }
     if (g_cap.api != gc::api_e::vulkan || v.dev.device != p.device->device || v.swapchain != p.swapchain->swapchain || v.family != p.queue_family ||
         !g_cap.device) {
       vk_release(false);  // (another swapchain, device or queue family: its objects start over)
-      std::string why;
-      if (!vk_setup(p, hwnd, why)) {
-        unsupported = true;
-        set_state(gc::hook_state_e::unsupported, ("Vulkan: " + why).c_str());
+      char why[160] = {};
+      const auto setup = vk_setup(p, hwnd, why);
+      if (setup != vk_setup_e::ok) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg), "Vulkan: %s", why);
+        if (setup == vk_setup_e::permanent) {
+          rejected_device = p.device->device;
+          set_state(gc::hook_state_e::unsupported, msg);
+        } else {
+          rejected_swapchain = p.swapchain->swapchain;
+          retry_after = now + 5 * qpc_frequency();
+          log("%s; trying again in 5 s", msg);
+        }
         return false;
       }
     }
@@ -3570,6 +3629,10 @@ namespace {
     back.Format = dxgi;
     back.SampleDesc.Count = 1;
     if (!ensure_textures(back, hwnd, v.handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT ? sharing_e::owner_nt : sharing_e::owner_kmt)) {
+      if (v.handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT && v.kmt_importable) {
+        log("Vulkan: NT-handle textures could not be created; switching to global handles");
+        v.handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+      }
       return false;
     }
     if (v.present_waits.size() != p.swapchain->image_count) {
@@ -3610,8 +3673,9 @@ namespace {
         v.handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
         retire_generation(hwnd);
       } else {
-        unsupported = true;
-        set_state(gc::hook_state_e::unsupported, "Vulkan: the capture textures cannot be imported");
+        rejected_swapchain = p.swapchain->swapchain;
+        retry_after = now + 5 * qpc_frequency();
+        log("Vulkan: the capture textures cannot be imported; trying again in 5 s");
       }
       return false;
     }
@@ -3707,9 +3771,9 @@ namespace {
     }
   }
 
-  void vk_post_present(void *, const vvk::present_t &p, VkResult result) {
+  VkResult vk_post_present(void *, const vvk::present_t &p, VkResult result) {
     if (p.swapchain_slot != 0) {
-      return;
+      return result;
     }
     // A Present that failed for lack of memory was not queued: it waited on
     // nothing, so our semaphore is still signalled and the application's
@@ -3725,18 +3789,22 @@ namespace {
       restore.signalSemaphoreCount = p.info->waitSemaphoreCount;
       restore.pSignalSemaphores = p.info->pWaitSemaphores;
       if (t_vk_submit(p.queue, 1, &restore, VK_NULL_HANDLE) != VK_SUCCESS) {
-        log("Vulkan: the Present failed (%d) and its semaphores could not be handed back", static_cast<int>(result));
+        // Its waits are gone for good: a retry would wait forever, so the
+        // application is told what it cannot retry
+        log("Vulkan: the Present failed (%d) and its semaphores could not be handed back: reporting the device lost", static_cast<int>(result));
+        result = VK_ERROR_DEVICE_LOST;
       }
     }
     t_vk_submit = nullptr;
     if (!g_block || !t_vk_paced) {
-      return;
+      return result;
     }
     t_vk_paced = false;
     if (result >= 0) {
       limiter_wait(t_vk_period);
     }
     limiter_give_back();
+    return result;
   }
 
   void vk_swapchain_destroyed(void *, const vvk::device_t &device, VkSwapchainKHR swapchain) {

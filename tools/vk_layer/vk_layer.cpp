@@ -104,6 +104,7 @@ namespace {
     instance_t *instance = nullptr;
     std::vector<VkQueueFamilyProperties> families;
     bool view_usage_info = false;  ///< VkImageViewUsageCreateInfo may be chained (1.1 or VK_KHR_maintenance2)
+    bool device_group = false;  ///< created over several physical devices (the copy submits for device 0 only)
     PFN_vkDestroyDevice DestroyDevice = nullptr;
     PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
     PFN_vkGetDeviceQueue2 GetDeviceQueue2 = nullptr;
@@ -338,6 +339,11 @@ namespace {
       rec->pub.api_version = api;
       rec->pub.external_memory_win32 = external_memory_win32;
       rec->view_usage_info = api >= VK_API_VERSION_1_1 || has_extension(info, VK_KHR_MAINTENANCE_2_EXTENSION_NAME);
+      for (auto *p = static_cast<const VkBaseInStructure *>(info->pNext); p; p = p->pNext) {
+        if (p->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO && reinterpret_cast<const VkDeviceGroupDeviceCreateInfo *>(p)->physicalDeviceCount > 1) {
+          rec->device_group = true;
+        }
+      }
       if (inst && inst->GetPhysicalDeviceQueueFamilyProperties) {
         std::uint32_t count = 0;
         inst->GetPhysicalDeviceQueueFamilyProperties(physical, &count, nullptr);
@@ -444,7 +450,7 @@ namespace {
       return false;
     }
     constexpr VkSwapchainCreateFlagsKHR unhandled = VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR | VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
-    if ((info->flags & unhandled) || info->imageArrayLayers != 1 ||
+    if (rec->device_group || (info->flags & unhandled) || info->imageArrayLayers != 1 ||
         info->presentMode == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR || info->presentMode == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR) {
       return false;
     }
@@ -479,10 +485,16 @@ namespace {
       query.flags = flags;
       VkImageFormatProperties2 out {};
       out.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
-      return inst->GetPhysicalDeviceImageFormatProperties2(rec->pub.physical_device, &query, &out) == VK_SUCCESS;
+      if (inst->GetPhysicalDeviceImageFormatProperties2(rec->pub.physical_device, &query, &out) != VK_SUCCESS) {
+        return false;
+      }
+      props = out.imageFormatProperties;
+    } else if (!inst->GetPhysicalDeviceImageFormatProperties ||
+               inst->GetPhysicalDeviceImageFormatProperties(rec->pub.physical_device, info->imageFormat, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &props) != VK_SUCCESS) {
+      return false;
     }
-    return inst->GetPhysicalDeviceImageFormatProperties &&
-           inst->GetPhysicalDeviceImageFormatProperties(rec->pub.physical_device, info->imageFormat, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &props) == VK_SUCCESS;
+    // (supported at all is not enough: at this size, too)
+    return props.maxExtent.width >= info->imageExtent.width && props.maxExtent.height >= info->imageExtent.height && props.maxArrayLayers >= 1;
   }
 
   VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *allocator, VkSwapchainKHR *out) {
@@ -513,8 +525,10 @@ namespace {
       }
     }
 
+    // The record: images, then the maps, all or nothing
+    std::unique_ptr<swapchain_rec_t> sc;
     try {
-      auto sc = std::make_unique<swapchain_rec_t>();
+      sc = std::make_unique<swapchain_rec_t>();
       std::uint32_t count = 0;
       if (!rec->GetSwapchainImagesKHR || rec->GetSwapchainImagesKHR(device, *out, &count, nullptr) < VK_SUCCESS) {
         count = 0;
@@ -524,41 +538,74 @@ namespace {
         count = 0;
       }
       sc->images.resize(count);
-      sc->app_usage = info->imageUsage;
-      sc->pub.swapchain = *out;
-      sc->pub.format = info->imageFormat;
-      sc->pub.color_space = info->imageColorSpace;
-      sc->pub.extent = info->imageExtent;
-      sc->pub.present_mode = info->presentMode;
-      sc->pub.image_count = static_cast<std::uint32_t>(sc->images.size());
-      sc->pub.images = sc->images.data();
-      sc->pub.transfer_src = (asked || widened) && !sc->images.empty();
-      // (what may_widen accepts is exactly what the copy handles)
-      constexpr VkSwapchainCreateFlagsKHR unhandled = VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR | VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
-      sc->pub.capturable = sc->pub.transfer_src && !(info->flags & unhandled) && info->imageArrayLayers == 1 &&
-                           info->presentMode != VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR && info->presentMode != VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR;
-      exclusive_t lg(g_lock);
-      if (rec->instance) {
-        const auto it = rec->instance->surfaces.find(info->surface);
-        sc->pub.hwnd = it == rec->instance->surfaces.end() ? nullptr : it->second;
+    } catch (...) {
+      sc.reset();
+    }
+    if (widened && (!sc || sc->images.empty())) {
+      // A widened swapchain whose images we cannot track (their views
+      // need narrowing): replaced by the one the application asked for.
+      // Its creation retired oldSwapchain, which may not be named again.
+      rec->DestroySwapchainKHR(device, *out, allocator);
+      *out = VK_NULL_HANDLE;
+      VkSwapchainCreateInfoKHR plain = *info;
+      plain.oldSwapchain = VK_NULL_HANDLE;
+      result = rec->CreateSwapchainKHR(device, &plain, allocator, out);
+      if (result != VK_SUCCESS) {
+        return result;
       }
-      rec->swapchain_images.reserve(rec->swapchain_images.size() + sc->images.size());
-      rec->swapchains.reserve(rec->swapchains.size() + 1);
-      swapchain_rec_t *raw = sc.get();
-      rec->swapchains[*out] = std::move(sc);  // (no throw: reserved)
-      if (widened) {
-        for (VkImage image : raw->images) {
-          rec->swapchain_images[image] = raw;
+      widened = false;
+      sc.reset();
+    }
+    if (!sc) {
+      return VK_SUCCESS;  // (unrecorded: never captured)
+    }
+    sc->app_usage = info->imageUsage;
+    sc->pub.swapchain = *out;
+    sc->pub.format = info->imageFormat;
+    sc->pub.color_space = info->imageColorSpace;
+    sc->pub.extent = info->imageExtent;
+    sc->pub.present_mode = info->presentMode;
+    sc->pub.image_count = static_cast<std::uint32_t>(sc->images.size());
+    sc->pub.images = sc->images.data();
+    sc->pub.transfer_src = (asked || widened) && !sc->images.empty();
+    // (what may_widen accepts is exactly what the copy handles)
+    constexpr VkSwapchainCreateFlagsKHR unhandled = VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR | VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
+    sc->pub.capturable = sc->pub.transfer_src && !rec->device_group && !(info->flags & unhandled) && info->imageArrayLayers == 1 &&
+                         info->presentMode != VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR && info->presentMode != VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR;
+    swapchain_rec_t *const raw = sc.get();
+    bool recorded = false;
+    {
+      exclusive_t lg(g_lock);
+      std::size_t images_in = 0;
+      bool swapchain_in = false;
+      try {
+        if (rec->instance) {
+          const auto it = rec->instance->surfaces.find(info->surface);
+          raw->pub.hwnd = it == rec->instance->surfaces.end() ? nullptr : it->second;
+        }
+        if (widened) {
+          for (VkImage image : raw->images) {
+            rec->swapchain_images.emplace(image, raw);
+            ++images_in;
+          }
+        }
+        rec->swapchains.emplace(*out, std::move(sc));
+        swapchain_in = true;
+        recorded = true;
+      } catch (...) {
+        // Undo what went in: nothing may point at a record that is not kept
+        for (std::size_t i = 0; i < images_in; ++i) {
+          rec->swapchain_images.erase(raw->images[i]);
+        }
+        if (swapchain_in) {
+          rec->swapchains.erase(*out);
         }
       }
-    } catch (...) {
-      // A widened swapchain must be recorded (its views need narrowing);
-      // undo it rather than let it out unrecorded
-      if (widened && rec->DestroySwapchainKHR) {
-        rec->DestroySwapchainKHR(device, *out, allocator);
-        *out = VK_NULL_HANDLE;
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
-      }
+    }
+    if (!recorded && widened) {
+      rec->DestroySwapchainKHR(device, *out, allocator);
+      *out = VK_NULL_HANDLE;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     return VK_SUCCESS;
   }
@@ -733,10 +780,14 @@ namespace {
         replaced = true;
       }
     }
-    const VkResult result = rec->QueuePresentKHR(queue, &forwarded);
+    VkResult result = rec->QueuePresentKHR(queue, &forwarded);
     if (callbacks->post_present) {
+      const VkResult forwarded_result = result;
       for (std::uint32_t i = 0; i < n; ++i) {
-        callbacks->post_present(ctx, presents[i], result);
+        const VkResult r = callbacks->post_present(ctx, presents[i], forwarded_result);
+        if (r != forwarded_result) {
+          result = r;
+        }
       }
     }
     return result;
