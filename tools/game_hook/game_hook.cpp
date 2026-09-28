@@ -90,7 +90,8 @@ namespace {
   // {3b9d7e21-6c4a-4f0e-8a5d-1e7c9b2f4a63}, {5e2a8c14-9b3d-4d71-b6e0-7f4a2c9d1e85}
   constexpr GUID kQueueKey = {0x3b9d7e21, 0x6c4a, 0x4f0e, {0x8a, 0x5d, 0x1e, 0x7c, 0x9b, 0x2f, 0x4a, 0x63}};
   constexpr GUID kQueueAmbiguousKey = {0x5e2a8c14, 0x9b3d, 0x4d71, {0xb6, 0xe0, 0x7f, 0x4a, 0x2c, 0x9d, 0x1e, 0x85}};
-  // ... and in how many Presents in a row it was seen (a count)
+  // ... and which of its back buffers were seen presented from it (a bitmask
+  // of buffer indices; all ones when ResizeBuffers1 named the queues)
   // {7c1f4b9a-2e6d-4a83-9f15-3b8e6d2a7c40}
   constexpr GUID kQueueSeenKey = {0x7c1f4b9a, 0x2e6d, 0x4a83, {0x9f, 0x15, 0x3b, 0x8e, 0x6d, 0x2a, 0x7c, 0x40}};
   // ... and how its frames are copied (submit_mode_e, a count)
@@ -995,6 +996,7 @@ namespace {
   thread_local bool t_seen_contaminated = false;  // another swapchain presented inside this Present
   thread_local ID3D12CommandQueue *t_seen_dxgi_queue = nullptr;  // ... of the submissions made by dxgi.dll itself (a reference)
   thread_local bool t_seen_dxgi_several = false;
+  thread_local UINT t_present_index = UINT_MAX;  // the back buffer this Present shows, read before the real call
 
   // A recorded D3D12 copy (capture_frame12), not yet submitted. Its slot's
   // owner word is held by the hook until it is submitted or given back.
@@ -1014,8 +1016,8 @@ namespace {
   // happened before the Present; inside DXGI's call only the recorded list is
   // executed and the fence signalled.
   struct armed_capture_t {
-    bool armed = false;
-    bool boundary_seen = false;  // DXGI submitted on the copy's queue during this Present
+    bool armed = false;  // a copy was prepared this Present (stays set when it is cancelled: it still counts)
+    bool boundary_seen = false;  // DXGI submitted on the copy's queue during this Present, uncontaminated
     IDXGISwapChain *swapchain = nullptr;  // borrowed: we are inside its Present
     HWND hwnd = nullptr;
     prepared12_t prepared;  // valid until submitted or given back
@@ -1092,7 +1094,8 @@ namespace {
     log("Swapchain %p %s: not captured", static_cast<void *>(swapchain), why);
   }
 
-  // How many Presents in a row showed the stored queue (0: none stored or unreadable)
+  // Back buffers confirmed presented from the stored queue (bit per index; 0:
+  // none stored or unreadable)
   std::uint32_t queue_seen(IDXGISwapChain *swapchain) {
     std::uint32_t value = 0;
     UINT size = sizeof(value);
@@ -1193,8 +1196,11 @@ namespace {
     if (t_seen_several || (known && known != seen)) {
       veto(swapchain, "presents from more than one D3D12 queue");
     } else if (known) {
-      const auto count = queue_seen(swapchain);
-      if (count < 64 && !set_queue_seen(swapchain, count + 1)) {
+      // This Present's buffer is confirmed: DXGI itself submitted it on the
+      // queue (a swapchain may present each buffer from its own queue)
+      const auto mask = queue_seen(swapchain);
+      const auto bit = t_present_index < 32 ? 1u << t_present_index : 0u;
+      if (bit && !(mask & bit) && !set_queue_seen(swapchain, mask | bit)) {
         forget_queue(swapchain);
       }
       if (from_dxgi && submit_mode(swapchain) == submit_mode_e::before_present) {
@@ -1203,7 +1209,7 @@ namespace {
       }
     } else if (!usable_queue(swapchain, seen)) {
       veto(swapchain, "presents from a D3D12 queue of another device or node");
-    } else if (!remember_queue(swapchain, seen, 1, from_dxgi ? "DXGI's own submission inside Present" : "seen inside Present")) {
+    } else if (!remember_queue(swapchain, seen, t_present_index < 32 ? 1u << t_present_index : 0u, "DXGI's own submission inside Present")) {
       forget_queue(swapchain);
     }
     safe_release(known);
@@ -1253,7 +1259,12 @@ namespace {
     safe_release(queue);
   }
 
+  // A prepared copy references the swapchain's current buffers: a resize
+  // (an overlay may resize from its own Present hook, inside ours) voids it
+  void cancel_prepared_for(IDXGISwapChain *swapchain);
+
   HRESULT STDMETHODCALLTYPE hook_resize_buffers(IDXGISwapChain *swapchain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
+    cancel_prepared_for(swapchain);
     const HRESULT hr = g_real_resize_buffers(swapchain, count, width, height, format, flags);
     if (SUCCEEDED(hr)) {
       note_resize(swapchain, 0, nullptr);
@@ -1263,6 +1274,7 @@ namespace {
 
   HRESULT STDMETHODCALLTYPE hook_resize_buffers1(IDXGISwapChain3 *swapchain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags,
                                                  const UINT *node_masks, IUnknown *const *queues) {
+    cancel_prepared_for(swapchain);
     const HRESULT hr = g_real_resize_buffers1(swapchain, count, width, height, format, flags, node_masks, queues);
     if (SUCCEEDED(hr)) {
       note_resize(swapchain, count, queues);
@@ -1410,7 +1422,7 @@ namespace {
   }
 
   // Capture lock held. `device` is the swapchain's (borrowed).
-  void submit12(const prepared12_t &p, IDXGISwapChain *swapchain, HWND hwnd);
+  void submit12(const prepared12_t &p, IDXGISwapChain *swapchain, HWND hwnd, bool inside_dxgi = false);
 
   // Records the copy of the current back buffer and, without `prepare`,
   // submits it at once; with it, leaves the recorded copy there (valid on
@@ -1450,8 +1462,17 @@ namespace {
     ID3D12CommandQueue *queue = known_queue(swapchain);
     if (queue) {
       DXGI_SWAP_CHAIN_DESC desc {};
-      if (FAILED(swapchain->GetDesc(&desc)) || queue_seen(swapchain) < std::max<UINT>(desc.BufferCount, 1)) {
-        safe_release(queue);  // not yet seen once per buffer
+      // Only a back buffer DXGI was seen presenting from this queue is copied
+      // on it (the others may belong to a queue we cannot see)
+      IDXGISwapChain3 *swapchain3 = nullptr;
+      UINT current = UINT_MAX;
+      if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
+        current = swapchain3->GetCurrentBackBufferIndex();
+        swapchain3->Release();
+      }
+      const auto mask = queue_seen(swapchain);
+      if (FAILED(swapchain->GetDesc(&desc)) || current >= 32 || !(mask & (1u << current))) {
+        safe_release(queue);  // not yet confirmed for this buffer
       }
     }
     if (!queue) {
@@ -1549,7 +1570,9 @@ namespace {
   // Executes a recorded copy on its queue and signals our fence; the slot
   // publishes on completion. Capture lock held; `p` recorded against the
   // current g_cap (checked by the caller).
-  void submit12(const prepared12_t &p, IDXGISwapChain *swapchain, HWND hwnd) {
+  // (inside_dxgi: called from within DXGI's own submission, where nothing may
+  // be created or released; cleanup then waits for the next capture pass)
+  void submit12(const prepared12_t &p, IDXGISwapChain *swapchain, HWND hwnd, bool inside_dxgi) {
     const int slot = p.slot;
     auto *list = p.list;
     const auto generation = p.generation;
@@ -1569,7 +1592,9 @@ namespace {
       g_cap.list_fence[slot] = fence_value;
       g_cap.highest_fence_value_used = fence_value;
       g_d3d12_dead.store(true, std::memory_order_release);
-      release_capture(hwnd);
+      if (!inside_dxgi) {
+        release_capture(hwnd);  // (otherwise the next capture pass does, on seeing g_d3d12_dead)
+      }
       char msg[80];
       std::snprintf(msg, sizeof(msg), "D3D12 Signal failed: 0x%08lx; capture stopped", signalled);
       set_state(gc::hook_state_e::failed, msg);
@@ -1599,25 +1624,52 @@ namespace {
     t_armed = armed_capture_t {};
   }
 
+  void cancel_prepared_for(IDXGISwapChain *swapchain) {
+    if (t_presenting) {
+      t_seen_contaminated = true;  // a Present that resizes teaches nothing about its (old) buffers
+    }
+    IUnknown *a = nullptr, *b = nullptr;
+    if (!t_armed.prepared.valid || !t_armed.swapchain) {
+      return;
+    }
+    t_armed.swapchain->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void **>(&a));
+    swapchain->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void **>(&b));
+    if (a && a == b) {
+      give_back_prepared(t_armed.prepared);
+      log("Swapchain %p resized inside its Present: the frame's copy was dropped", static_cast<void *>(swapchain));
+    }
+    safe_release(a);
+    safe_release(b);
+  }
+
   // From the ExecuteCommandLists detour: dxgi.dll submits on the armed copy's
   // queue inside the real Present. The copy goes ahead of it, unless another
   // swapchain's Present intervened or the capture changed since recording.
   void run_armed_capture(ID3D12CommandQueue *queue) {
-    t_armed.boundary_seen = true;
     auto &p = t_armed.prepared;
-    if (!p.valid || t_seen_contaminated) {
+    if (t_seen_contaminated) {
+      give_back_prepared(p);  // (another swapchain's submission: no boundary of ours)
+      return;
+    }
+    t_armed.boundary_seen = true;
+    if (!p.valid) {
+      return;
+    }
+    // Never wait inside DXGI: a capture elsewhere holding the lock costs
+    // this frame, not a stall
+    struct lock_t {
+      bool held = TryAcquireSRWLockExclusive(&g_capture_lock);
+
+      ~lock_t() {
+        if (held) {
+          ReleaseSRWLockExclusive(&g_capture_lock);
+        }
+      }
+    } lock;
+    if (!lock.held) {
       give_back_prepared(p);
       return;
     }
-    struct lock_t {
-      lock_t() {
-        AcquireSRWLockExclusive(&g_capture_lock);
-      }
-
-      ~lock_t() {
-        ReleaseSRWLockExclusive(&g_capture_lock);
-      }
-    } lock;
     const bool current = g_cap.api == gc::api_e::d3d12 && g_cap.swapchain == t_armed.swapchain && g_cap.queue == queue &&
                          g_cap.fence12 == p.fence && g_cap.lists[p.slot] == p.list &&
                          g_current_generation.load(std::memory_order_acquire) == p.generation && reserve_retirement();
@@ -1627,7 +1679,7 @@ namespace {
     }
     const prepared12_t submitting = p;
     p.valid = false;  // (consumed, whatever submit12 does)
-    submit12(submitting, t_armed.swapchain, t_armed.hwnd);
+    submit12(submitting, t_armed.swapchain, t_armed.hwnd, true);
   }
 
   // After the real Present. A Present that showed DXGI's submission on the
@@ -2044,6 +2096,21 @@ namespace {
       }
     } give_back {paced};
 
+    // Armed copies are settled in the observation scope below; this covers an
+    // exception between arming (in capture_frame) and entering it
+    struct armed_guard_t {
+      ~armed_guard_t() {
+        disarm_capture();
+      }
+    } armed_guard;
+
+    // The back buffer this Present shows (queue learning confirms per buffer)
+    t_present_index = UINT_MAX;
+    if (IDXGISwapChain3 *swapchain3 = nullptr; SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
+      t_present_index = swapchain3->GetCurrentBackBufferIndex();
+      swapchain3->Release();
+    }
+
     capture_frame(swapchain, now, release);
 
     // Paced, the game must not also wait for the host display's vblank. For
@@ -2110,7 +2177,7 @@ namespace {
     swapchain->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void **>(&inner));
     if (!outer || outer != inner) {
       t_seen_contaminated = true;
-      disarm_capture();  // its DXGI submission must not carry our copy
+      give_back_prepared(t_armed.prepared);  // its DXGI submission must not carry our copy (the attempt still counts)
     }
     safe_release(outer);
     safe_release(inner);
