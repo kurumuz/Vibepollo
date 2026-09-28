@@ -1860,6 +1860,7 @@ namespace {
   };
 
   thread_local armed11_t t_armed11;
+  thread_local int t_nested_presents = 0;  // public Presents re-entered inside the outermost one (an overlay's test Present, say)
 
   void give_back_prepared11(prepared11_t &p) {
     if (!p.valid) {
@@ -1920,14 +1921,18 @@ namespace {
 
   // In `image` (dxgi.dll's file, laid out as loaded), the one direct call to
   // `target` within [begin, end): the RVA the call returns to, or 0
-  std::uint32_t single_call_to(const std::uint8_t *image, std::uint32_t begin, std::uint32_t end, std::uint32_t target, const char *what) {
+  std::uint32_t single_call_to(const std::uint8_t *image, std::uint32_t image_size, std::uint32_t begin, std::uint32_t end, std::uint32_t target, const char *what) {
     std::uint32_t found = 0;
     int count = 0;
+    if (end > image_size || end - begin < 5 || image_size - end < 16) {
+      log("PresentImpl: %s's extent (+0x%x..+0x%x) is not within the image", what, begin, end);
+      return 0;
+    }
     for (std::uint32_t at = begin; at < end;) {
       hde64s hs {};
       const unsigned len = hde64_disasm(image + at, &hs);
-      if ((hs.flags & F_ERROR) || len == 0) {
-        log("PresentImpl: an instruction of %s at +0x%x could not be decoded", what, at);
+      if ((hs.flags & F_ERROR) || len == 0 || at + len > end) {
+        log("PresentImpl: an instruction of %s at +0x%x could not be decoded within the function", what, at);
         return 0;
       }
       if (hs.opcode == 0xE8 && len == 5 &&
@@ -2023,14 +2028,14 @@ namespace {
           present_rva, present1_rva, rva, fallback);
       return;
     }
-    const auto ret0 = single_call_to(image, pb, pe, rva, "Present");
-    const auto ret1 = single_call_to(image, p1b, p1e, rva, "Present1");
+    const auto ret0 = single_call_to(image, image_size, pb, pe, rva, "Present");
+    const auto ret1 = single_call_to(image, image_size, p1b, p1e, rva, "Present1");
     if (!ret0 || !ret1) {
       log("PresentImpl: %s", fallback);
       return;
     }
     // Its entry must be DXGI's own code (nothing else detoured it)
-    if (ie - ib < 16 || std::memcmp(base + ib, image + ib, 16) != 0) {
+    if (ie > image_size || ie - ib < 16 || std::memcmp(base + ib, image + ib, 16) != 0) {
       log("PresentImpl: its code in memory differs from dxgi.dll on disk (detoured by something else?); %s", fallback);
       return;
     }
@@ -2050,7 +2055,10 @@ namespace {
 
   // Whether this swapchain's D3D11 frames are copied at the boundary
   bool late_copy11(IDXGISwapChain *swapchain) {
-    if (!g_present_impl_ready.load(std::memory_order_acquire) || g_submit_mode_broken.load(std::memory_order_acquire)) {
+    // (the prepared copy holds a back-buffer reference across the overlay
+    // chain: a resize made there must reach our ResizeBuffers detours)
+    if (!g_present_impl_ready.load(std::memory_order_acquire) || g_submit_mode_broken.load(std::memory_order_acquire) ||
+        !g_real_resize_buffers || !g_real_resize_buffers1) {
       return false;
     }
     const auto mode = static_cast<submit_mode_e>(swapchain_count(swapchain, kSubmitModeKey) & 0xff);
@@ -2232,7 +2240,11 @@ namespace {
   }
 
   HRESULT WINAPI hook_present_impl(void *self, const void *args, UINT dirty_count, const RECT *dirty_rects, UINT scroll_count, const void *scroll_rects, IUnknown *resource) {
-    if (t_armed11.armed && t_presenting && self == static_cast<void *>(t_armed11.swapchain)) {
+    // Ours: the outermost Present's own call (a Present re-entered through
+    // the public entry inside it, an overlay's test Present of the same
+    // swapchain, must not take the copy), of the whole back buffer
+    if (t_armed11.armed && t_presenting && t_nested_presents == 0 && self == static_cast<void *>(t_armed11.swapchain) &&
+        dirty_count == 0 && scroll_count == 0 && resource == nullptr) {
       void *const from = __builtin_return_address(0);
       if (from == g_present_impl_return[0] || from == g_present_impl_return[1]) {
         run_armed_capture11();
@@ -2597,7 +2609,10 @@ namespace {
   HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags) {
     if (t_in_present) {
       note_nested(swapchain);
-      return g_real_present(swapchain, sync_interval, flags);
+      ++t_nested_presents;
+      const HRESULT hr = g_real_present(swapchain, sync_interval, flags);
+      --t_nested_presents;
+      return hr;
     }
     in_present_t in_present;
     return present_with_capture(swapchain, sync_interval, flags, false, [&](UINT interval) {
@@ -2608,7 +2623,10 @@ namespace {
   HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swapchain, UINT sync_interval, UINT flags, const DXGI_PRESENT_PARAMETERS *params) {
     if (t_in_present) {
       note_nested(swapchain);
-      return g_real_present1(swapchain, sync_interval, flags, params);
+      ++t_nested_presents;
+      const HRESULT hr = g_real_present1(swapchain, sync_interval, flags, params);
+      --t_nested_presents;
+      return hr;
     }
     in_present_t in_present;
     const bool partial = params && (params->DirtyRectsCount > 0 || params->pScrollRect != nullptr);

@@ -129,7 +129,7 @@ namespace game_capture {
     bool download(const std::string &url, const std::filesystem::path &file, std::string &why) {
       std::error_code ec;
       std::filesystem::create_directories(file.parent_path(), ec);
-      const auto part = file.wstring() + L".part";
+      const auto part = file.wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L".part";
       FILE *fp = _wfopen(part.c_str(), L"wb");
       if (!fp) {
         why = "cannot create " + file.string();
@@ -151,15 +151,18 @@ namespace game_capture {
       curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
       curl_easy_setopt(curl, CURLOPT_USERAGENT, "Vibepollo");
       curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
-#if defined(CURLOPT_SSL_OPTIONS) && defined(CURLSSLOPT_NATIVE_CA)
       curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#if LIBCURL_VERSION_NUM >= 0x075500
+      curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+      curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
 #endif
       const CURLcode result = curl_easy_perform(curl);
       long status = 0;
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
       curl_easy_cleanup(curl);
-      std::fclose(fp);
-      if (result != CURLE_OK) {
+      const bool closed = std::fclose(fp) == 0;
+      if (result != CURLE_OK || !closed) {
         DeleteFileW(part.c_str());
         why = "download failed: " + std::string(curl_easy_strerror(result)) + " (HTTP " + std::to_string(status) + ")";
         return false;
@@ -195,7 +198,10 @@ namespace game_capture {
     // The RVA of PresentImpl from the PDB in `dir`, through DbgHelp, which
     // loads a PDB only if its GUID and age match the binary's
     bool lookup(const std::filesystem::path &dxgi, const std::filesystem::path &dir, std::uint32_t &rva, std::wstring &name, std::string &why) {
-      HANDLE process = GetCurrentProcess();
+      // DbgHelp keys its sessions by this handle, which it documents need
+      // not be a process handle when nothing is invaded: a value of our own
+      // keeps this apart from any other DbgHelp user in the host
+      HANDLE process = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(0x56474350));  // "VGCP"
       const DWORD old_options = SymGetOptions();
       // Decorated names (no UNDNAME): the whole signature is compared
       SymSetOptions(SYMOPT_EXACT_SYMBOLS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_IGNORE_NT_SYMPATH | SYMOPT_PUBLICS_ONLY);
@@ -262,7 +268,7 @@ namespace game_capture {
         std::ifstream in(cache);
         std::uint32_t ts = 0, size = 0, rva = 0;
         std::string decorated;
-        if (in >> ts >> size >> rva >> decorated && ts == pe.timestamp && size == pe.image_size && rva != 0 && decorated == narrow(kPresentImplDecorated)) {
+        if (in >> ts >> size >> rva >> decorated && ts == pe.timestamp && size == pe.image_size && rva != 0 && rva < pe.image_size && decorated == narrow(kPresentImplDecorated)) {
           std::lock_guard lg(g_lock);
           g_result = dxgi_symbols_t {pe.timestamp, pe.image_size, rva};
           BOOST_LOG(info) << "Game capture: dxgi.dll (timestamp 0x" << std::hex << pe.timestamp << std::dec << "): PresentImpl at RVA 0x" << std::hex << rva << std::dec << " (cached)";
@@ -271,23 +277,35 @@ namespace game_capture {
       }
 
       const auto pdb = dir / pe.pdb_name;
-      if (!std::filesystem::exists(pdb) || !looks_like_pdb(pdb)) {
-        const std::string url = std::string(kSymbolServer) + pe.pdb_name + "/" + key + "/" + pe.pdb_name;
-        BOOST_LOG(info) << "Game capture: downloading dxgi.dll's public symbols from " << url;
-        if (!download(url, pdb, why)) {
-          BOOST_LOG(warning) << "Game capture: " << why << "; D3D11 frames are copied before Present";
-          return;
-        }
-        if (!looks_like_pdb(pdb)) {
-          BOOST_LOG(warning) << "Game capture: the downloaded file is not a PDB; D3D11 frames are copied before Present";
-          return;
-        }
-      }
-
+      const std::string url = std::string(kSymbolServer) + pe.pdb_name + "/" + key + "/" + pe.pdb_name;
       std::uint32_t rva = 0;
       std::wstring decorated;
-      if (!lookup(dxgi, dir, rva, decorated, why)) {
-        BOOST_LOG(warning) << "Game capture: dxgi.dll symbols: " << why << "; D3D11 frames are copied before Present";
+      std::error_code ec;
+      // A cached PDB that fails the lookup is fetched afresh once: a
+      // truncated or wrong file must not disable this for good
+      for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt == 1 || !std::filesystem::exists(pdb, ec) || !looks_like_pdb(pdb)) {
+          BOOST_LOG(info) << "Game capture: downloading dxgi.dll's public symbols from " << url;
+          if (!download(url, pdb, why)) {
+            BOOST_LOG(warning) << "Game capture: " << why << "; D3D11 frames are copied before Present";
+            return;
+          }
+          if (!looks_like_pdb(pdb)) {
+            BOOST_LOG(warning) << "Game capture: the downloaded file is not a PDB; D3D11 frames are copied before Present";
+            return;
+          }
+        }
+        if (lookup(dxgi, dir, rva, decorated, why)) {
+          break;
+        }
+        if (attempt == 1) {
+          BOOST_LOG(warning) << "Game capture: dxgi.dll symbols: " << why << "; D3D11 frames are copied before Present";
+          return;
+        }
+        BOOST_LOG(info) << "Game capture: dxgi.dll symbols: " << why << "; fetching the PDB again";
+      }
+      if (rva == 0 || rva >= pe.image_size) {
+        BOOST_LOG(warning) << "Game capture: PresentImpl's RVA 0x" << std::hex << rva << std::dec << " is outside dxgi.dll; D3D11 frames are copied before Present";
         return;
       }
       if (decorated != kPresentImplDecorated) {
@@ -297,8 +315,14 @@ namespace game_capture {
         return;
       }
       {
-        std::ofstream out(cache, std::ios::trunc);
+        // (written whole, then moved into place: a reader never sees a part)
+        const auto part = cache.wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L".part";
+        std::ofstream out(std::filesystem::path(part), std::ios::trunc);
         out << pe.timestamp << ' ' << pe.image_size << ' ' << rva << ' ' << narrow(decorated) << '\n';
+        out.close();
+        if (!out || !MoveFileExW(part.c_str(), cache.wstring().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+          DeleteFileW(part.c_str());  // (not cached: resolved again next start)
+        }
       }
       std::lock_guard lg(g_lock);
       g_result = dxgi_symbols_t {pe.timestamp, pe.image_size, rva};
@@ -311,7 +335,13 @@ namespace game_capture {
       return;
     }
     std::thread([] {
-      resolve();
+      try {
+        resolve();
+      } catch (const std::exception &e) {
+        BOOST_LOG(warning) << "Game capture: resolving dxgi.dll's PresentImpl failed: " << e.what() << "; D3D11 frames are copied before Present";
+      } catch (...) {
+        BOOST_LOG(warning) << "Game capture: resolving dxgi.dll's PresentImpl failed; D3D11 frames are copied before Present";
+      }
     }).detach();
   }
 
