@@ -189,6 +189,10 @@ namespace game_capture {
     BOOL CALLBACK on_symbol(PSYMBOL_INFOW info, ULONG, PVOID user) {
       auto *ctx = static_cast<enum_ctx_t *>(user);
       std::wstring name(info->Name, info->NameLen);
+      // (NameLen has been seen to count a terminator or padding)
+      while (!name.empty() && (name.back() == L'\0' || name.back() == L' ')) {
+        name.pop_back();
+      }
       if (name.rfind(kPresentImplPrefix, 0) == 0 && info->Address >= ctx->base) {
         ctx->matches.emplace_back(name, static_cast<std::uint32_t>(info->Address - ctx->base));
       }
