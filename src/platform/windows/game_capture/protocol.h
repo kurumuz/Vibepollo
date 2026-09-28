@@ -86,6 +86,7 @@ namespace game_capture {
     unknown = 0,
     d3d11 = 1,
     d3d12 = 2,
+    vulkan = 3,  ///< a Vulkan swapchain (frames copied through the Vulkan layer, into D3D11 textures the hook shares)
   };
 
   // How the game's pixels are encoded
