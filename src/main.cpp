@@ -52,6 +52,9 @@
 
 extern "C" {
 #include "rswrapper.h"
+#ifdef _WIN32
+  #include "src/platform/windows/game_capture/vk_layer_registration.h"
+#endif
 }
 
 using namespace std::literals;
@@ -454,6 +457,9 @@ int main(int argc, char *argv[]) {
   // running as SYSTEM, since it writes HKLM; the call short-circuits when already in the desired state.
   if (platf::is_running_as_system()) {
     platf::set_vulkan_hdr_layer_enabled(config::video.dd.vulkan_hdr_layer);
+    // Game capture's Vulkan layer: registered last (below overlay layers)
+    // before any game starts, or removed when game capture is off
+    game_capture::sync_vk_layer_registration(config::video.game_capture);
   }
 #endif
 

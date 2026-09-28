@@ -31,7 +31,7 @@
 
 namespace vvk {
 
-  constexpr std::uint32_t kApiVersion = 1;
+  constexpr std::uint32_t kApiVersion = 2;
   constexpr const wchar_t *kModuleName = L"vibepollo_vk_layer.dll";
   constexpr const char *kEntryPoint = "vibepollo_vk_api";
 
@@ -58,6 +58,10 @@ namespace vvk {
     std::uint32_t image_count;
     const VkImage *images;
     bool transfer_src;  ///< its images allow TRANSFER_SRC (the layer added it, or the application asked)
+    /// An ordinary swapchain this copy handles: TRANSFER_SRC, unprotected,
+    /// one array layer, no shared-present mode, no device-group split
+    bool capturable;
+    VkPresentModeKHR present_mode;
   };
 
   /// A Present as the hook sees it, for one swapchain of the VkPresentInfoKHR

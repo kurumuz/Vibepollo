@@ -26,6 +26,7 @@
 #include <vulkan/vk_layer.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -87,6 +88,8 @@ namespace {
     PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties = nullptr;
+    PFN_vkGetPhysicalDeviceImageFormatProperties GetPhysicalDeviceImageFormatProperties = nullptr;
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2 = nullptr;
     std::unordered_map<VkSurfaceKHR, HWND> surfaces;
   };
 
@@ -109,6 +112,8 @@ namespace {
     PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR = nullptr;
     PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
     PFN_vkCreateImageView CreateImageView = nullptr;
+    PFN_vkCreateImage CreateImage = nullptr;
+    PFN_vkDestroyImage DestroyImage = nullptr;
     std::unordered_map<VkQueue, std::uint32_t> queue_families;
     std::unordered_map<VkSwapchainKHR, std::unique_ptr<swapchain_rec_t>> swapchains;
     std::unordered_map<VkImage, swapchain_rec_t *> swapchain_images;  ///< images whose usage we widened
@@ -117,9 +122,16 @@ namespace {
   std::unordered_map<void *, std::unique_ptr<instance_t>> g_instances;
   std::unordered_map<void *, std::unique_ptr<device_rec_t>> g_devices;
 
-  // The registered hook (set once, never cleared: the hook stays loaded)
-  const vvk::callbacks_t *g_callbacks = nullptr;
-  void *g_callbacks_ctx = nullptr;
+  // The registered hook (set once, never cleared: the hook stays loaded),
+  // published whole so a Present on another thread sees callbacks and
+  // context together
+  struct registration_t {
+    const vvk::callbacks_t *callbacks;
+    void *ctx;
+  };
+
+  registration_t g_registration_storage {};
+  std::atomic<const registration_t *> g_registration {nullptr};
 
   instance_t *find_instance(void *key) {
     shared_t lg(g_lock);
@@ -175,11 +187,21 @@ namespace {
       VVK_INSTANCE_FN(EnumerateDeviceExtensionProperties);
       VVK_INSTANCE_FN(GetPhysicalDeviceQueueFamilyProperties);
       VVK_INSTANCE_FN(GetPhysicalDeviceProperties);
+      VVK_INSTANCE_FN(GetPhysicalDeviceImageFormatProperties);
+      if (rec->api_version >= VK_API_VERSION_1_1) {
+        VVK_INSTANCE_FN(GetPhysicalDeviceImageFormatProperties2);
+      }
 #undef VVK_INSTANCE_FN
       exclusive_t lg(g_lock);
       g_instances[key_of(*out)] = std::move(rec);
     } catch (...) {
-      // (no record: this instance is simply not captured)
+      // Without its record the instance cannot be dispatched through us:
+      // undo it rather than hand out a broken one
+      if (const auto destroy = reinterpret_cast<PFN_vkDestroyInstance>(next_gipa(*out, "vkDestroyInstance"))) {
+        destroy(*out, allocator);
+      }
+      *out = VK_NULL_HANDLE;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     return VK_SUCCESS;
   }
@@ -213,6 +235,7 @@ namespace {
         exclusive_t lg(g_lock);
         rec->surfaces[*out] = info->hwnd;
       } catch (...) {
+        // (a surface without a window record is simply never captured)
       }
     }
     return result;
@@ -246,6 +269,7 @@ namespace {
     const PFN_vkGetInstanceProcAddr next_gipa = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     const PFN_vkGetDeviceProcAddr next_gdpa = link->u.pLayerInfo->pfnNextGetDeviceProcAddr;
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
+    VkLayerDeviceLink *const below = link->u.pLayerInfo;  // (a retry hands the next layer the chain as it was)
     const auto create = reinterpret_cast<PFN_vkCreateDevice>(next_gipa(inst ? inst->instance : VK_NULL_HANDLE, "vkCreateDevice"));
     if (!create) {
       return VK_ERROR_INITIALIZATION_FAILED;
@@ -296,6 +320,7 @@ namespace {
       }
     }
     if (result != VK_SUCCESS) {
+      link->u.pLayerInfo = below;
       result = create(physical, info, allocator, out);  // (as the application asked)
       if (result != VK_SUCCESS) {
         return result;
@@ -328,10 +353,17 @@ namespace {
       VVK_DEVICE_FN(GetSwapchainImagesKHR);
       VVK_DEVICE_FN(QueuePresentKHR);
       VVK_DEVICE_FN(CreateImageView);
+      VVK_DEVICE_FN(CreateImage);
+      VVK_DEVICE_FN(DestroyImage);
 #undef VVK_DEVICE_FN
       exclusive_t lg(g_lock);
       g_devices[key_of(*out)] = std::move(rec);
     } catch (...) {
+      if (const auto destroy = reinterpret_cast<PFN_vkDestroyDevice>(next_gdpa(*out, "vkDestroyDevice"))) {
+        destroy(*out, allocator);
+      }
+      *out = VK_NULL_HANDLE;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     return VK_SUCCESS;
   }
@@ -341,8 +373,8 @@ namespace {
       return;
     }
     device_rec_t *rec = find_device(key_of(device));
-    if (rec && g_callbacks && g_callbacks->device_destroyed) {
-      g_callbacks->device_destroyed(g_callbacks_ctx, rec->pub);
+    if (const registration_t *reg = g_registration.load(std::memory_order_acquire); rec && reg && reg->callbacks->device_destroyed) {
+      reg->callbacks->device_destroyed(reg->ctx, rec->pub);
     }
     std::unique_ptr<device_rec_t> owned;
     {
@@ -392,26 +424,90 @@ namespace {
 
   // ---- swapchain -------------------------------------------------------------
 
+  template<class T>
+  const T *find_in_chain(const void *next, VkStructureType type) {
+    for (auto *p = static_cast<const VkBaseInStructure *>(next); p; p = p->pNext) {
+      if (p->sType == type) {
+        return reinterpret_cast<const T *>(p);
+      }
+    }
+    return nullptr;
+  }
+
+  // Whether an ordinary swapchain (the only kind the copy handles) with
+  // TRANSFER_SRC added is a valid configuration: the surface allows the
+  // usage, and an image of the swapchain's parameters with it is supported
+  // (mutable format and format list included)
+  bool may_widen(device_rec_t *rec, const VkSwapchainCreateInfoKHR *info) {
+    instance_t *inst = rec->instance;
+    if (!inst || !inst->GetPhysicalDeviceSurfaceCapabilitiesKHR) {
+      return false;
+    }
+    constexpr VkSwapchainCreateFlagsKHR unhandled = VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR | VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
+    if ((info->flags & unhandled) || info->imageArrayLayers != 1 ||
+        info->presentMode == VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR || info->presentMode == VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR) {
+      return false;
+    }
+    VkSurfaceCapabilitiesKHR caps {};
+    if (inst->GetPhysicalDeviceSurfaceCapabilitiesKHR(rec->pub.physical_device, info->surface, &caps) != VK_SUCCESS ||
+        !(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+      return false;
+    }
+    VkImageCreateFlags flags = 0;
+    if (info->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR) {
+      flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
+    const auto *list = find_in_chain<VkImageFormatListCreateInfo>(info->pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+    const VkImageUsageFlags usage = info->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkImageFormatProperties props {};
+    if (list || flags) {
+      if (!inst->GetPhysicalDeviceImageFormatProperties2) {
+        return false;  // (cannot check the full configuration: leave it as asked)
+      }
+      VkImageFormatListCreateInfo formats {};
+      if (list) {
+        formats = *list;
+        formats.pNext = nullptr;
+      }
+      VkPhysicalDeviceImageFormatInfo2 query {};
+      query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+      query.pNext = list ? &formats : nullptr;
+      query.format = info->imageFormat;
+      query.type = VK_IMAGE_TYPE_2D;
+      query.tiling = VK_IMAGE_TILING_OPTIMAL;
+      query.usage = usage;
+      query.flags = flags;
+      VkImageFormatProperties2 out {};
+      out.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+      return inst->GetPhysicalDeviceImageFormatProperties2(rec->pub.physical_device, &query, &out) == VK_SUCCESS;
+    }
+    return inst->GetPhysicalDeviceImageFormatProperties &&
+           inst->GetPhysicalDeviceImageFormatProperties(rec->pub.physical_device, info->imageFormat, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &props) == VK_SUCCESS;
+  }
+
   VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *allocator, VkSwapchainKHR *out) {
     device_rec_t *rec = find_device(key_of(device));
     if (!rec || !rec->CreateSwapchainKHR) {
       return VK_ERROR_INITIALIZATION_FAILED;
     }
-    bool transfer_src = (info->imageUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    const bool asked = (info->imageUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
     bool widened = false;
+    bool tried = false;
     VkResult result = VK_ERROR_INITIALIZATION_FAILED;
-    if (!transfer_src && rec->instance && rec->instance->GetPhysicalDeviceSurfaceCapabilitiesKHR) {
-      VkSurfaceCapabilitiesKHR caps {};
-      if (rec->instance->GetPhysicalDeviceSurfaceCapabilitiesKHR(rec->pub.physical_device, info->surface, &caps) == VK_SUCCESS &&
-          (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
-        VkSwapchainCreateInfoKHR wide = *info;
-        wide.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        result = rec->CreateSwapchainKHR(device, &wide, allocator, out);
-        widened = transfer_src = result == VK_SUCCESS;
-      }
+    if (!asked && may_widen(rec, info)) {
+      tried = true;
+      VkSwapchainCreateInfoKHR wide = *info;
+      wide.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      result = rec->CreateSwapchainKHR(device, &wide, allocator, out);
+      widened = result == VK_SUCCESS;
     }
     if (result != VK_SUCCESS) {
-      result = rec->CreateSwapchainKHR(device, info, allocator, out);  // (as the application asked)
+      VkSwapchainCreateInfoKHR plain = *info;
+      if (tried && info->oldSwapchain) {
+        // A failed creation retired oldSwapchain: it may not be named again
+        plain.oldSwapchain = VK_NULL_HANDLE;
+      }
+      result = rec->CreateSwapchainKHR(device, &plain, allocator, out);  // (as the application asked)
       if (result != VK_SUCCESS) {
         return result;
       }
@@ -420,33 +516,49 @@ namespace {
     try {
       auto sc = std::make_unique<swapchain_rec_t>();
       std::uint32_t count = 0;
-      if (rec->GetSwapchainImagesKHR && rec->GetSwapchainImagesKHR(device, *out, &count, nullptr) >= VK_SUCCESS && count) {
-        sc->images.resize(count);
-        if (rec->GetSwapchainImagesKHR(device, *out, &count, sc->images.data()) < VK_SUCCESS) {
-          sc->images.clear();
-        }
-        sc->images.resize(std::min<std::size_t>(count, sc->images.size()));
+      if (!rec->GetSwapchainImagesKHR || rec->GetSwapchainImagesKHR(device, *out, &count, nullptr) < VK_SUCCESS) {
+        count = 0;
       }
+      sc->images.resize(count);
+      if (count && rec->GetSwapchainImagesKHR(device, *out, &count, sc->images.data()) < VK_SUCCESS) {
+        count = 0;
+      }
+      sc->images.resize(count);
       sc->app_usage = info->imageUsage;
       sc->pub.swapchain = *out;
       sc->pub.format = info->imageFormat;
       sc->pub.color_space = info->imageColorSpace;
       sc->pub.extent = info->imageExtent;
+      sc->pub.present_mode = info->presentMode;
       sc->pub.image_count = static_cast<std::uint32_t>(sc->images.size());
       sc->pub.images = sc->images.data();
-      sc->pub.transfer_src = transfer_src && !sc->images.empty();
+      sc->pub.transfer_src = (asked || widened) && !sc->images.empty();
+      // (what may_widen accepts is exactly what the copy handles)
+      constexpr VkSwapchainCreateFlagsKHR unhandled = VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR | VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
+      sc->pub.capturable = sc->pub.transfer_src && !(info->flags & unhandled) && info->imageArrayLayers == 1 &&
+                           info->presentMode != VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR && info->presentMode != VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR;
       exclusive_t lg(g_lock);
       if (rec->instance) {
         const auto it = rec->instance->surfaces.find(info->surface);
         sc->pub.hwnd = it == rec->instance->surfaces.end() ? nullptr : it->second;
       }
+      rec->swapchain_images.reserve(rec->swapchain_images.size() + sc->images.size());
+      rec->swapchains.reserve(rec->swapchains.size() + 1);
+      swapchain_rec_t *raw = sc.get();
+      rec->swapchains[*out] = std::move(sc);  // (no throw: reserved)
       if (widened) {
-        for (VkImage image : sc->images) {
-          rec->swapchain_images[image] = sc.get();
+        for (VkImage image : raw->images) {
+          rec->swapchain_images[image] = raw;
         }
       }
-      rec->swapchains[*out] = std::move(sc);
     } catch (...) {
+      // A widened swapchain must be recorded (its views need narrowing);
+      // undo it rather than let it out unrecorded
+      if (widened && rec->DestroySwapchainKHR) {
+        rec->DestroySwapchainKHR(device, *out, allocator);
+        *out = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
     }
     return VK_SUCCESS;
   }
@@ -456,8 +568,8 @@ namespace {
     if (!rec) {
       return;
     }
-    if (swapchain && g_callbacks && g_callbacks->swapchain_destroyed) {
-      g_callbacks->swapchain_destroyed(g_callbacks_ctx, rec->pub, swapchain);
+    if (const registration_t *reg = g_registration.load(std::memory_order_acquire); swapchain && reg && reg->callbacks->swapchain_destroyed) {
+      reg->callbacks->swapchain_destroyed(reg->ctx, rec->pub, swapchain);
     }
     std::unique_ptr<swapchain_rec_t> owned;
     {
@@ -474,6 +586,61 @@ namespace {
     if (rec->DestroySwapchainKHR) {
       rec->DestroySwapchainKHR(device, swapchain, allocator);
     }
+  }
+
+  // An image bound to swapchain memory (VkImageSwapchainCreateInfoKHR) must
+  // have the swapchain's parameters: a widened swapchain's aliases get the
+  // widened usage too, and are tracked so their views are narrowed back
+  VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(VkDevice device, const VkImageCreateInfo *info, const VkAllocationCallbacks *allocator, VkImage *out) {
+    device_rec_t *rec = find_device(key_of(device));
+    if (!rec || !rec->CreateImage) {
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    const auto *alias = find_in_chain<VkImageSwapchainCreateInfoKHR>(info->pNext, VK_STRUCTURE_TYPE_IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
+    swapchain_rec_t *sc = nullptr;
+    if (alias && alias->swapchain) {
+      shared_t lg(g_lock);
+      const auto it = rec->swapchains.find(alias->swapchain);
+      if (it != rec->swapchains.end() && !(it->second->app_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && it->second->pub.transfer_src) {
+        sc = it->second.get();
+      }
+    }
+    if (!sc) {
+      return rec->CreateImage(device, info, allocator, out);
+    }
+    VkImageCreateInfo wide = *info;
+    wide.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    const VkResult result = rec->CreateImage(device, &wide, allocator, out);
+    if (result == VK_SUCCESS) {
+      try {
+        exclusive_t lg(g_lock);
+        rec->swapchain_images[*out] = sc;
+      } catch (...) {
+        rec->DestroyImage(device, *out, allocator);
+        *out = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+    }
+    return result;
+  }
+
+  VKAPI_ATTR void VKAPI_CALL layer_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *allocator) {
+    device_rec_t *rec = find_device(key_of(device));
+    if (!rec || !rec->DestroyImage) {
+      return;
+    }
+    if (image) {
+      bool tracked;
+      {
+        shared_t lg(g_lock);
+        tracked = rec->swapchain_images.count(image) != 0;
+      }
+      if (tracked) {
+        exclusive_t lg(g_lock);
+        rec->swapchain_images.erase(image);
+      }
+    }
+    rec->DestroyImage(device, image, allocator);
   }
 
   // A view of a swapchain image whose usage we widened gets the
@@ -521,7 +688,9 @@ namespace {
     if (!rec || !rec->QueuePresentKHR) {
       return VK_ERROR_DEVICE_LOST;
     }
-    const vvk::callbacks_t *callbacks = g_callbacks;
+    const registration_t *reg = g_registration.load(std::memory_order_acquire);
+    const vvk::callbacks_t *callbacks = reg ? reg->callbacks : nullptr;
+    void *const ctx = reg ? reg->ctx : nullptr;
     if (!callbacks || !callbacks->pre_present || !info || info->swapchainCount == 0) {
       return rec->QueuePresentKHR(queue, info);
     }
@@ -558,7 +727,7 @@ namespace {
     for (std::uint32_t i = 0; i < n; ++i) {
       std::uint32_t wait_count = 0;
       const VkSemaphore *waits = nullptr;
-      if (callbacks->pre_present(g_callbacks_ctx, presents[i], &wait_count, &waits) && !replaced) {
+      if (callbacks->pre_present(ctx, presents[i], &wait_count, &waits) && !replaced) {
         forwarded.waitSemaphoreCount = wait_count;
         forwarded.pWaitSemaphores = waits;
         replaced = true;
@@ -567,7 +736,7 @@ namespace {
     const VkResult result = rec->QueuePresentKHR(queue, &forwarded);
     if (callbacks->post_present) {
       for (std::uint32_t i = 0; i < n; ++i) {
-        callbacks->post_present(g_callbacks_ctx, presents[i], result);
+        callbacks->post_present(ctx, presents[i], result);
       }
     }
     return result;
@@ -589,6 +758,8 @@ namespace {
       {"vkDestroySwapchainKHR", reinterpret_cast<PFN_vkVoidFunction>(&layer_DestroySwapchainKHR)},
       {"vkQueuePresentKHR", reinterpret_cast<PFN_vkVoidFunction>(&layer_QueuePresentKHR)},
       {"vkCreateImageView", reinterpret_cast<PFN_vkVoidFunction>(&layer_CreateImageView)},
+      {"vkCreateImage", reinterpret_cast<PFN_vkVoidFunction>(&layer_CreateImage)},
+      {"vkDestroyImage", reinterpret_cast<PFN_vkVoidFunction>(&layer_DestroyImage)},
     };
     for (const auto &e : table) {
       if (std::strcmp(name, e.name) == 0) {
@@ -677,11 +848,11 @@ namespace {
 
   bool register_callbacks(const vvk::callbacks_t *callbacks, void *ctx) {
     exclusive_t lg(g_lock);
-    if (g_callbacks || !callbacks) {
+    if (g_registration.load(std::memory_order_acquire) || !callbacks) {
       return false;
     }
-    g_callbacks_ctx = ctx;
-    g_callbacks = callbacks;
+    g_registration_storage = {callbacks, ctx};
+    g_registration.store(&g_registration_storage, std::memory_order_release);
     return true;
   }
 

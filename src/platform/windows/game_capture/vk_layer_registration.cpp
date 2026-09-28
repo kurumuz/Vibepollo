@@ -46,18 +46,17 @@ namespace game_capture {
     }
   }  // namespace
 
-  void ensure_vk_layer_registered() {
-    if (g_done.exchange(true)) {
-      return;
-    }
+  void sync_vk_layer_registration(bool enabled) {
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
       return;
     }
     const auto manifest = std::filesystem::path(exe).parent_path() / L"tools" / kManifest;
     std::error_code ec;
-    if (!std::filesystem::exists(manifest, ec)) {
+    const bool installed = std::filesystem::exists(manifest, ec);
+    if (enabled && !installed) {
       BOOST_LOG(info) << "Game capture: no Vulkan layer manifest at " << narrow(manifest.wstring()) << "; Vulkan games are not captured";
+      g_done = true;  // (nothing to retry)
       return;
     }
     const std::wstring ours = manifest.wstring();
@@ -65,7 +64,7 @@ namespace game_capture {
     HKEY key = nullptr;
     const LSTATUS opened = RegCreateKeyExW(HKEY_LOCAL_MACHINE, kKey, 0, nullptr, 0, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
     if (opened != ERROR_SUCCESS) {
-      BOOST_LOG(warning) << "Game capture: cannot open HKLM\\SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers (" << opened << "); the Vulkan layer is not registered";
+      BOOST_LOG(warning) << "Game capture: cannot open HKLM\\SOFTWARE\\Khronos\\Vulkan\\ImplicitLayers (" << opened << "); the Vulkan layer registration is unchanged";
       return;
     }
     struct close_t {
@@ -78,39 +77,62 @@ namespace game_capture {
 
     std::vector<std::wstring> names;
     if (!list(key, names)) {
-      BOOST_LOG(warning) << "Game capture: cannot list the Vulkan implicit layers; the Vulkan layer is not registered";
+      BOOST_LOG(warning) << "Game capture: cannot list the Vulkan implicit layers; the Vulkan layer registration is unchanged";
       return;
     }
-    // Stale registrations of our layer (an older install path) go
-    bool present = false;
+    // Every other registration of our layer goes (an older install path);
+    // with capture off, ours too
+    bool present = false, failed = false;
     for (const auto &name : names) {
       const bool is_ours = _wcsicmp(name.c_str(), ours.c_str()) == 0;
-      if (is_ours) {
+      if (is_ours && enabled) {
         present = true;
-      } else if (_wcsicmp(std::filesystem::path(name).filename().c_str(), kManifest) == 0) {
-        RegDeleteValueW(key, name.c_str());
-        BOOST_LOG(info) << "Game capture: removed a stale Vulkan layer registration (" << narrow(name) << ')';
+      } else if (is_ours || _wcsicmp(std::filesystem::path(name).filename().c_str(), kManifest) == 0) {
+        const LSTATUS removed = RegDeleteValueW(key, name.c_str());
+        failed = failed || removed != ERROR_SUCCESS;
+        BOOST_LOG(info) << "Game capture: " << (removed == ERROR_SUCCESS ? "removed" : "could not remove") << " the Vulkan layer registration " << narrow(name);
       }
     }
-    list(key, names);
-    if (present && !names.empty() && _wcsicmp(names.back().c_str(), ours.c_str()) == 0) {
+    if (!enabled) {
+      g_done = !failed;
+      return;
+    }
+
+    // In place already: the loader lists implicit layers in the order this
+    // same enumeration returns them, and a value of 0 means enabled
+    auto enabled_value = [&] {
+      DWORD value = 1, type = 0, size = sizeof(value);
+      return RegQueryValueExW(key, ours.c_str(), nullptr, &type, reinterpret_cast<BYTE *>(&value), &size) == ERROR_SUCCESS && type == REG_DWORD && value == 0;
+    };
+    if (!list(key, names)) {
+      return;
+    }
+    if (present && !names.empty() && _wcsicmp(names.back().c_str(), ours.c_str()) == 0 && enabled_value()) {
       BOOST_LOG(info) << "Game capture: the Vulkan layer is registered last of " << names.size() << " implicit layers";
+      g_done = !failed;
       return;
     }
     // (Re)created, so it lists last
-    if (present) {
-      RegDeleteValueW(key, ours.c_str());
+    if (present && RegDeleteValueW(key, ours.c_str()) != ERROR_SUCCESS) {
+      BOOST_LOG(warning) << "Game capture: cannot move the Vulkan layer registration to the end; retried at the next stream";
+      return;
     }
     const DWORD zero = 0;
     const LSTATUS set = RegSetValueExW(key, ours.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE *>(&zero), sizeof(zero));
     if (set != ERROR_SUCCESS) {
-      BOOST_LOG(warning) << "Game capture: cannot register the Vulkan layer (" << set << ")";
+      BOOST_LOG(warning) << "Game capture: cannot register the Vulkan layer (" << set << "); retried at the next stream";
       return;
     }
-    list(key, names);
-    const bool last = !names.empty() && _wcsicmp(names.back().c_str(), ours.c_str()) == 0;
+    const bool last = list(key, names) && !names.empty() && _wcsicmp(names.back().c_str(), ours.c_str()) == 0;
     BOOST_LOG(info) << "Game capture: Vulkan layer " << (present ? "moved to the end" : "registered") << " (" << narrow(ours) << ')'
                     << (last ? "" : "; but the registry does not list it last, so an overlay layer may draw after our copy");
+    g_done = last && !failed;
+  }
+
+  void ensure_vk_layer_registered() {
+    if (!g_done.load()) {
+      sync_vk_layer_registration(true);
+    }
   }
 
 }  // namespace game_capture

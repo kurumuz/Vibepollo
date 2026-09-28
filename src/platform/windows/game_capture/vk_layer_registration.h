@@ -17,10 +17,16 @@
 namespace game_capture {
 
   /**
-   * @brief Registers the layer's manifest (installed beside the hook in
-   *        tools/) as the last implicit layer, if it is not already. Once
-   *        per process; logs what it did.
+   * @brief With game capture on: registers the layer's manifest (installed
+   *        beside the hook in tools/) as the last, enabled implicit layer,
+   *        if it is not already. Off: removes the registration, so the
+   *        layer is not loaded into every Vulkan application for nothing.
+   *        Needs HKLM write access (the host runs as SYSTEM); on failure it
+   *        tries again on the next call. Logs what it did.
    */
+  void sync_vk_layer_registration(bool enabled);
+
+  /// sync_vk_layer_registration(true), at most once successfully per process
   void ensure_vk_layer_registered();
 
 }  // namespace game_capture
