@@ -93,6 +93,9 @@ namespace {
   // ... and in how many Presents in a row it was seen (a count)
   // {7c1f4b9a-2e6d-4a83-9f15-3b8e6d2a7c40}
   constexpr GUID kQueueSeenKey = {0x7c1f4b9a, 0x2e6d, 0x4a83, {0x9f, 0x15, 0x3b, 0x8e, 0x6d, 0x2a, 0x7c, 0x40}};
+  // ... and how its frames are copied (submit_mode_e, a count)
+  // {2d8e5f17-4c3b-4e9a-a061-9b7d3c5e2f84}
+  constexpr GUID kSubmitModeKey = {0x2d8e5f17, 0x4c3b, 0x4e9a, {0xa0, 0x61, 0x9b, 0x7d, 0x3c, 0x5e, 0x2f, 0x84}};
 
   present_fn g_real_present = nullptr;
   present1_fn g_real_present1 = nullptr;
@@ -956,6 +959,18 @@ namespace {
   // ResizeBuffers forgets it, to be learned again. Either way no copy is
   // submitted on a queue the swapchain no longer presents from.
   //
+  // Overlays (Steam's, say) draw into the back buffer from their own Present
+  // hook, which sits behind ours when we are injected after them, so a copy
+  // taken before the real Present misses them. DXGI's own presentation work
+  // is the last submission on the presenting queue inside Present, made from
+  // dxgi.dll (checked on this machine: an overlay's draw, then DXGI's, one
+  // each per Present). So the copy is armed before the real Present and
+  // submitted from our ExecuteCommandLists detour just ahead of DXGI's
+  // submission, when the frame is final. Only DXGI's submissions teach the
+  // queue, too, so an overlay's own queue is no ambiguity. A swapchain whose
+  // Presents stop showing DXGI's submission falls back to copying before the
+  // real Present (overlays then missed), after kSubmitMisses in a row.
+  //
   // Per frame, on the presenting thread inside Present: the slot's own
   // command list (reused only once its previous copy completed) moves the
   // back buffer PRESENT -> COPY_SOURCE, copies it into the slot's shared
@@ -978,6 +993,40 @@ namespace {
   thread_local ID3D12CommandQueue *t_seen_queue = nullptr;  // a reference, taken inside its own ExecuteCommandLists
   thread_local bool t_seen_several = false;
   thread_local bool t_seen_contaminated = false;  // another swapchain presented inside this Present
+  thread_local ID3D12CommandQueue *t_seen_dxgi_queue = nullptr;  // ... of the submissions made by dxgi.dll itself (a reference)
+  thread_local bool t_seen_dxgi_several = false;
+
+  // A D3D12 copy waiting for DXGI's own submission inside the real Present
+  struct armed_capture_t {
+    bool armed = false;
+    IDXGISwapChain *swapchain = nullptr;  // borrowed: we are inside its Present
+    ID3D12Device *device = nullptr;  // a reference
+    HWND hwnd = nullptr;
+    UINT index = 0;  // the back buffer being presented, read before the real Present
+    std::uint64_t present_qpc = 0;
+    std::uint64_t release_qpc = 0;
+  };
+
+  thread_local armed_capture_t t_armed;
+
+  enum class submit_mode_e : std::uint32_t {
+    before_present = 0,  ///< copy before the real Present (overlays drawn after ours are missed)
+    at_dxgi_submit = 1,  ///< copy just ahead of DXGI's own submission (overlays included)
+    abandoned = 2,  ///< DXGI's submission stopped showing up: before_present for good
+  };
+
+  constexpr std::uint32_t kSubmitMisses = 3;
+
+  HMODULE g_dxgi_module = nullptr;  // Windows' dxgi.dll (set by install_hooks)
+
+  bool called_from_dxgi(void *return_address) {
+    HMODULE module = nullptr;
+    return g_dxgi_module &&
+           GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(return_address), &module) &&
+           module == g_dxgi_module;
+  }
+
+  void run_armed_capture(ID3D12CommandQueue *queue);
 
   // Set when a swapchain veto could not be recorded, or a Signal failed:
   // D3D12 capture stops for the process (what our copies used is leaked)
@@ -987,11 +1036,17 @@ namespace {
     // Only direct queues can present; copy/compute submissions inside
     // Present (an overlay's uploads, say) are not candidates
     if (t_presenting && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-      if (!t_seen_queue) {
+      const bool dxgi = called_from_dxgi(__builtin_return_address(0));
+      auto &seen = dxgi ? t_seen_dxgi_queue : t_seen_queue;
+      auto &several = dxgi ? t_seen_dxgi_several : t_seen_several;
+      if (!seen) {
         queue->AddRef();
-        t_seen_queue = queue;
-      } else if (t_seen_queue != queue) {
-        t_seen_several = true;
+        seen = queue;
+      } else if (seen != queue) {
+        several = true;
+      }
+      if (dxgi && t_armed.armed) {
+        run_armed_capture(queue);  // our copy goes on the queue just ahead of DXGI's work
       }
     }
     g_real_execute_command_lists(queue, count, lists);
@@ -1081,9 +1136,31 @@ namespace {
 
   // After the real Present of `swapchain` on this thread: record what it
   // submitted on. Only D3D12 swapchains get here with something seen.
+  std::uint32_t swapchain_count(IDXGISwapChain *swapchain, const GUID &key) {
+    std::uint32_t value = 0;
+    UINT size = sizeof(value);
+    return SUCCEEDED(swapchain->GetPrivateData(key, &size, &value)) && size == sizeof(value) ? value : 0;
+  }
+
+  void set_swapchain_count(IDXGISwapChain *swapchain, const GUID &key, std::uint32_t value) {
+    swapchain->SetPrivateData(key, sizeof(value), &value);
+  }
+
+  submit_mode_e submit_mode(IDXGISwapChain *swapchain) {
+    return static_cast<submit_mode_e>(swapchain_count(swapchain, kSubmitModeKey) & 0xff);
+  }
+
   void learn_present_queue(IDXGISwapChain *swapchain) {
-    ID3D12CommandQueue *seen = t_seen_queue;
+    // DXGI's own submissions are the authority; any other direct submission
+    // inside Present (an overlay's) only counts when DXGI showed none
+    const bool from_dxgi = t_seen_dxgi_queue != nullptr;
+    ID3D12CommandQueue *seen = from_dxgi ? t_seen_dxgi_queue : t_seen_queue;
+    if (from_dxgi) {
+      safe_release(t_seen_queue);
+      t_seen_several = t_seen_dxgi_several;
+    }
     t_seen_queue = nullptr;
+    t_seen_dxgi_queue = nullptr;
     if (vetoed(swapchain)) {
       safe_release(seen);
       return;
@@ -1096,9 +1173,13 @@ namespace {
       if (count < 64 && !set_queue_seen(swapchain, count + 1)) {
         forget_queue(swapchain);
       }
+      if (from_dxgi && submit_mode(swapchain) == submit_mode_e::before_present) {
+        set_swapchain_count(swapchain, kSubmitModeKey, static_cast<std::uint32_t>(submit_mode_e::at_dxgi_submit));
+        log("Swapchain %p: DXGI submits on its queue from dxgi.dll; frames are copied just ahead of that (overlays included)", static_cast<void *>(swapchain));
+      }
     } else if (!usable_queue(swapchain, seen)) {
       veto(swapchain, "presents from a D3D12 queue of another device or node");
-    } else if (!remember_queue(swapchain, seen, 1, "seen inside Present")) {
+    } else if (!remember_queue(swapchain, seen, 1, from_dxgi ? "DXGI's own submission inside Present" : "seen inside Present")) {
       forget_queue(swapchain);
     }
     safe_release(known);
@@ -1305,7 +1386,8 @@ namespace {
   }
 
   // Capture lock held. `device` is the swapchain's (borrowed).
-  void capture_frame12(IDXGISwapChain *swapchain, ID3D12Device *device, HWND hwnd, std::uint64_t present_qpc, std::uint64_t release_qpc) {
+  // `index`: the back buffer to copy (UINT_MAX: the current one)
+  void capture_frame12(IDXGISwapChain *swapchain, ID3D12Device *device, HWND hwnd, std::uint64_t present_qpc, std::uint64_t release_qpc, UINT index = UINT_MAX) {
     static IDXGISwapChain *unseen_swapchain = nullptr;
     static std::uint64_t unseen_since = 0;
     static bool reported = false;
@@ -1367,7 +1449,9 @@ namespace {
     if (FAILED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
       return;
     }
-    const UINT index = swapchain3->GetCurrentBackBufferIndex();
+    if (index == UINT_MAX) {
+      index = swapchain3->GetCurrentBackBufferIndex();
+    }
     swapchain3->Release();
     ID3D12Resource *back = nullptr;
     if (FAILED(swapchain->GetBuffer(index, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&back)))) {
@@ -1451,6 +1535,56 @@ namespace {
       return;
     }
     note_capturing(swapchain, "D3D12");
+  }
+
+  void disarm_capture() {
+    safe_release(t_armed.device);
+    t_armed = armed_capture_t {};
+  }
+
+  // From the ExecuteCommandLists detour, when dxgi.dll submits inside the
+  // real Present: the armed copy, if this is the swapchain's queue
+  void run_armed_capture(ID3D12CommandQueue *queue) {
+    ID3D12CommandQueue *known = known_queue(t_armed.swapchain);
+    const bool ours = known == queue;
+    safe_release(known);
+    if (!ours) {
+      return;  // (stays armed: counted as a miss after the Present)
+    }
+    if (TryAcquireSRWLockExclusive(&g_capture_lock)) {
+      capture_frame12(t_armed.swapchain, t_armed.device, t_armed.hwnd, t_armed.present_qpc, t_armed.release_qpc, t_armed.index);
+      ReleaseSRWLockExclusive(&g_capture_lock);
+    } else {
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    disarm_capture();
+  }
+
+  // After the real Present: an armed copy DXGI's submission never collected
+  // is a missed frame; enough of them in a row and the swapchain goes back
+  // to copying before the real Present
+  void settle_armed_capture(IDXGISwapChain *swapchain, bool presented) {
+    if (!t_armed.armed) {
+      const auto value = swapchain_count(swapchain, kSubmitModeKey);
+      if ((value & 0xff) == static_cast<std::uint32_t>(submit_mode_e::at_dxgi_submit) && (value >> 8) != 0) {
+        set_swapchain_count(swapchain, kSubmitModeKey, static_cast<std::uint32_t>(submit_mode_e::at_dxgi_submit));  // (misses reset)
+      }
+      return;
+    }
+    disarm_capture();
+    if (!presented) {
+      return;
+    }
+    g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+    const auto value = swapchain_count(swapchain, kSubmitModeKey);
+    const auto misses = (value >> 8) + 1;
+    if (misses >= kSubmitMisses) {
+      set_swapchain_count(swapchain, kSubmitModeKey, static_cast<std::uint32_t>(submit_mode_e::abandoned));
+      log("Swapchain %p: DXGI's submission was missing from %u Presents in a row; copying before Present from now on (overlays drawn after our hook are missed)",
+          static_cast<void *>(swapchain), misses);
+    } else {
+      set_swapchain_count(swapchain, kSubmitModeKey, (misses << 8) | static_cast<std::uint32_t>(submit_mode_e::at_dxgi_submit));
+    }
   }
 
   HWND setup_hwnd() {
@@ -1563,6 +1697,22 @@ namespace {
           reported = true;
           set_state(gc::hook_state_e::unsupported, "The swapchain is neither D3D11 nor D3D12");
         }
+        return;
+      }
+      IDXGISwapChain3 *swapchain3 = nullptr;
+      if (submit_mode(swapchain) == submit_mode_e::at_dxgi_submit && g_real_execute_command_lists &&
+          SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
+        // Copied from inside the real Present, when DXGI submits (see the
+        // D3D12 section): the buffer is the one being presented now
+        disarm_capture();
+        t_armed.armed = true;
+        t_armed.swapchain = swapchain;
+        t_armed.device = device12;  // (the reference moves in)
+        t_armed.hwnd = hwnd;
+        t_armed.index = swapchain3->GetCurrentBackBufferIndex();
+        t_armed.present_qpc = present_qpc;
+        t_armed.release_qpc = release_qpc;
+        swapchain3->Release();
         return;
       }
       capture_frame12(swapchain, device12, hwnd, present_qpc, release_qpc);
@@ -1829,8 +1979,11 @@ namespace {
       ~observation_t() {
         t_presenting = nullptr;
         safe_release(t_seen_queue);
+        safe_release(t_seen_dxgi_queue);
         t_seen_several = false;
+        t_seen_dxgi_several = false;
         t_seen_contaminated = false;
+        disarm_capture();  // (normally settled already; this covers an exception)
       }
     };
 
@@ -1839,7 +1992,8 @@ namespace {
       observation_t observing(swapchain);
       hr = real(paced ? 0 : sync_interval);
       t_presenting = nullptr;
-      if (t_seen_queue && SUCCEEDED(hr) && !t_seen_contaminated) {
+      settle_armed_capture(swapchain, SUCCEEDED(hr));
+      if ((t_seen_queue || t_seen_dxgi_queue) && SUCCEEDED(hr) && !t_seen_contaminated) {
         learn_present_queue(swapchain);
       }
     }
@@ -1999,6 +2153,8 @@ namespace {
       // this hook relies on
       set_state(gc::hook_state_e::unsupported, "The process uses a DXGI other than Windows' own");
       hr = E_NOTIMPL;
+    } else if (SUCCEEDED(hr) && !(g_dxgi_module = GetModuleHandleW(L"dxgi.dll"))) {
+      hr = E_FAIL;
     } else if (DXGI_COLOR_SPACE_TYPE cs; SUCCEEDED(hr) && !dxgi_color_space(swapchain, cs)) {
       hr = E_NOINTERFACE;  // (fatal, reported: without the getter no frame can be interpreted)
     } else if (SUCCEEDED(hr)) {
