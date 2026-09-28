@@ -27,6 +27,9 @@
 #include "version_compare.h"
 #include "uuid.h"
 #include "video.h"
+#ifdef _WIN32
+  #include "src/platform/windows/game_capture/vk_layer_registration.h"
+#endif
 #include "session_history.h"
 #include "state_storage.h"
 #include "webrtc_stream.h"
@@ -52,9 +55,6 @@
 
 extern "C" {
 #include "rswrapper.h"
-#ifdef _WIN32
-  #include "src/platform/windows/game_capture/vk_layer_registration.h"
-#endif
 }
 
 using namespace std::literals;
