@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.1.2",
+  "layer": {
+    "name": "VK_LAYER_VIBEPOLLO_capture",
+    "type": "GLOBAL",
+    "library_path": ".\\vibepollo_vk_layer.dll",
+    "api_version": "1.4.341",
+    "implementation_version": "1",
+    "description": "Vibepollo in-game capture (inert unless Vibepollo captures this process)",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {
+      "DISABLE_VIBEPOLLO_VK_LAYER": "1"
+    }
+  }
+}

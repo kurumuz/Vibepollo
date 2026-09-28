@@ -129,6 +129,22 @@ target_link_libraries(vibepollo_game_hook
         user32)
 target_link_options(vibepollo_game_hook PRIVATE -static -static-libgcc -static-libstdc++)
 
+# Vulkan implicit layer (VK_LAYER_VIBEPOLLO_capture): loaded by the Vulkan
+# loader into every Vulkan application, so it does as little as it can; the
+# capture itself is the game hook's (see vk_layer/vk_layer_api.h). The host
+# registers its manifest (installed beside it) as the last implicit layer.
+add_library(vibepollo_vk_layer SHARED
+        vk_layer/vk_layer.cpp)
+set_target_properties(vibepollo_vk_layer PROPERTIES
+        CXX_STANDARD 20
+        PREFIX ""
+        OUTPUT_NAME "vibepollo_vk_layer")
+target_link_options(vibepollo_vk_layer PRIVATE -static -static-libgcc -static-libstdc++)
+add_custom_command(TARGET vibepollo_vk_layer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/vk_layer/vibepollo_vk_layer.json
+                $<TARGET_FILE_DIR:vibepollo_vk_layer>/vibepollo_vk_layer.json)
+
 # Display settings helper: detached helper that applies/reverts display settings via IPC.
 # One exe hosts both engines (legacy + v2), selected by --engine= or persisted state.
 add_executable(sunshine_display_helper
