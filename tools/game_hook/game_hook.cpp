@@ -12,8 +12,11 @@
  * we patched). D3D12 also needs the queue a swapchain presents from, which
  * DXGI does not expose: ID3D12CommandQueue::ExecuteCommandLists is detoured
  * too, and a frame is captured only when that queue is certain (see the D3D12
- * section). A frame's colour space is read from its swapchain through DXGI's
- * private getter (see swapchain_color_space).
+ * section). D3D11 frames are copied at dxgi!CDXGISwapChain::PresentImpl,
+ * the internal function both public Present entries reach after every hook
+ * on them (an overlay's) has run: see the PresentImpl section. A frame's
+ * colour space is read from its swapchain through DXGI's private getter
+ * (see swapchain_color_space).
  *
  * Threading, so that nothing here can stall or crash the game:
  *  - All work on the game's D3D objects happens on the game's own thread
@@ -42,6 +45,10 @@
 #include "src/platform/windows/game_capture/protocol.h"
 
 #include <MinHook.h>
+
+extern "C" {
+#include "hde/hde64.h"
+}
 
 #include <windows.h>
 #include <d3d11_4.h>
@@ -1027,8 +1034,9 @@ namespace {
 
   enum class submit_mode_e : std::uint32_t {
     before_present = 0,  ///< copy before the real Present (overlays drawn after ours are missed)
-    at_dxgi_submit = 1,  ///< copy just ahead of DXGI's own submission (overlays included)
-    abandoned = 2,  ///< DXGI's submission stopped showing up: before_present for good
+    at_dxgi_submit = 1,  ///< D3D12: copy just ahead of DXGI's own submission (overlays included)
+    abandoned = 2,  ///< the late copy point stopped being reached: before_present for good
+    at_present_impl = 3,  ///< D3D11: copy at dxgi!CDXGISwapChain::PresentImpl (overlays included)
   };
 
   constexpr std::uint32_t kSubmitMisses = 3;
@@ -1044,6 +1052,8 @@ namespace {
 
   void run_armed_capture(ID3D12CommandQueue *queue);
   void disarm_capture();
+  void cancel_prepared11_for(IDXGISwapChain *swapchain);  // (PresentImpl section)
+  void give_back_armed11();
 
   // Set when a swapchain veto could not be recorded, or a Signal failed:
   // D3D12 capture stops for the process (what our copies used is leaked)
@@ -1628,6 +1638,7 @@ namespace {
     if (t_presenting) {
       t_seen_contaminated = true;  // a Present that resizes teaches nothing about its (old) buffers
     }
+    cancel_prepared11_for(swapchain);
     IUnknown *a = nullptr, *b = nullptr;
     if (!t_armed.prepared.valid || !t_armed.swapchain) {
       return;
@@ -1687,32 +1698,40 @@ namespace {
   // and enough in a row send the swapchain back to copying before Present.
   // Presents where nothing was armed (not captured, no free slot, ...) are
   // no evidence either way.
-  void settle_armed_capture(IDXGISwapChain *swapchain, bool presented) {
-    if (!t_armed.armed) {
-      return;
-    }
-    const bool seen = t_armed.boundary_seen;
-    disarm_capture();  // (gives back a copy that was never submitted)
-    if (!presented) {
-      return;
-    }
+  // Per swapchain, after a real Present that armed a late copy: reaching the
+  // late copy point resets its miss count; not reaching it is a miss, and
+  // kSubmitMisses in a row send the swapchain back to copying before Present
+  void count_boundary(IDXGISwapChain *swapchain, submit_mode_e late_mode, bool seen, const char *what) {
     const auto value = swapchain_count(swapchain, kSubmitModeKey);
-    if ((value & 0xff) != static_cast<std::uint32_t>(submit_mode_e::at_dxgi_submit)) {
+    if ((value & 0xff) != static_cast<std::uint32_t>(late_mode)) {
       return;
     }
     if (seen) {
       if ((value >> 8) != 0) {
-        set_swapchain_count(swapchain, kSubmitModeKey, static_cast<std::uint32_t>(submit_mode_e::at_dxgi_submit));
+        set_swapchain_count(swapchain, kSubmitModeKey, static_cast<std::uint32_t>(late_mode));
       }
       return;
     }
     const auto misses = (value >> 8) + 1;
     if (misses >= kSubmitMisses) {
       set_swapchain_count(swapchain, kSubmitModeKey, static_cast<std::uint32_t>(submit_mode_e::abandoned));
-      log("Swapchain %p: DXGI's submission was missing from %u Presents in a row; copying before Present from now on (overlays drawn after our hook are missed)",
-          static_cast<void *>(swapchain), misses);
+      log("Swapchain %p: %s in %u Presents in a row; copying before Present from now on (overlays drawn after our hook are missed)",
+          static_cast<void *>(swapchain), what, misses);
     } else {
-      set_swapchain_count(swapchain, kSubmitModeKey, (misses << 8) | static_cast<std::uint32_t>(submit_mode_e::at_dxgi_submit));
+      set_swapchain_count(swapchain, kSubmitModeKey, (misses << 8) | static_cast<std::uint32_t>(late_mode));
+    }
+  }
+
+  // After the real Present (D3D12). Presents where nothing was armed (not
+  // captured, no free slot, ...) are no evidence either way.
+  void settle_armed_capture(IDXGISwapChain *swapchain, bool presented) {
+    if (!t_armed.armed) {
+      return;
+    }
+    const bool seen = t_armed.boundary_seen;
+    disarm_capture();  // (gives back a copy that was never submitted)
+    if (presented) {
+      count_boundary(swapchain, submit_mode_e::at_dxgi_submit, seen, "DXGI's submission was missing");
     }
   }
 
@@ -1773,7 +1792,456 @@ namespace {
     collect_retired(false);
   }
 
-  void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc, std::uint64_t release_qpc) {
+  // ---- The PresentImpl boundary (D3D11) ------------------------------------
+  //
+  // An overlay injected before us (Steam's) hooks the public Present entry
+  // points and draws into the back buffer from its hook, which sits behind
+  // ours: a copy taken before calling the real Present misses it, and a copy
+  // after Present reads the wrong buffer on flip-model swapchains (two frames
+  // behind, measured). D3D11 has no submission of DXGI's own to slip ahead
+  // of, unlike D3D12. What it has: both public entries, Present and Present1,
+  // call one internal function, CDXGISwapChain::PresentImpl, once their hook
+  // chains have run and before DXGI's own presentation work begins. A detour
+  // at its entry runs on the presenting thread with the frame final; the
+  // copy is enqueued on the immediate context there, so it precedes the
+  // presentation the same way a copy before an unhooked Present would.
+  //
+  // PresentImpl is not exported and moves with every dxgi.dll build, so the
+  // host resolves it from Microsoft's public symbols for the system dxgi.dll
+  // (dxgi_symbols.cpp; the symbol's decorated name fixes the argument list
+  // this detour forwards) and hands the RVA over in the shared block. The
+  // hook takes nothing on trust: the loaded dxgi.dll must be the build the
+  // host resolved; Present, Present1 and PresentImpl must each be a function
+  // of the exception directory starting at their addresses; Present and
+  // Present1, read from dxgi.dll on disk (their entries in memory are the
+  // overlays' patches), must each contain exactly one direct call to
+  // PresentImpl, whose return addresses the detour then requires; and
+  // PresentImpl's entry must be unpatched. Anything else: frames are copied
+  // before Present as before, and the log says why.
+  //
+  // Per frame: the copy is prepared before the real Present (device and
+  // textures, a slot with its record written, a reference to the back
+  // buffer) and enqueued at the boundary, if it is reached for this
+  // swapchain from one of those two call sites during this Present and the
+  // capture is unchanged; otherwise the slot goes back and, after
+  // kSubmitMisses such Presents in a row, the swapchain copies before
+  // Present again. Present1 with dirty or scroll rectangles is not captured
+  // at all: its back buffer holds only what changed.
+
+  using present_impl_fn = HRESULT(WINAPI *)(void *self, const void *args, UINT dirty_count, const RECT *dirty_rects, UINT scroll_count, const void *scroll_rects, IUnknown *resource);
+  present_impl_fn g_real_present_impl = nullptr;
+  void *g_present_impl_return[2] = {};  // the return addresses of Present's and Present1's calls to it
+  std::atomic<bool> g_present_impl_ready {false};
+  bool g_present_impl_attempted = false;  // capture lock
+  void *g_present_target = nullptr;  // DXGI's Present and Present1 themselves (install_hooks)
+  void *g_present1_target = nullptr;
+
+  // A D3D11 copy with everything but the copy itself done
+  struct prepared11_t {
+    bool valid = false;
+    int slot = -1;
+    ID3D11Texture2D *back = nullptr;  // references, released on submit or give-back
+    ID3D11Texture2D *target = nullptr;  // g_cap.textures[slot] when prepared
+    ID3D11DeviceContext *context = nullptr;  // g_cap.context when prepared
+    IDXGIKeyedMutex *mutex = nullptr;  // held since the slot was claimed (keyed-mutex sync); null under owner words
+    bool resolve = false;  // multisampled back buffer
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    std::uint32_t version = 0;
+    std::uint32_t generation = 0;
+    std::uint64_t frame_id = 0;
+  };
+
+  struct armed11_t {
+    bool armed = false;  // a copy was prepared this Present (stays set when it is given back: it still counts)
+    bool boundary_seen = false;  // PresentImpl was reached for this swapchain from Present or Present1, uncontaminated
+    IDXGISwapChain *swapchain = nullptr;  // borrowed: we are inside its Present
+    HWND hwnd = nullptr;
+    prepared11_t prepared;
+  };
+
+  thread_local armed11_t t_armed11;
+
+  void give_back_prepared11(prepared11_t &p) {
+    if (!p.valid) {
+      return;
+    }
+    if (p.mutex) {
+      p.mutex->ReleaseSync(0);
+    } else {
+      g_block->owner[p.slot].store(gc::kOwnerNone, std::memory_order_release);
+    }
+    g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+    safe_release(p.mutex);
+    safe_release(p.back);
+    safe_release(p.target);
+    safe_release(p.context);
+    p.valid = false;
+  }
+
+  void give_back_armed11() {
+    give_back_prepared11(t_armed11.prepared);
+  }
+
+  void disarm11() {
+    give_back_prepared11(t_armed11.prepared);
+    t_armed11 = armed11_t {};
+  }
+
+  // A resize of the swapchain inside its own Present: the prepared copy
+  // holds a back-buffer reference the resize would fail on
+  void cancel_prepared11_for(IDXGISwapChain *swapchain) {
+    if (!t_armed11.prepared.valid || !t_armed11.swapchain) {
+      return;
+    }
+    IUnknown *a = nullptr, *b = nullptr;
+    t_armed11.swapchain->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void **>(&a));
+    swapchain->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void **>(&b));
+    if (a && a == b) {
+      give_back_prepared11(t_armed11.prepared);
+      log("Swapchain %p resized inside its Present: the frame's copy was dropped", static_cast<void *>(swapchain));
+    }
+    safe_release(a);
+    safe_release(b);
+  }
+
+  // A function's extent from dxgi.dll's exception directory; false unless
+  // `rva` is where one starts
+  bool function_extent(std::uint32_t rva, std::uint32_t &begin, std::uint32_t &end) {
+    DWORD64 base = 0;
+    const auto address = reinterpret_cast<DWORD64>(g_dxgi_module) + rva;
+    PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(address, &base, nullptr);
+    if (!entry || base != reinterpret_cast<DWORD64>(g_dxgi_module) || entry->BeginAddress != rva || entry->EndAddress <= entry->BeginAddress) {
+      return false;
+    }
+    begin = entry->BeginAddress;
+    end = entry->EndAddress;
+    return true;
+  }
+
+  // In `image` (dxgi.dll's file, laid out as loaded), the one direct call to
+  // `target` within [begin, end): the RVA the call returns to, or 0
+  std::uint32_t single_call_to(const std::uint8_t *image, std::uint32_t begin, std::uint32_t end, std::uint32_t target, const char *what) {
+    std::uint32_t found = 0;
+    int count = 0;
+    for (std::uint32_t at = begin; at < end;) {
+      hde64s hs {};
+      const unsigned len = hde64_disasm(image + at, &hs);
+      if ((hs.flags & F_ERROR) || len == 0) {
+        log("PresentImpl: an instruction of %s at +0x%x could not be decoded", what, at);
+        return 0;
+      }
+      if (hs.opcode == 0xE8 && len == 5 &&
+          static_cast<std::int64_t>(at) + 5 + static_cast<std::int32_t>(hs.imm.imm32) == static_cast<std::int64_t>(target)) {
+        ++count;
+        found = at + 5;
+      }
+      at += len;
+    }
+    if (count != 1) {
+      log("PresentImpl: %s makes %d direct calls to it (exactly one expected)", what, count);
+      return 0;
+    }
+    return found;
+  }
+
+  HRESULT WINAPI hook_present_impl(void *self, const void *args, UINT dirty_count, const RECT *dirty_rects, UINT scroll_count, const void *scroll_rects, IUnknown *resource);
+
+  // Verifies the address the host resolved and detours PresentImpl. Capture
+  // lock held; one attempt per process, made once the host has resolved it.
+  void ensure_present_impl_hook() {
+    if (g_present_impl_attempted || !g_block) {
+      return;
+    }
+    const auto rva = g_block->dxgi_present_impl_rva.load(std::memory_order_acquire);
+    if (!rva) {
+      return;  // (the host may still be resolving it: looked at again next frame)
+    }
+    g_present_impl_attempted = true;
+    const auto timestamp = g_block->dxgi_timestamp.load(std::memory_order_relaxed);
+    const auto image_size = g_block->dxgi_image_size.load(std::memory_order_relaxed);
+    const char *const fallback = "D3D11 frames are copied before Present (overlays drawn after our hook are missed)";
+    if (!g_dxgi_module || !g_present_target || !g_present1_target) {
+      log("PresentImpl: no DXGI module to verify it against; %s", fallback);
+      return;
+    }
+    const auto *const base = reinterpret_cast<const std::uint8_t *>(g_dxgi_module);
+    auto same_build = [&](const std::uint8_t *image, const char *which) {
+      const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(image);
+      const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(image + dos->e_lfanew);
+      if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE ||
+          nt->FileHeader.TimeDateStamp != timestamp || nt->OptionalHeader.SizeOfImage != image_size) {
+        log("PresentImpl: the host resolved it for another dxgi.dll build than the one %s (timestamp 0x%08lx, size 0x%lx; host: 0x%08lx, 0x%lx); %s",
+            which, static_cast<unsigned long>(nt->FileHeader.TimeDateStamp), static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage),
+            static_cast<unsigned long>(timestamp), static_cast<unsigned long>(image_size), fallback);
+        return false;
+      }
+      return true;
+    };
+    if (!same_build(base, "loaded")) {
+      return;
+    }
+
+    // The file, laid out as loaded: the public entries' unpatched code (in
+    // memory they begin with the overlays' jumps)
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(g_dxgi_module, path, MAX_PATH)) {
+      log("PresentImpl: cannot find dxgi.dll's path; %s", fallback);
+      return;
+    }
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE mapping = file != INVALID_HANDLE_VALUE ? CreateFileMappingW(file, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr) : nullptr;
+    const auto *image = mapping ? static_cast<const std::uint8_t *>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0)) : nullptr;
+    struct unmap_t {
+      HANDLE file, mapping;
+      const std::uint8_t *image;
+
+      ~unmap_t() {
+        if (image) {
+          UnmapViewOfFile(image);
+        }
+        if (mapping) {
+          CloseHandle(mapping);
+        }
+        if (file != INVALID_HANDLE_VALUE) {
+          CloseHandle(file);
+        }
+      }
+    } unmap {file, mapping, image};
+    if (!image) {
+      log("PresentImpl: cannot map dxgi.dll from disk (%lu); %s", GetLastError(), fallback);
+      return;
+    }
+    if (!same_build(image, "on disk")) {
+      return;
+    }
+
+    const auto present_rva = static_cast<std::uint32_t>(static_cast<const std::uint8_t *>(g_present_target) - base);
+    const auto present1_rva = static_cast<std::uint32_t>(static_cast<const std::uint8_t *>(g_present1_target) - base);
+    std::uint32_t pb = 0, pe = 0, p1b = 0, p1e = 0, ib = 0, ie = 0;
+    if (!function_extent(present_rva, pb, pe) || !function_extent(present1_rva, p1b, p1e) || !function_extent(rva, ib, ie)) {
+      log("PresentImpl: dxgi.dll's exception directory does not describe Present (+0x%x), Present1 (+0x%x) and PresentImpl (+0x%x) as functions starting there; %s",
+          present_rva, present1_rva, rva, fallback);
+      return;
+    }
+    const auto ret0 = single_call_to(image, pb, pe, rva, "Present");
+    const auto ret1 = single_call_to(image, p1b, p1e, rva, "Present1");
+    if (!ret0 || !ret1) {
+      log("PresentImpl: %s", fallback);
+      return;
+    }
+    // Its entry must be DXGI's own code (nothing else detoured it)
+    if (ie - ib < 16 || std::memcmp(base + ib, image + ib, 16) != 0) {
+      log("PresentImpl: its code in memory differs from dxgi.dll on disk (detoured by something else?); %s", fallback);
+      return;
+    }
+
+    void *target = const_cast<std::uint8_t *>(base) + rva;
+    if (MH_CreateHook(target, reinterpret_cast<void *>(&hook_present_impl), reinterpret_cast<void **>(&g_real_present_impl)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+      log("PresentImpl: could not be detoured; %s", fallback);
+      return;
+    }
+    g_present_impl_return[0] = const_cast<std::uint8_t *>(base) + ret0;
+    g_present_impl_return[1] = const_cast<std::uint8_t *>(base) + ret1;
+    g_present_impl_ready.store(true, std::memory_order_release);
+    log("dxgi!CDXGISwapChain::PresentImpl at +0x%x, called from Present at +0x%x and Present1 at +0x%x (verified against dxgi.dll on disk): D3D11 frames are copied there, after overlays",
+        rva, ret0 - 5, ret1 - 5);
+  }
+
+  // Whether this swapchain's D3D11 frames are copied at the boundary
+  bool late_copy11(IDXGISwapChain *swapchain) {
+    if (!g_present_impl_ready.load(std::memory_order_acquire) || g_submit_mode_broken.load(std::memory_order_acquire)) {
+      return false;
+    }
+    const auto mode = static_cast<submit_mode_e>(swapchain_count(swapchain, kSubmitModeKey) & 0xff);
+    if (mode == submit_mode_e::abandoned) {
+      return false;
+    }
+    if (mode != submit_mode_e::at_present_impl) {
+      set_swapchain_count(swapchain, kSubmitModeKey, static_cast<std::uint32_t>(submit_mode_e::at_present_impl));
+      if (g_submit_mode_broken.load(std::memory_order_acquire)) {
+        return false;
+      }
+      log("Swapchain %p: D3D11 frames are copied at PresentImpl, after overlays", static_cast<void *>(swapchain));
+    }
+    return true;
+  }
+
+  // The copy itself and its publication. Capture lock held; `p` prepared
+  // against the current g_cap (checked by the caller); consumed.
+  void submit11(prepared11_t p, IDXGISwapChain *swapchain, bool at_boundary) {
+    const int slot = p.slot;
+    if (p.resolve) {
+      p.context->ResolveSubresource(p.target, 0, p.back, 0, p.format);
+    } else {
+      p.context->CopyResource(p.target, p.back);
+    }
+    if (p.mutex) {
+      p.mutex->ReleaseSync(0);
+    } else {
+      // The copy is still in flight, but the host takes only a published
+      // slot, and this one publishes after its fence completes
+      g_block->owner[slot].store(gc::kOwnerNone, std::memory_order_release);
+    }
+
+    auto &s = g_slots[slot];
+    const auto ticket = mark_pending(slot, p.version, p.generation, p.frame_id, (g_cap.fence && g_cap.context4) ? ++g_cap.fence_value : 0);
+
+    // Completion always goes through the completion thread (single
+    // publisher). Without a fence, or if registering its event fails, the
+    // event is set here and the frame publishes at Present time.
+    bool signalled = false;
+    if (s.fence_value) {
+      g_cap.highest_fence_value_used = s.fence_value;
+      signalled = SUCCEEDED(g_cap.context4->Signal(g_cap.fence, s.fence_value)) &&
+                  SUCCEEDED(g_cap.fence->SetEventOnCompletion(s.fence_value, s.done_event));
+      if (signalled && g_cap.owner_sync) {
+        // Without a keyed mutex nothing else submits the copy: a shared
+        // resource's writer must flush (OpenSharedResource)
+        p.context->Flush();
+      }
+    }
+    if (!signalled) {
+      if (s.fence_value) {
+        drop_pending(slot, ticket);
+      } else {
+        SetEvent(s.done_event);
+      }
+    }
+    safe_release(p.mutex);
+    safe_release(p.back);
+    safe_release(p.target);
+    safe_release(p.context);
+    note_capturing(swapchain, at_boundary ? "D3D11 (at PresentImpl, overlays included)" : "D3D11");
+  }
+
+  // Everything but the copy: the device, textures, a slot and its record.
+  // Capture lock held. The copy follows at once, or at the boundary.
+  void capture_frame11(IDXGISwapChain *swapchain, ID3D11Device *device, HWND hwnd, std::uint64_t present_qpc, std::uint64_t release_qpc) {
+    ensure_device(swapchain, device, hwnd);
+    ensure_present_impl_hook();
+
+    ID3D11Texture2D *back = nullptr;
+    if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&back)))) {
+      return;
+    }
+    D3D11_TEXTURE2D_DESC back_desc {};
+    back->GetDesc(&back_desc);
+    if (!ensure_textures(back_desc, hwnd)) {
+      back->Release();
+      return;
+    }
+    const std::uint32_t color_space = swapchain_color_space(swapchain);
+
+    const int slot = acquire_free_slot();
+    if (slot == -2) {
+      log("A capture texture's keyed mutex was abandoned; recreating the textures");
+      retire_generation(hwnd);  // the next Present creates a fresh set
+      back->Release();
+      return;
+    }
+    if (slot < 0) {
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+      back->Release();
+      return;
+    }
+
+    // Holding the slot (its pixel mutex, or its owner word): rewrite its
+    // record, then the pixels. The host's acquire is GPU-ordered after the
+    // release in submit11, so a host holding the mutex and reading an even
+    // record reads this frame's.
+    prepared11_t p;
+    p.valid = true;
+    p.slot = slot;
+    p.back = back;  // (the reference taken above)
+    p.target = g_cap.textures[slot];
+    p.target->AddRef();
+    p.context = g_cap.context;
+    p.context->AddRef();
+    if (!g_cap.owner_sync) {
+      p.mutex = g_cap.mutexes[slot];
+      p.mutex->AddRef();
+    }
+    p.resolve = back_desc.SampleDesc.Count > 1;
+    p.format = g_cap.format;
+    p.generation = g_current_generation.load(std::memory_order_acquire);
+    p.frame_id = ++g_cap.next_frame_id;
+    p.version = write_slot_record(slot, p.generation, color_space, p.frame_id, present_qpc, release_qpc);
+
+    if (!late_copy11(swapchain)) {
+      submit11(p, swapchain, false);
+      return;
+    }
+    disarm11();  // (never two)
+    t_armed11.armed = true;
+    t_armed11.swapchain = swapchain;
+    t_armed11.hwnd = hwnd;
+    t_armed11.prepared = p;
+  }
+
+  // From the PresentImpl detour: reached for the armed swapchain from
+  // Present or Present1 during its Present. The copy goes now, unless
+  // another swapchain's Present intervened or the capture changed since.
+  void run_armed_capture11() {
+    auto &p = t_armed11.prepared;
+    if (t_seen_contaminated) {
+      give_back_prepared11(p);
+      return;
+    }
+    t_armed11.boundary_seen = true;
+    if (!p.valid) {
+      return;
+    }
+    // Never wait here: a capture elsewhere holding the lock costs this
+    // frame, not a stall inside Present
+    struct lock_t {
+      bool held = TryAcquireSRWLockExclusive(&g_capture_lock);
+
+      ~lock_t() {
+        if (held) {
+          ReleaseSRWLockExclusive(&g_capture_lock);
+        }
+      }
+    } lock;
+    if (!lock.held) {
+      give_back_prepared11(p);
+      return;
+    }
+    const bool current = g_cap.api == gc::api_e::d3d11 && g_cap.swapchain == t_armed11.swapchain && g_cap.context == p.context &&
+                         g_cap.textures[p.slot] == p.target && g_current_generation.load(std::memory_order_acquire) == p.generation &&
+                         on_capture_thread();
+    if (!current) {
+      give_back_prepared11(p);
+      return;
+    }
+    const prepared11_t submitting = p;
+    p.valid = false;  // (consumed)
+    submit11(submitting, t_armed11.swapchain, true);
+  }
+
+  // After the real Present (D3D11)
+  void settle_armed11(IDXGISwapChain *swapchain, bool presented) {
+    if (!t_armed11.armed) {
+      return;
+    }
+    const bool seen = t_armed11.boundary_seen;
+    disarm11();
+    if (presented) {
+      count_boundary(swapchain, submit_mode_e::at_present_impl, seen, "PresentImpl was not reached");
+    }
+  }
+
+  HRESULT WINAPI hook_present_impl(void *self, const void *args, UINT dirty_count, const RECT *dirty_rects, UINT scroll_count, const void *scroll_rects, IUnknown *resource) {
+    if (t_armed11.armed && t_presenting && self == static_cast<void *>(t_armed11.swapchain)) {
+      void *const from = __builtin_return_address(0);
+      if (from == g_present_impl_return[0] || from == g_present_impl_return[1]) {
+        run_armed_capture11();
+      }
+    }
+    return g_real_present_impl(self, args, dirty_count, dirty_rects, scroll_count, scroll_rects, resource);
+  }
+
+  void capture_frame(IDXGISwapChain *swapchain, std::uint64_t present_qpc, std::uint64_t release_qpc, bool partial) {
     g_block->frames_presented.fetch_add(1, std::memory_order_relaxed);
     if (!g_block->capture_enabled.load(std::memory_order_acquire)) {
       housekeeping(swapchain);
@@ -1805,6 +2273,17 @@ namespace {
     if (!reserve_retirement()) {
       g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       return;  // out of memory: nothing may be retired this frame
+    }
+    if (partial) {
+      // Present1 with dirty or scroll rectangles: the back buffer holds
+      // only what changed
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        log("Present1 with dirty or scroll rectangles: such frames are not captured");
+      }
+      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
+      return;
     }
 
     collect_retired(false);
@@ -1850,80 +2329,8 @@ namespace {
       device12->Release();
       return;
     }
-    ensure_device(swapchain, device, hwnd);
+    capture_frame11(swapchain, device, hwnd, present_qpc, release_qpc);
     device->Release();
-
-    ID3D11Texture2D *back = nullptr;
-    if (FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&back)))) {
-      return;
-    }
-    D3D11_TEXTURE2D_DESC back_desc {};
-    back->GetDesc(&back_desc);
-    if (!ensure_textures(back_desc, hwnd)) {
-      back->Release();
-      return;
-    }
-    const std::uint32_t color_space = swapchain_color_space(swapchain);
-
-    const int slot = acquire_free_slot();
-    if (slot == -2) {
-      log("A capture texture's keyed mutex was abandoned; recreating the textures");
-      retire_generation(hwnd);  // the next Present creates a fresh set
-      back->Release();
-      return;
-    }
-    if (slot < 0) {
-      g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
-      back->Release();
-      return;
-    }
-
-    // Holding the slot's pixel mutex: rewrite its record, then the pixels.
-    // The host's acquire is GPU-ordered after the release below, so a host
-    // holding the mutex and reading an even record reads this frame's.
-    const auto generation = g_current_generation.load(std::memory_order_acquire);
-    const auto frame_id = ++g_cap.next_frame_id;
-    const auto version = write_slot_record(slot, generation, color_space, frame_id, present_qpc, release_qpc);
-
-    if (back_desc.SampleDesc.Count > 1) {
-      g_cap.context->ResolveSubresource(g_cap.textures[slot], 0, back, 0, g_cap.format);
-    } else {
-      g_cap.context->CopyResource(g_cap.textures[slot], back);
-    }
-    if (g_cap.owner_sync) {
-      // The copy is still in flight, but the host takes only a published
-      // slot, and this one publishes after its fence completes
-      g_block->owner[slot].store(gc::kOwnerNone, std::memory_order_release);
-    } else {
-      g_cap.mutexes[slot]->ReleaseSync(0);
-    }
-    back->Release();
-
-    auto &s = g_slots[slot];
-    const auto ticket = mark_pending(slot, version, generation, frame_id, (g_cap.fence && g_cap.context4) ? ++g_cap.fence_value : 0);
-
-    // Completion always goes through the completion thread (single
-    // publisher). Without a fence, or if registering its event fails, the
-    // event is set here and the frame publishes at Present time.
-    bool signalled = false;
-    if (s.fence_value) {
-      g_cap.highest_fence_value_used = s.fence_value;
-      signalled = SUCCEEDED(g_cap.context4->Signal(g_cap.fence, s.fence_value)) &&
-                  SUCCEEDED(g_cap.fence->SetEventOnCompletion(s.fence_value, s.done_event));
-      if (signalled && g_cap.owner_sync) {
-        // Without a keyed mutex nothing else submits the copy: a shared
-        // resource's writer must flush (OpenSharedResource)
-        g_cap.context->Flush();
-      }
-    }
-    if (!signalled) {
-      if (s.fence_value) {
-        drop_pending(slot, ticket);
-      } else {
-        SetEvent(s.done_event);
-      }
-    }
-    note_capturing(swapchain, "D3D11");
   }
 
 
@@ -2058,7 +2465,7 @@ namespace {
 
   // What one outermost Present does around the real call
   template<class F>
-  HRESULT present_with_capture(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags, F &&real) {
+  HRESULT present_with_capture(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags, bool partial, F &&real) {
     if (flags & DXGI_PRESENT_TEST) {
       const HRESULT hr = real(sync_interval);
       if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
@@ -2101,6 +2508,7 @@ namespace {
     struct armed_guard_t {
       ~armed_guard_t() {
         disarm_capture();
+        disarm11();
       }
     } armed_guard;
 
@@ -2111,7 +2519,7 @@ namespace {
       swapchain3->Release();
     }
 
-    capture_frame(swapchain, now, release);
+    capture_frame(swapchain, now, release, partial);
 
     // Paced, the game must not also wait for the host display's vblank. For
     // a D3D12 swapchain the queue DXGI submits on during this call is the
@@ -2130,6 +2538,7 @@ namespace {
         t_seen_dxgi_several = false;
         t_seen_contaminated = false;
         disarm_capture();  // (normally settled already; this covers an exception)
+        disarm11();
       }
     };
 
@@ -2139,6 +2548,7 @@ namespace {
       hr = real(paced ? 0 : sync_interval);
       t_presenting = nullptr;
       settle_armed_capture(swapchain, SUCCEEDED(hr));
+      settle_armed11(swapchain, SUCCEEDED(hr));
       if (t_seen_dxgi_queue && SUCCEEDED(hr) && !t_seen_contaminated) {
         learn_present_queue(swapchain);
       }
@@ -2178,6 +2588,7 @@ namespace {
     if (!outer || outer != inner) {
       t_seen_contaminated = true;
       give_back_prepared(t_armed.prepared);  // its DXGI submission must not carry our copy (the attempt still counts)
+      give_back_armed11();
     }
     safe_release(outer);
     safe_release(inner);
@@ -2189,7 +2600,7 @@ namespace {
       return g_real_present(swapchain, sync_interval, flags);
     }
     in_present_t in_present;
-    return present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
+    return present_with_capture(swapchain, sync_interval, flags, false, [&](UINT interval) {
       return g_real_present(swapchain, interval, flags);
     });
   }
@@ -2200,7 +2611,8 @@ namespace {
       return g_real_present1(swapchain, sync_interval, flags, params);
     }
     in_present_t in_present;
-    return present_with_capture(swapchain, sync_interval, flags, [&](UINT interval) {
+    const bool partial = params && (params->DirtyRectsCount > 0 || params->pScrollRect != nullptr);
+    return present_with_capture(swapchain, sync_interval, flags, partial, [&](UINT interval) {
       return g_real_present1(swapchain, interval, flags, params);
     });
   }
@@ -2309,6 +2721,8 @@ namespace {
       hr = E_NOINTERFACE;  // (fatal, reported: without the getter no frame can be interpreted)
     } else if (SUCCEEDED(hr)) {
       void **vtable = *reinterpret_cast<void ***>(swapchain);
+      g_present_target = vtable[kVtPresent];
+      g_present1_target = vtable[kVtPresent1];
       ok = MH_Initialize() == MH_OK &&
            MH_CreateHook(vtable[kVtPresent], reinterpret_cast<void *>(&hook_present), reinterpret_cast<void **>(&g_real_present)) == MH_OK &&
            MH_CreateHook(vtable[kVtPresent1], reinterpret_cast<void *>(&hook_present1), reinterpret_cast<void **>(&g_real_present1)) == MH_OK;
@@ -2328,6 +2742,11 @@ namespace {
       if (ok) {
         install_d3d12_hook();
         ok = MH_EnableHook(MH_ALL_HOOKS) == MH_OK;
+      }
+      if (ok) {
+        AcquireSRWLockExclusive(&g_capture_lock);
+        ensure_present_impl_hook();  // (if the host has resolved it by now; else at the first D3D11 frame after it has)
+        ReleaseSRWLockExclusive(&g_capture_lock);
       }
       if (!ok) {
         MH_DisableHook(MH_ALL_HOOKS);

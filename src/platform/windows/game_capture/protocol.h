@@ -57,7 +57,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 11;
+  constexpr std::uint32_t kVersion = 12;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 320;
 
@@ -159,6 +159,14 @@ namespace game_capture {
     std::atomic<std::uint64_t> host_lock;  ///< (host pid << 32) | host instance of the one host reading this block; 0 = none
     std::atomic<std::uint64_t> host_heartbeat_qpc;  ///< refreshed by the host while it streams; the limiter stops when it goes stale
     std::atomic<std::uint64_t> limiter_period_ps;  ///< frame period the hook paces the game at, picoseconds; 0 = no limiter
+    // dxgi!CDXGISwapChain::PresentImpl, resolved by the host from Microsoft's
+    // public symbols for the system dxgi.dll it describes (PE timestamp and
+    // image size); written before injection, 0 = not resolved. The hook
+    // copies D3D11 frames at that function's entry, after overlays hooked on
+    // the public Present have drawn, and verifies the address itself first.
+    std::atomic<std::uint32_t> dxgi_timestamp;
+    std::atomic<std::uint32_t> dxgi_image_size;
+    std::atomic<std::uint32_t> dxgi_present_impl_rva;
 
     // Hook -> host
     std::atomic<std::uint32_t> hook_state;  ///< hook_state_e

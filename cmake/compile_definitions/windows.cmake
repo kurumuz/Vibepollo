@@ -218,6 +218,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/game_source.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/game_source.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/protocol.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/dxgi_symbols.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/dxgi_symbols.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.h"
         ${SUNSHINE_WINDOWS_VDISPLAY_SOURCES}
@@ -256,6 +258,7 @@ list(PREPEND PLATFORM_LIBRARIES
         avrt
         d3d11
         D3DCompiler
+        dbghelp
         dwmapi
         dxgi
         iphlpapi

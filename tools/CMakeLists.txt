@@ -122,7 +122,7 @@ set_target_properties(vibepollo_game_hook PROPERTIES
         CXX_STANDARD 23
         PREFIX ""
         OUTPUT_NAME "vibepollo_game_hook")
-target_include_directories(vibepollo_game_hook PRIVATE ${CMAKE_SOURCE_DIR}/third-party/minhook/include)
+target_include_directories(vibepollo_game_hook PRIVATE ${CMAKE_SOURCE_DIR}/third-party/minhook/include ${CMAKE_SOURCE_DIR}/third-party/minhook/src)
 target_link_libraries(vibepollo_game_hook
         d3d11
         dxgi

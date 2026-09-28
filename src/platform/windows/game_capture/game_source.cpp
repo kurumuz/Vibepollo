@@ -7,6 +7,7 @@
  * from the texture the host itself opened, never from the block.
  */
 #include "game_source.h"
+#include "dxgi_symbols.h"
 
 #include "src/config.h"
 #include "src/logging.h"
@@ -434,6 +435,7 @@ namespace platf::dxgi::game_capture {
       }
       if (!existed) {
         std::string why;
+        publish_dxgi_symbols(block);
         if (!inject(process.get(), dll, why)) {
           return fail("injection failed: " + why);
         }
@@ -514,7 +516,18 @@ namespace platf::dxgi::game_capture {
     }
   };
 
+  // Hands the hook the address of dxgi!CDXGISwapChain::PresentImpl, once the
+  // host has resolved it (dxgi_symbols.h); nothing until then
+  void publish_dxgi_symbols(gc::shared_block_t *block) {
+    if (const auto symbols = dxgi_symbols(); symbols && block->dxgi_present_impl_rva.load(std::memory_order_relaxed) == 0) {
+      block->dxgi_timestamp.store(symbols->timestamp, std::memory_order_relaxed);
+      block->dxgi_image_size.store(symbols->image_size, std::memory_order_relaxed);
+      block->dxgi_present_impl_rva.store(symbols->present_impl_rva, std::memory_order_release);
+    }
+  }
+
   source_t::source_t(ID3D11Device *device) {
+    start_dxgi_symbol_resolution();
     {
       std::lock_guard lg(g_instances_lock);
       _instance_id = (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32) | ++g_next_instance;
@@ -642,6 +655,7 @@ namespace platf::dxgi::game_capture {
         // Every hooked game is paced while we stream, focused or not
         t->block->limiter_period_ps.store(limiter_period, std::memory_order_release);
         t->block->host_heartbeat_qpc.store(heartbeat, std::memory_order_release);
+        publish_dxgi_symbols(t->block);  // (a resolution that finished after injection)
       }
     }
 
