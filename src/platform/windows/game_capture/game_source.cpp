@@ -349,7 +349,20 @@ namespace platf::dxgi::game_capture {
 
     // Reads a slot's record consistently (seqlock; the render thread is its
     // only writer). Validated: enum range, timestamps within the last second.
-    bool read_slot(const gc::slot_record_t &record, std::uint32_t &version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc, std::uint64_t &release_qpc) {
+    // A slot record's motion fields, as read (validated by the caller)
+    struct slot_motion_t {
+      std::uint64_t id = 0;
+      std::uint32_t width = 0, height = 0, out_width = 0, out_height = 0;
+      float scale_x = 0, scale_y = 0;
+    };
+
+    float float_bits(std::uint32_t u) {
+      float f;
+      std::memcpy(&f, &u, sizeof(f));
+      return f;
+    }
+
+    bool read_slot(const gc::slot_record_t &record, std::uint32_t &version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc, std::uint64_t &release_qpc, slot_motion_t &motion) {
       for (int attempt = 0; attempt < 8; ++attempt) {
         const auto s1 = record.seq.load(std::memory_order_acquire);
         if (s1 & 1u) {
@@ -361,6 +374,13 @@ namespace platf::dxgi::game_capture {
         present_qpc = record.present_qpc.load(std::memory_order_relaxed);
         gpu_done_qpc = record.gpu_done_qpc.load(std::memory_order_relaxed);
         release_qpc = record.release_qpc.load(std::memory_order_relaxed);
+        motion.id = record.motion_id.load(std::memory_order_relaxed);
+        motion.width = record.motion_width.load(std::memory_order_relaxed);
+        motion.height = record.motion_height.load(std::memory_order_relaxed);
+        motion.out_width = record.motion_out_width.load(std::memory_order_relaxed);
+        motion.out_height = record.motion_out_height.load(std::memory_order_relaxed);
+        motion.scale_x = float_bits(record.motion_scale_x.load(std::memory_order_relaxed));
+        motion.scale_y = float_bits(record.motion_scale_y.load(std::memory_order_relaxed));
         std::atomic_thread_fence(std::memory_order_acquire);
         if (record.seq.load(std::memory_order_relaxed) != s1) {
           continue;
@@ -476,6 +496,9 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<ID3D11Texture2D> textures[gc::kSlots];
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC texture_desc {};
+    winrt::com_ptr<ID3D11Texture2D> motion_textures[gc::kSlots];  // of the opened generation; empty: none
+    D3D11_TEXTURE2D_DESC motion_desc {};
+    std::uint32_t motion_logged_generation = 0;
     gc::sync_e sync = gc::sync_e::keyed_mutex;  // of the opened generation
 
     // sync_e::owner: slots whose owner word we hold until our reads of them
@@ -502,7 +525,12 @@ namespace platf::dxgi::game_capture {
     }
 
     // Reads the setup consistently (seqlock)
-    bool read_setup(std::uint32_t &generation, std::uint64_t handles[gc::kSlots], std::uint32_t &handle_kind, std::uint32_t &sync, LUID &luid, std::uint32_t &width, std::uint32_t &height) const {
+    struct motion_setup_t {
+      std::uint32_t format = 0, width = 0, height = 0;
+      std::uint64_t handles[gc::kSlots] = {};
+    };
+
+    bool read_setup(std::uint32_t &generation, std::uint64_t handles[gc::kSlots], std::uint32_t &handle_kind, std::uint32_t &sync, LUID &luid, std::uint32_t &width, std::uint32_t &height, motion_setup_t *motion = nullptr) const {
       for (int attempt = 0; attempt < 8; ++attempt) {
         const auto s1 = block->setup_seq.load(std::memory_order_acquire);
         if (s1 & 1u) {
@@ -518,6 +546,14 @@ namespace platf::dxgi::game_capture {
         luid.HighPart = block->setup.adapter_luid_high.load(std::memory_order_relaxed);
         width = block->setup.width.load(std::memory_order_relaxed);
         height = block->setup.height.load(std::memory_order_relaxed);
+        if (motion) {
+          motion->format = block->setup.motion_format.load(std::memory_order_relaxed);
+          motion->width = block->setup.motion_width.load(std::memory_order_relaxed);
+          motion->height = block->setup.motion_height.load(std::memory_order_relaxed);
+          for (int i = 0; i < gc::kSlots; ++i) {
+            motion->handles[i] = block->setup.motion_textures[i].load(std::memory_order_relaxed);
+          }
+        }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (block->setup_seq.load(std::memory_order_relaxed) == s1) {
           return true;
@@ -719,6 +755,7 @@ namespace platf::dxgi::game_capture {
       return false;
     }
 
+    t.block->motion_enabled.store(config::video.nv.motion_hints ? 1 : 0, std::memory_order_release);
     t.block->capture_enabled.store(1, std::memory_order_release);
 
     const auto state = t.block->hook_state.load(std::memory_order_acquire);
@@ -797,7 +834,8 @@ namespace platf::dxgi::game_capture {
     std::uint32_t generation, handle_kind, sync, width, height;
     std::uint64_t handles[gc::kSlots];
     LUID luid;
-    if (!t.read_setup(generation, handles, handle_kind, sync, luid, width, height)) {
+    target_t::motion_setup_t motion_setup;
+    if (!t.read_setup(generation, handles, handle_kind, sync, luid, width, height, &motion_setup)) {
       return false;
     }
     if (width == 0 || height == 0) {
@@ -903,6 +941,49 @@ namespace platf::dxgi::game_capture {
     if (desc.Width != width || desc.Height != height) {
       return false;  // setup moved on while opening; the next call retries
     }
+
+    // The generation's motion textures, if it has them: optional (a failure
+    // here only costs the frames their vectors)
+    winrt::com_ptr<ID3D11Texture2D> motion_textures[gc::kSlots];
+    D3D11_TEXTURE2D_DESC motion_desc {};
+    if (motion_setup.format != 0) {
+      std::string why;
+      const bool plausible = (motion_setup.format == DXGI_FORMAT_R16G16_FLOAT || motion_setup.format == DXGI_FORMAT_R32G32_FLOAT) &&
+                             motion_setup.width > 0 && motion_setup.height > 0 && motion_setup.width <= kMaxDimension && motion_setup.height <= kMaxDimension;
+      if (!plausible) {
+        why = "implausible motion textures";
+      }
+      for (int i = 0; i < gc::kSlots && why.empty(); ++i) {
+        HRESULT hr;
+        if (handle_kind == static_cast<std::uint32_t>(gc::handle_kind_e::legacy)) {
+          hr = motion_setup.handles[i] ? _device->OpenSharedResource(reinterpret_cast<HANDLE>(motion_setup.handles[i]), __uuidof(ID3D11Texture2D), motion_textures[i].put_void()) : E_HANDLE;
+        } else {
+          winrt::handle shared {duplicate(motion_setup.handles[i])};
+          hr = shared ? _device->OpenSharedResource1(shared.get(), __uuidof(ID3D11Texture2D), motion_textures[i].put_void()) : E_HANDLE;
+        }
+        if (FAILED(hr)) {
+          why = "cannot open motion texture " + std::to_string(i) + " [0x" + std::string(util::hex(hr).to_string_view()) + ']';
+          break;
+        }
+        D3D11_TEXTURE2D_DESC d {};
+        motion_textures[i]->GetDesc(&d);
+        if (d.Width != motion_setup.width || d.Height != motion_setup.height || d.Format != static_cast<DXGI_FORMAT>(motion_setup.format) ||
+            d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+          why = "a motion texture has an unexpected shape";
+          break;
+        }
+        motion_desc = d;
+      }
+      if (!why.empty()) {
+        for (auto &m : motion_textures) {
+          m = nullptr;
+        }
+        if (t.motion_logged_generation != generation) {
+          t.motion_logged_generation = generation;
+          BOOST_LOG(warning) << "Game capture: " << why << "; frames go without motion vectors";
+        }
+      }
+    }
     // The setup must not have changed underneath the handles we opened
     std::uint32_t generation2, handle_kind2, sync2, width2, height2;
     std::uint64_t handles2[gc::kSlots];
@@ -926,12 +1007,15 @@ namespace platf::dxgi::game_capture {
     for (int i = 0; i < gc::kSlots; ++i) {
       t.textures[i] = std::move(textures[i]);
       t.mutexes[i] = std::move(mutexes[i]);
+      t.motion_textures[i] = std::move(motion_textures[i]);
     }
+    t.motion_desc = motion_desc;
     t.sync = owner_sync ? gc::sync_e::owner : gc::sync_e::keyed_mutex;
     t.texture_desc = desc;
     t.opened_generation = generation;
     t.open_failures = 0;
-    BOOST_LOG(info) << "Game capture: " << t.exe << " frames " << desc.Width << 'x' << desc.Height << " format " << desc.Format << " (generation " << generation << ')';
+    BOOST_LOG(info) << "Game capture: " << t.exe << " frames " << desc.Width << 'x' << desc.Height << " format " << desc.Format << " (generation " << generation << ')'
+                    << (t.motion_textures[0] ? ", with DLSS motion vectors " + std::to_string(motion_desc.Width) + 'x' + std::to_string(motion_desc.Height) : std::string());
     return true;
   }
 
@@ -1007,7 +1091,8 @@ namespace platf::dxgi::game_capture {
       std::uint32_t record_version, generation;
       gc::color_space_e color_space;
       std::uint64_t frame_id, present_qpc, gpu_done_qpc, release_qpc;
-      const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc, release_qpc);
+      slot_motion_t motion;
+      const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc, release_qpc, motion);
       if (!valid || record_version != version) {
         release();
         if (!valid) {
@@ -1050,6 +1135,25 @@ namespace platf::dxgi::game_capture {
       frame.present_qpc = present_qpc;
       frame.gpu_done_qpc = gpu_done_qpc;
       frame.release_qpc = release_qpc;
+      // Its vectors, if the generation has motion textures and the record
+      // describes a region inside them
+      frame.motion = nullptr;
+      frame.motion_id = 0;
+      const bool motion_ok = motion.id != 0 && t->motion_textures[slot] && motion.width > 0 && motion.height > 0 &&
+                             motion.width <= t->motion_desc.Width && motion.height <= t->motion_desc.Height &&
+                             motion.out_width > 0 && motion.out_height > 0 && motion.out_width <= kMaxDimension && motion.out_height <= kMaxDimension &&
+                             std::isfinite(motion.scale_x) && std::isfinite(motion.scale_y) && motion.scale_x != 0 && motion.scale_y != 0 &&
+                             std::abs(motion.scale_x) < 1e6f && std::abs(motion.scale_y) < 1e6f;
+      if (motion_ok) {
+        frame.motion = t->motion_textures[slot].get();
+        frame.motion_id = motion.id;
+        frame.motion_width = motion.width;
+        frame.motion_height = motion.height;
+        frame.motion_out_width = motion.out_width;
+        frame.motion_out_height = motion.out_height;
+        frame.motion_scale_x = motion.scale_x;
+        frame.motion_scale_y = motion.scale_y;
+      }
       t->consumed_latest = latest;
       t->consumed_frame_id = frame_id;
       _locked_slot = static_cast<int>(slot);

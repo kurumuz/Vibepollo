@@ -25,6 +25,7 @@ extern "C" {
 // lib includes
 #include "display.h"
 #include "display_vram.h"
+#include "game_capture/motion_hints.h"
 #include "misc.h"
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
   #include "nv_truehdr.h"
@@ -2086,14 +2087,71 @@ namespace platf::dxgi {
       }
 
       base.apply_colorspace(colorspace, client_config.rtx_hdr_active);
+      encode_width = static_cast<std::uint32_t>(client_config.width);
+      encode_height = static_cast<std::uint32_t>(client_config.height);
       return base.init_output(nvenc_d3d->get_input_texture(), client_config.width, client_config.height, colorspace) == 0;
     }
 
     int convert(platf::img_t &img_base) override {
-      return base.convert(img_base);
+      const int result = base.convert(img_base);
+      if (result == 0 && config::video.nv.motion_hints) {
+        set_motion_hints(static_cast<img_d3d_t &>(img_base));
+      }
+      return result;
     }
 
   private:
+    // The game frame's motion field as hints for the encoded picture, mapped
+    // through the conversion's viewport (the frame may be scaled and
+    // letterboxed; the bars do not move). Only for the step from the game
+    // frame converted just before: a repeat, a desktop frame or a skipped game
+    // frame in between leaves the picture without hints.
+    void set_motion_hints(const img_d3d_t &img) {
+      const auto id = img.game_frame_id;
+      const bool step = id != 0 && last_game_frame_id != 0 && id == last_game_frame_id + 1;
+      if (id != last_game_frame_id) {
+        last_game_frame_id = id;
+      }
+      const auto *field = img.motion.get();
+      if (!step || !field || field->frame_id != id || !field->width || !field->height) {
+        nvenc_d3d->set_motion_hints({});
+        return;
+      }
+      const auto &vp = base.out_Y_or_YUV_viewports[0];
+      const float to_field_x = static_cast<float>(field->width) / vp.Width;
+      const float to_field_y = static_cast<float>(field->height) / vp.Height;
+      nvenc::nvenc_base::motion_hints_t hints;
+      hints.cols = (encode_width + 15) / 16;
+      hints.rows = (encode_height + 15) / 16;
+      hints.vectors.resize(static_cast<std::size_t>(hints.cols) * hints.rows * 2);
+      for (std::uint32_t y = 0; y < hints.rows; ++y) {
+        for (std::uint32_t x = 0; x < hints.cols; ++x) {
+          const float cx = x * 16 + 8.0f - vp.TopLeftX;
+          const float cy = y * 16 + 8.0f - vp.TopLeftY;
+          std::int32_t vx = 0, vy = 0;
+          if (cx >= 0 && cy >= 0 && cx < vp.Width && cy < vp.Height) {
+            const auto fx = std::min(static_cast<std::uint32_t>(cx * to_field_x) / 16, field->cols - 1);
+            const auto fy = std::min(static_cast<std::uint32_t>(cy * to_field_y) / 16, field->rows - 1);
+            const auto i = (static_cast<std::size_t>(fy) * field->cols + fx) * 2;
+            vx = field->vectors[i];
+            vy = field->vectors[i + 1];
+            if (vx != game_capture::motion_field_t::kNone) {
+              vx = static_cast<std::int32_t>(std::lround(vx / to_field_x));
+              vy = static_cast<std::int32_t>(std::lround(vy / to_field_y));
+            } else {
+              vx = nvenc::nvenc_base::motion_hints_t::kNone;
+            }
+          }
+          hints.vectors[(static_cast<std::size_t>(y) * hints.cols + x) * 2] = vx;
+          hints.vectors[(static_cast<std::size_t>(y) * hints.cols + x) * 2 + 1] = vy;
+        }
+      }
+      nvenc_d3d->set_motion_hints(std::move(hints));
+    }
+
+    std::uint64_t last_game_frame_id = 0;
+    std::uint32_t encode_width = 0;
+    std::uint32_t encode_height = 0;
     d3d_base_encode_device base;
     std::unique_ptr<nvenc::nvenc_d3d11> nvenc_d3d;
     NV_ENC_BUFFER_FORMAT buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;

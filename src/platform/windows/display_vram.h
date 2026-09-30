@@ -15,6 +15,9 @@
 #include <dxgi.h>
 
 namespace platf::dxgi {
+  namespace game_capture {
+    struct motion_field_t;
+  }
 
   /**
    * @brief Direct3D-backed image container used for WGC/DXGI capture paths.
@@ -31,6 +34,8 @@ namespace platf::dxgi {
     bool blank = true;  ///< True if contains no desktop or cursor content.
     uint32_t id = 0;  ///< Monotonically increasing identifier.
     DXGI_FORMAT format;  ///< Underlying DXGI texture format.
+    std::uint64_t game_frame_id = 0;  ///< In-game capture: the game frame it holds (0: not a game frame)
+    std::shared_ptr<const game_capture::motion_field_t> motion;  ///< ... and that frame's motion hints (null: none)
 
     ~img_d3d_t() override {
       if (encoder_texture_handle) {

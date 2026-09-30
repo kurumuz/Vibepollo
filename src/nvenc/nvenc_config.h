@@ -40,6 +40,9 @@ namespace nvenc {
     // Allocate more bitrate to frames with more motion, reduces block-artefact pulsing in moving scenes
     bool temporal_aq = false;
 
+    // Feed a DLSS game's own motion vectors (game capture) to the encoder as motion-estimation hints
+    bool motion_hints = false;
+
     // Don't use QP below certain value, limits peak image quality to save bitrate
     bool enable_min_qp = false;
 

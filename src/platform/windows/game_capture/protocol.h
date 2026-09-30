@@ -45,6 +45,20 @@
  *    the published one. A slot rewritten meanwhile has a new version, so
  *    pixels and metadata can never be mixed.
  *
+ * Motion vectors (while motion_enabled): the hook detours the driver's DLSS
+ * entry points (_nvngx.dll EvaluateFeature, D3D11 and D3D12). After each
+ * successful DLSS evaluation it appends, to the game's own command list, a
+ * copy of the evaluation's motion-vector region into a ring of its own; the
+ * next captured frame's copy also moves the vectors DLSS saw for it into the
+ * slot's motion texture, under the slot's ownership like its pixels. A
+ * generation that has motion textures says so in setup_t (they are created,
+ * retired and shared with its textures); a slot record whose motion_id is 0
+ * carries none. The vectors are DLSS's: in pixels of the region they cover
+ * (after multiplying by motion_scale), pointing from a pixel to where it was
+ * in the previous frame. Consecutive evaluations have consecutive ids, so a
+ * frame's vectors describe the step from the previous captured frame only
+ * when both ids and frame ids are consecutive.
+ *
  * Everything the host reads from this block is untrusted: the game's user
  * can write it. The host bounds and validates every field.
  */
@@ -57,7 +71,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 12;
+  constexpr std::uint32_t kVersion = 13;
   constexpr int kSlots = 3;
   constexpr std::size_t kErrorLength = 320;
 
@@ -132,6 +146,12 @@ namespace game_capture {
     std::atomic<std::uint32_t> handle_kind;  ///< handle_kind_e
     std::atomic<std::uint32_t> sync;  ///< sync_e
     std::atomic<std::uint64_t> textures[kSlots];  ///< handle values, see handle_kind (0 = none)
+    // Motion textures of this generation (same handle kind; guarded with the
+    // slot's pixels: no mutex of their own). format 0 = the generation has none.
+    std::atomic<std::uint32_t> motion_format;  ///< DXGI_FORMAT_R16G16_FLOAT or DXGI_FORMAT_R32G32_FLOAT
+    std::atomic<std::uint32_t> motion_width;
+    std::atomic<std::uint32_t> motion_height;
+    std::atomic<std::uint64_t> motion_textures[kSlots];
   };
 
   // What one slot's texture holds. `seq` is odd while the render thread
@@ -144,6 +164,14 @@ namespace game_capture {
     std::atomic<std::uint64_t> present_qpc;  ///< QueryPerformanceCounter at the game's Present()
     std::atomic<std::uint64_t> gpu_done_qpc;  ///< written by the completion thread just before publishing (0 = no fence)
     std::atomic<std::uint64_t> release_qpc;  ///< the limiter release that started this frame (0 = not paced)
+    // The motion vectors in the slot's motion texture (see the top comment)
+    std::atomic<std::uint64_t> motion_id;  ///< the DLSS evaluation they come from; 0 = none for this frame
+    std::atomic<std::uint32_t> motion_width;  ///< the region holding them, from the texture's top-left
+    std::atomic<std::uint32_t> motion_height;
+    std::atomic<std::uint32_t> motion_out_width;  ///< the DLSS output the region spans
+    std::atomic<std::uint32_t> motion_out_height;
+    std::atomic<std::uint32_t> motion_scale_x;  ///< float bits: DLSS's MV.Scale (vector = stored value * scale)
+    std::atomic<std::uint32_t> motion_scale_y;
   };
 
   inline std::uint64_t make_latest(std::uint32_t slot, std::uint32_t version) {
@@ -168,6 +196,7 @@ namespace game_capture {
     std::atomic<std::uint32_t> dxgi_timestamp;
     std::atomic<std::uint32_t> dxgi_image_size;
     std::atomic<std::uint32_t> dxgi_present_impl_rva;
+    std::atomic<std::uint32_t> motion_enabled;  ///< the hook captures DLSS motion vectors only while non-zero
 
     // Hook -> host
     std::atomic<std::uint32_t> hook_state;  ///< hook_state_e

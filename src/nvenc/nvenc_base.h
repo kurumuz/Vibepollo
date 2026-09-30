@@ -9,6 +9,11 @@
   #include <winsock2.h>
 #endif
 
+// standard includes
+#include <climits>
+#include <cstdint>
+#include <vector>
+
 // lib includes
 #include <ffnvcodec/nvEncodeAPI.h>
 
@@ -94,6 +99,25 @@ namespace nvenc {
      */
     void set_hdr_metadata(const SS_HDR_METADATA &metadata);
 
+    /**
+     * @brief Motion-search hints for the next encoded frame: per 16x16 block of
+     *        the encoded picture, where the block was in the previous frame.
+     */
+    struct motion_hints_t {
+      static constexpr int32_t kNone = INT32_MIN;  ///< in x: no hint for the block
+      uint32_t cols = 0;
+      uint32_t rows = 0;
+      std::vector<int32_t> vectors;  ///< (x, y) per block in quarter pixels, row by row
+    };
+
+    /**
+     * @brief Hints for the next `encode_frame()` only (an empty set: none).
+     *        Used only when the encoder was created with `motion_hints`, the
+     *        frame is not an IDR and no reference was invalidated since the
+     *        previous frame (the hints describe the step from that frame).
+     */
+    void set_motion_hints(motion_hints_t hints);
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -175,6 +199,14 @@ namespace nvenc {
 
     bool hdr_metadata_valid = false;
     SS_HDR_METADATA hdr_metadata {};
+
+    bool pack_motion_hints();
+
+    bool motion_hints_enabled = false;  ///< the encoder accepted external motion hints
+    bool rfi_since_last_frame = false;  ///< a reference was invalidated: the next frame's reference is not the previous frame
+    motion_hints_t pending_motion_hints;
+    std::vector<NVENC_EXTERNAL_ME_HINT> mb_hints;
+    std::vector<NVENC_EXTERNAL_ME_SB_HINT> sb_hints;
   };
 
 }  // namespace nvenc

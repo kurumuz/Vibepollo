@@ -9,6 +9,7 @@
 // standard includes
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -720,7 +721,38 @@ namespace nvenc {
 
     init_params.encodeConfig = &enc_config;
 
-    if (nvenc_failed(nvenc->nvEncInitializeEncoder(encoder, &init_params))) {
+    // External motion hints (a DLSS game's own vectors, see set_motion_hints):
+    // one 16x16 candidate per macroblock (H.264/HEVC) or per 16x16 coding unit
+    // of each 64x64 superblock (AV1), L0 only. An encoder that refuses them
+    // is set up again without.
+    motion_hints_enabled = false;
+    if (config.motion_hints && !api::api_version_less(selected_api_version, api::make_api_version(12U, 0U))) {
+      init_params.enableExternalMEHints = 1;
+      if (client_config.videoFormat == 2) {
+        init_params.maxMEHintCountsPerBlock[0].numCandsPerSb = 16;
+      } else {
+        init_params.maxMEHintCountsPerBlock[0].numCandsPerBlk16x16 = 1;
+      }
+      if (!nvenc_failed(nvenc->nvEncInitializeEncoder(encoder, &init_params))) {
+        motion_hints_enabled = true;
+      } else {
+        BOOST_LOG(warning) << "NvEnc: external motion hints refused (" << last_nvenc_error_string << "); encoding without them";
+        nvenc->nvEncDestroyEncoder(encoder);
+        encoder = nullptr;
+        NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS session_params = {api::open_encode_session_ex_params_version(selected_api_version)};
+        session_params.device = device;
+        session_params.deviceType = device_type;
+        session_params.apiVersion = selected_api_version;
+        if (nvenc_failed(nvenc->nvEncOpenEncodeSessionEx(&session_params, &encoder))) {
+          BOOST_LOG(error) << "NvEnc: NvEncOpenEncodeSessionEx() failed: " << last_nvenc_error_string;
+          return false;
+        }
+        init_params.enableExternalMEHints = 0;
+        init_params.maxMEHintCountsPerBlock[0] = {};
+      }
+    }
+
+    if (!motion_hints_enabled && nvenc_failed(nvenc->nvEncInitializeEncoder(encoder, &init_params))) {
       auto init_error = last_nvenc_error_string;
       auto init_status = last_nvenc_status;
 
@@ -827,6 +859,9 @@ namespace nvenc {
       if (config.vbv_percentage_increase > 0 && get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
         extra += std::format(" vbv+{}", config.vbv_percentage_increase);
       }
+      if (motion_hints_enabled) {
+        extra += " motion-hints";
+      }
       if (encoder_params.rfi) {
         extra += " rfi";
       }
@@ -898,6 +933,84 @@ namespace nvenc {
                     << " nits, MaxFALL " << metadata.maxFrameAverageLightLevel << " nits)";
   }
 
+  void nvenc_base::set_motion_hints(motion_hints_t hints) {
+    pending_motion_hints = std::move(hints);
+  }
+
+  // The pending hints in the codec's layout (mb_hints / sb_hints); false if
+  // there are none for this picture
+  bool nvenc_base::pack_motion_hints() {
+    const auto &h = pending_motion_hints;
+    const uint32_t cols = (encoder_params.width + 15) / 16;
+    const uint32_t rows = (encoder_params.height + 15) / 16;
+    if (h.cols != cols || h.rows != rows || h.vectors.size() != static_cast<size_t>(cols) * rows * 2) {
+      return false;
+    }
+    auto at = [&](uint32_t x, uint32_t y, int32_t &vx, int32_t &vy) {
+      const size_t i = (static_cast<size_t>(y) * cols + x) * 2;
+      vx = h.vectors[i];
+      vy = h.vectors[i + 1];
+      return vx != motion_hints_t::kNone;
+    };
+
+    if (encoder_params.video_format == 2) {
+      // AV1: superblocks in raster order, each with its 16x16 coding units in
+      // quadtree (Z) order at their positions in 8-pixel units; units outside
+      // the picture are left out. Quarter-pixel vectors, S12.2 / S10.2.
+      const uint32_t sb_cols = (cols + 3) / 4, sb_rows = (rows + 3) / 4;
+      sb_hints.clear();
+      sb_hints.reserve(static_cast<size_t>(sb_cols) * sb_rows * 16);
+      for (uint32_t sy = 0; sy < sb_rows; ++sy) {
+        for (uint32_t sx = 0; sx < sb_cols; ++sx) {
+          const size_t first = sb_hints.size();
+          for (uint32_t i = 0; i < 16; ++i) {
+            const uint32_t cx = (i & 1) | ((i >> 1) & 2), cy = ((i >> 1) & 1) | ((i >> 2) & 2);
+            const uint32_t bx = sx * 4 + cx, by = sy * 4 + cy;
+            if (bx >= cols || by >= rows) {
+              continue;
+            }
+            int32_t vx, vy;
+            const bool valid = at(bx, by, vx, vy) && std::abs(vx) <= 4092 && std::abs(vy) <= 2044;
+            NVENC_EXTERNAL_ME_SB_HINT hint {};
+            hint.refidx = valid ? 0 : -1;  // (signed 5-bit field: all ones = 31 = invalid)
+            hint.x8 = static_cast<int16_t>(cx * 2 >= 4 ? cx * 2 - 8 : cx * 2);  // (signed 3-bit fields hold 0..7 as bit patterns)
+            hint.y8 = static_cast<int16_t>(cy * 2 >= 4 ? cy * 2 - 8 : cy * 2);
+            hint.cu_size = 1;  // 16x16
+            hint.last_of_cu = -1;
+            hint.mvx = static_cast<int16_t>(valid ? vx : 0);
+            hint.mvy = static_cast<int16_t>(valid ? vy : 0);
+            sb_hints.push_back(hint);
+          }
+          if (sb_hints.size() > first) {
+            sb_hints.back().last_of_sb = -1;
+          }
+        }
+      }
+      return true;
+    }
+
+    // H.264 / HEVC: one 16x16 candidate per macroblock, raster order,
+    // full-pixel vectors (S12.0 / S10.0)
+    mb_hints.assign(static_cast<size_t>(cols) * rows, NVENC_EXTERNAL_ME_HINT {});
+    for (uint32_t y = 0; y < rows; ++y) {
+      for (uint32_t x = 0; x < cols; ++x) {
+        int32_t vx, vy;
+        const bool have = at(x, y, vx, vy);
+        const int32_t fx = have ? static_cast<int32_t>(std::lround(vx / 4.0)) : 0;
+        const int32_t fy = have ? static_cast<int32_t>(std::lround(vy / 4.0)) : 0;
+        const bool valid = have && fx >= -2048 && fx <= 2047 && fy >= -512 && fy <= 511;
+        auto &hint = mb_hints[static_cast<size_t>(y) * cols + x];
+        hint.mvx = valid ? fx : 0;
+        hint.mvy = valid ? fy : 0;
+        hint.refidx = valid ? 0 : -1;
+        hint.partType = 0;  // 16x16
+        hint.lastofPart = -1;  // (signed 1-bit fields: set)
+        hint.lastOfMB = -1;
+      }
+    }
+    return true;
+  }
+
   nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
     if (!encoder) {
       return {};
@@ -934,6 +1047,21 @@ namespace nvenc {
     pic_params.bufferFmt = mapped_input_buffer.mappedBufferFmt;
     pic_params.outputBitstream = output_bitstream;
     pic_params.completionEvent = async_event_handle;
+
+    // This frame's motion hints (only for the step from the previous frame)
+    const bool use_hints = motion_hints_enabled && !force_idr && !rfi_since_last_frame && pack_motion_hints();
+    pending_motion_hints = {};
+    rfi_since_last_frame = false;
+    if (use_hints) {
+      if (encoder_params.video_format == 2) {
+        pic_params.meHintCountsPerBlock[0].numCandsPerSb = 16;
+        pic_params.meExternalSbHints = sb_hints.data();
+        pic_params.meSbHintsCount = static_cast<uint32_t>(sb_hints.size());
+      } else {
+        pic_params.meHintCountsPerBlock[0].numCandsPerBlk16x16 = 1;
+        pic_params.meExternalHints = mb_hints.data();
+      }
+    }
 
 #if NVENCAPI_MAJOR_VERSION >= 13
     CONTENT_LIGHT_LEVEL content_light_level {};
@@ -1058,6 +1186,7 @@ namespace nvenc {
       return false;
     }
 
+    rfi_since_last_frame = true;  // (the next frame predicts from an older one: no motion hints for it)
     for (auto i = first_frame; i <= last_frame; i++) {
       if (nvenc_failed(nvenc->nvEncInvalidateRefFrames(encoder, i))) {
         BOOST_LOG(error) << "NvEnc: NvEncInvalidateRefFrames() " << i << " failed: " << last_nvenc_error_string;

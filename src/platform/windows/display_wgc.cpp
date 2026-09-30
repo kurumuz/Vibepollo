@@ -22,6 +22,7 @@
 #include "src/platform/windows/display_vram.h"
 #include "src/platform/windows/game_activity.h"
 #include "src/platform/windows/game_capture/game_source.h"
+#include "src/platform/windows/game_capture/motion_hints.h"
 #include "src/platform/windows/misc.h"
 #include "src/utility.h"
 
@@ -398,6 +399,12 @@ namespace platf::dxgi {
     // Keep WGC's QPC-derived timestamp for RTP/client accounting, but do not
     // use compositor timestamp jitter as the capture-loop sleep anchor.
     img->capture_pacing_timestamp = host_processing_timestamp;
+    // A desktop frame: no game frame, and the game's next one has no predecessor
+    d3d_img->game_frame_id = 0;
+    d3d_img->motion = nullptr;
+    if (_game_motion) {
+      _game_motion->reset();
+    }
     img_out = img;
     _last_cached_frame = img;
 
@@ -502,6 +509,15 @@ namespace platf::dxgi {
       return capture_e::ok;
     }
     d3d_img->blank = false;
+    // Its DLSS motion vectors as encoder hints (while the frame is still held)
+    d3d_img->game_frame_id = frame.frame_id;
+    d3d_img->motion = nullptr;
+    if (config::video.nv.motion_hints) {
+      if (!_game_motion) {
+        _game_motion = std::make_unique<game_capture::motion_pass_t>();
+      }
+      d3d_img->motion = _game_motion->run(device.get(), device_ctx.get(), frame);
+    }
 
     // The frame is the game's: stamped when the GPU finished it (the fence
     // completing the hook's copy), or at its Present without fence support

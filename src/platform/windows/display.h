@@ -412,6 +412,7 @@ namespace platf::dxgi {
   namespace game_capture {
     class source_t;
     class converter_t;
+    class motion_pass_t;
   }  // namespace game_capture
 
   class display_wgc_ipc_vram_t: public display_vram_t {
@@ -503,6 +504,7 @@ namespace platf::dxgi {
     // In-game capture (hybrid): used while a hooked game is focused and fullscreen
     std::unique_ptr<game_capture::source_t> _game_source;
     std::unique_ptr<game_capture::converter_t> _game_converter;
+    std::unique_ptr<game_capture::motion_pass_t> _game_motion;  ///< DLSS motion vectors -> encoder hints (nvenc_motion_hints)
     foreground_app::state_t _game_foreground;
     std::chrono::steady_clock::time_point _game_foreground_checked {};
     float _game_sdr_white_scale = 1.0f;

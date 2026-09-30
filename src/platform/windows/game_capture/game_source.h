@@ -31,6 +31,17 @@ namespace platf::dxgi::game_capture {
     std::uint64_t present_qpc = 0;  ///< validated: within the last second
     std::uint64_t gpu_done_qpc = 0;  ///< 0 when the hook had no fence
     std::uint64_t release_qpc = 0;  ///< the limiter release that started the frame (0 = not paced)
+
+    // The game's DLSS motion vectors for this frame (see protocol.h), held
+    // with the frame; null: none
+    ID3D11Texture2D *motion = nullptr;
+    std::uint64_t motion_id = 0;  ///< the DLSS evaluation (consecutive evaluations: consecutive ids)
+    std::uint32_t motion_width = 0;  ///< the region holding them, from the texture's top-left
+    std::uint32_t motion_height = 0;
+    std::uint32_t motion_out_width = 0;  ///< the DLSS output they span
+    std::uint32_t motion_out_height = 0;
+    float motion_scale_x = 1;  ///< vector = stored value * scale, in pixels of the region
+    float motion_scale_y = 1;
   };
 
   class source_t {

@@ -217,6 +217,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_wgc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/game_source.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/game_source.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/motion_hints.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/motion_hints.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/protocol.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/dxgi_symbols.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/game_capture/dxgi_symbols.h"

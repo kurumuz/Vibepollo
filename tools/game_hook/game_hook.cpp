@@ -313,8 +313,10 @@ namespace {
   // never meets a recycled handle value.
   struct retired_t {
     IUnknown *textures[gc::kSlots] = {};  // ID3D11Texture2D or ID3D12Resource
+    IUnknown *motion[gc::kSlots] = {};  // the generation's motion textures (same kinds)
     IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
     HANDLE handles[gc::kSlots] = {};
+    HANDLE motion_handles[gc::kSlots] = {};
     ID3D11Fence *fence = nullptr;  // the fence its copies were signalled on (a reference; D3D11)
     ID3D12Fence *fence12 = nullptr;  // ... or D3D12 (then nothing is released before it completes)
     ID3D12CommandAllocator *allocators[gc::kSlots] = {};  // D3D12 command storage of a released capture
@@ -354,6 +356,16 @@ namespace {
     IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
     HANDLE shared_handles[gc::kSlots] = {};  // NT handles (owned); null with legacy sharing
     std::uint64_t legacy_handles[gc::kSlots] = {};  // global (KMT) share handles: not closable, live as long as the texture
+
+    // Motion textures of the generation (see the motion section), shared like
+    // the textures and guarded with them; motion_format UNKNOWN = none
+    ID3D11Texture2D *motion11[gc::kSlots] = {};
+    ID3D12Resource *motion12[gc::kSlots] = {};
+    HANDLE motion_handles[gc::kSlots] = {};
+    std::uint64_t motion_legacy[gc::kSlots] = {};
+    DXGI_FORMAT motion_format = DXGI_FORMAT_UNKNOWN;
+    UINT motion_width = 0;
+    UINT motion_height = 0;
     bool owner_sync = false;  // no keyed mutexes: slots are guarded by shared_block_t::owner
     UINT width = 0;
     UINT height = 0;
@@ -368,6 +380,47 @@ namespace {
 
   capture_t g_cap;
   std::atomic<IDXGISwapChain *> g_captured_swapchain {nullptr};  // g_cap.swapchain, readable without the capture lock
+
+  // The motion textures a generation should have (see the motion section)
+  struct motion_want_t {
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;  // UNKNOWN: none wanted
+    UINT width = 0;
+    UINT height = 0;
+
+    bool operator==(const motion_want_t &o) const {
+      return format == o.format && width == o.width && height == o.height;
+    }
+  };
+
+  // The vectors a captured frame carries: one evaluation's ring texture (a
+  // reference, see the motion section) and where they lie in it
+  struct motion_pick_t {
+    std::uint64_t id = 0;  // 0 = none
+    ID3D11Texture2D *src11 = nullptr;
+    ID3D12Resource *src12 = nullptr;
+    UINT width = 0;  // the region, from the ring texture's top-left
+    UINT height = 0;
+    UINT out_width = 0;  // the DLSS output it spans
+    UINT out_height = 0;
+    float scale_x = 1;
+    float scale_y = 1;
+    motion_want_t textures;  // the ring's format and size: what the generation's motion textures must be
+
+    void release() {
+      safe_release(src11);
+      safe_release(src12);
+      id = 0;
+    }
+  };
+
+  motion_want_t g_motion_refused;  // a set the device would not create: not asked for again (capture lock)
+
+  // Whether the current generation serves `want` (one that has motion
+  // textures keeps them when none is wanted)
+  bool motion_satisfied(const motion_want_t &want) {
+    return want.format == DXGI_FORMAT_UNKNOWN || want == g_motion_refused ||
+           (g_cap.motion_format == want.format && g_cap.motion_width == want.width && g_cap.motion_height == want.height);
+  }
 
   std::atomic<std::uint64_t> g_vk_completed {0};  // Vulkan: the last copy the fence waiter saw finish (UINT64_MAX: device lost)
 
@@ -399,6 +452,14 @@ namespace {
       const auto value = g_cap.shared_handles[i] ? reinterpret_cast<std::uint64_t>(g_cap.shared_handles[i]) : g_cap.legacy_handles[i];
       b.setup.textures[i].store(valid ? value : 0, std::memory_order_relaxed);
     }
+    const bool motion = valid && g_cap.motion_format != DXGI_FORMAT_UNKNOWN;
+    for (int i = 0; i < gc::kSlots; ++i) {
+      const auto value = g_cap.motion_handles[i] ? reinterpret_cast<std::uint64_t>(g_cap.motion_handles[i]) : g_cap.motion_legacy[i];
+      b.setup.motion_textures[i].store(motion ? value : 0, std::memory_order_relaxed);
+    }
+    b.setup.motion_format.store(motion ? static_cast<std::uint32_t>(g_cap.motion_format) : 0, std::memory_order_relaxed);
+    b.setup.motion_width.store(motion ? g_cap.motion_width : 0, std::memory_order_relaxed);
+    b.setup.motion_height.store(motion ? g_cap.motion_height : 0, std::memory_order_relaxed);
     b.setup.sync.store(static_cast<std::uint32_t>(g_cap.owner_sync ? gc::sync_e::owner : gc::sync_e::keyed_mutex), std::memory_order_relaxed);
     b.setup.handle_kind.store(static_cast<std::uint32_t>(valid && g_cap.legacy_handles[0] ? gc::handle_kind_e::legacy : gc::handle_kind_e::nt), std::memory_order_relaxed);
     if (valid && g_cap.device12) {
@@ -437,6 +498,7 @@ namespace {
     for (int i = 0; i < gc::kSlots; ++i) {
       safe_release(r.mutexes[i]);
       safe_release(r.textures[i]);
+      safe_release(r.motion[i]);
       safe_release(r.lists[i]);
       safe_release(r.allocators[i]);
     }
@@ -470,11 +532,15 @@ namespace {
           release_retired(r);
         }
       }
-      const bool has_handles = r.legacy || std::any_of(std::begin(r.handles), std::end(r.handles), [](HANDLE h) {
-                                 return h != nullptr;
-                               });
+      const auto some = [](const HANDLE (&handles)[gc::kSlots]) {
+        return std::any_of(std::begin(handles), std::end(handles), [](HANDLE h) {
+          return h != nullptr;
+        });
+      };
+      const bool has_handles = r.legacy || some(r.handles) || some(r.motion_handles);
       if (r.textures_released && (!has_handles || now - r.retired_qpc > 2 * qpc_frequency() || force)) {
         close_handles(r.handles);
+        close_handles(r.motion_handles);
         r.in_use = false;
       }
     }
@@ -540,14 +606,24 @@ namespace {
     for (int i = 0; i < gc::kSlots; ++i) {
       slot->textures[i] = g_cap.textures[i] ? static_cast<IUnknown *>(g_cap.textures[i]) : static_cast<IUnknown *>(g_cap.textures12[i]);
     }
+    for (int i = 0; i < gc::kSlots; ++i) {
+      slot->motion[i] = g_cap.motion11[i] ? static_cast<IUnknown *>(g_cap.motion11[i]) : static_cast<IUnknown *>(g_cap.motion12[i]);
+    }
     std::memcpy(slot->mutexes, g_cap.mutexes, sizeof(g_cap.mutexes));
     std::memcpy(slot->handles, g_cap.shared_handles, sizeof(g_cap.shared_handles));
+    std::memcpy(slot->motion_handles, g_cap.motion_handles, sizeof(g_cap.motion_handles));
     slot->legacy = g_cap.legacy_handles[0] != 0;
     std::memset(g_cap.textures, 0, sizeof(g_cap.textures));
     std::memset(g_cap.textures12, 0, sizeof(g_cap.textures12));
     std::memset(g_cap.mutexes, 0, sizeof(g_cap.mutexes));
     std::memset(g_cap.shared_handles, 0, sizeof(g_cap.shared_handles));
     std::memset(g_cap.legacy_handles, 0, sizeof(g_cap.legacy_handles));
+    std::memset(g_cap.motion11, 0, sizeof(g_cap.motion11));
+    std::memset(g_cap.motion12, 0, sizeof(g_cap.motion12));
+    std::memset(g_cap.motion_handles, 0, sizeof(g_cap.motion_handles));
+    std::memset(g_cap.motion_legacy, 0, sizeof(g_cap.motion_legacy));
+    g_cap.motion_format = DXGI_FORMAT_UNKNOWN;
+    g_cap.motion_width = g_cap.motion_height = 0;
     g_cap.owner_sync = false;
     g_cap.width = g_cap.height = 0;
     g_cap.format = DXGI_FORMAT_UNKNOWN;
@@ -722,9 +798,62 @@ namespace {
 
   // `terminal`: whether a failure is reported to the host as final (not
   // when the caller still has another sharing kind to try)
-  bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd, sharing_e sharing = sharing_e::any, bool terminal = true) {
+  // A generation's motion textures on the D3D11 device, shared like its
+  // textures (`nt`), without keyed mutexes: they are read under the slot's.
+  // False (nothing created) if the device refuses them.
+  bool create_motion11(const motion_want_t &want, bool nt) {
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = want.width;
+    desc.Height = want.height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = want.format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | (nt ? D3D11_RESOURCE_MISC_SHARED_NTHANDLE : 0);
+    HRESULT hr = S_OK;
+    for (int i = 0; i < gc::kSlots && SUCCEEDED(hr); ++i) {
+      hr = g_cap.device->CreateTexture2D(&desc, nullptr, &g_cap.motion11[i]);
+      if (SUCCEEDED(hr) && nt) {
+        IDXGIResource1 *resource = nullptr;
+        hr = g_cap.motion11[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&resource));
+        if (SUCCEEDED(hr)) {
+          hr = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &g_cap.motion_handles[i]);
+          resource->Release();
+        }
+      } else if (SUCCEEDED(hr)) {
+        IDXGIResource *resource = nullptr;
+        hr = g_cap.motion11[i]->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&resource));
+        HANDLE handle = nullptr;
+        if (SUCCEEDED(hr)) {
+          hr = resource->GetSharedHandle(&handle);
+          resource->Release();
+        }
+        if (SUCCEEDED(hr) && !handle) {
+          hr = E_FAIL;
+        }
+        g_cap.motion_legacy[i] = reinterpret_cast<std::uint64_t>(handle);
+      }
+    }
+    if (FAILED(hr)) {
+      for (int i = 0; i < gc::kSlots; ++i) {
+        safe_release(g_cap.motion11[i]);
+      }
+      close_handles(g_cap.motion_handles);
+      std::memset(g_cap.motion_legacy, 0, sizeof(g_cap.motion_legacy));
+      log("Motion textures %ux%u format %d could not be created (0x%08lx): frames go without motion vectors", want.width, want.height, want.format, hr);
+      return false;
+    }
+    g_cap.motion_format = want.format;
+    g_cap.motion_width = want.width;
+    g_cap.motion_height = want.height;
+    return true;
+  }
+
+  bool ensure_textures(const D3D11_TEXTURE2D_DESC &back, HWND hwnd, sharing_e sharing = sharing_e::any, bool terminal = true, const motion_want_t &motion = {}) {
     const DXGI_FORMAT format = shareable_format(back.Format);
-    if (g_cap.textures[0] && g_cap.width == back.Width && g_cap.height == back.Height && g_cap.format == format) {
+    if (g_cap.textures[0] && g_cap.width == back.Width && g_cap.height == back.Height && g_cap.format == format && motion_satisfied(motion)) {
       return true;
     }
     retire_generation(hwnd);
@@ -871,11 +1000,15 @@ namespace {
     g_cap.width = back.Width;
     g_cap.height = back.Height;
     g_cap.format = format;
+    if (motion.format != DXGI_FORMAT_UNKNOWN && !(motion == g_motion_refused) && !create_motion11(motion, used->nt)) {
+      g_motion_refused = motion;
+    }
     if (g_current_generation.load(std::memory_order_acquire) == 0) {
       g_current_generation.store(1, std::memory_order_release);  // 0 means "nothing set up" to the host
     }
     publish_setup(hwnd, true);
-    log("Capture textures %ux%u format %d, generation %u", back.Width, back.Height, format, g_current_generation.load());
+    log("Capture textures %ux%u format %d, generation %u%s", back.Width, back.Height, format, g_current_generation.load(),
+        g_cap.motion_format != DXGI_FORMAT_UNKNOWN ? " (with motion textures)" : "");
     return true;
   }
 
@@ -893,8 +1026,10 @@ namespace {
   // keyed mutex or owner word), before the copy: a host that holds the slot
   // and reads an even record reads the metadata of exactly its pixels.
   // Returns the record's version.
+  // `motion`: the vectors copied into the slot's motion texture with its
+  // pixels (null: none)
   std::uint32_t write_slot_record(int slot, std::uint32_t generation, std::uint32_t color_space, std::uint64_t frame_id,
-                                  std::uint64_t present_qpc, std::uint64_t release_qpc) {
+                                  std::uint64_t present_qpc, std::uint64_t release_qpc, const motion_pick_t *motion = nullptr) {
     auto &record = g_block->slots[slot];
     const auto seq = record.seq.load(std::memory_order_relaxed);
     record.seq.store(seq + 1, std::memory_order_release);
@@ -905,6 +1040,18 @@ namespace {
     record.present_qpc.store(present_qpc, std::memory_order_relaxed);
     record.release_qpc.store(release_qpc, std::memory_order_relaxed);
     record.gpu_done_qpc.store(0, std::memory_order_relaxed);
+    const auto bits = [](float f) {
+      std::uint32_t u;
+      std::memcpy(&u, &f, sizeof(u));
+      return u;
+    };
+    record.motion_id.store(motion ? motion->id : 0, std::memory_order_relaxed);
+    record.motion_width.store(motion ? motion->width : 0, std::memory_order_relaxed);
+    record.motion_height.store(motion ? motion->height : 0, std::memory_order_relaxed);
+    record.motion_out_width.store(motion ? motion->out_width : 0, std::memory_order_relaxed);
+    record.motion_out_height.store(motion ? motion->out_height : 0, std::memory_order_relaxed);
+    record.motion_scale_x.store(motion ? bits(motion->scale_x) : 0, std::memory_order_relaxed);
+    record.motion_scale_y.store(motion ? bits(motion->scale_y) : 0, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     record.seq.store(seq + 2, std::memory_order_release);
     return (seq + 2) >> 1;
@@ -1079,6 +1226,8 @@ namespace {
 
   void run_armed_capture(ID3D12CommandQueue *queue);
   void disarm_capture();
+  bool motion_submissions_pending();  // (motion section)
+  void motion_note_submission(UINT count, ID3D12CommandList *const *lists);
   void cancel_prepared11_for(IDXGISwapChain *swapchain);  // (PresentImpl section)
   void give_back_armed11();
 
@@ -1087,6 +1236,9 @@ namespace {
   std::atomic<bool> g_d3d12_dead {false};
 
   void STDMETHODCALLTYPE hook_execute_command_lists(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists) {
+    if (motion_submissions_pending()) {
+      motion_note_submission(count, lists);  // (any queue, any thread: a DLSS evaluation may be in these)
+    }
     // Only direct queues can present; copy/compute submissions inside
     // Present (an overlay's uploads, say) are not candidates
     if (t_presenting && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
@@ -1391,10 +1543,48 @@ namespace {
     return true;
   }
 
-  bool ensure_textures12(const D3D12_RESOURCE_DESC &back, HWND hwnd) {
+  // D3D12 motion textures of a generation: shared, simultaneous-access (the
+  // copy promotes them and they decay to COMMON, like the frame textures).
+  // False (nothing created) if the device refuses them.
+  bool create_motion12(const motion_want_t &want) {
+    D3D12_HEAP_PROPERTIES heap {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = want.width;
+    desc.Height = want.height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = want.format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;  // (see ensure_textures12)
+    HRESULT hr = S_OK;
+    for (int i = 0; i < gc::kSlots && SUCCEEDED(hr); ++i) {
+      hr = g_cap.device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                   __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_cap.motion12[i]));
+      if (SUCCEEDED(hr)) {
+        hr = g_cap.device12->CreateSharedHandle(g_cap.motion12[i], nullptr, GENERIC_ALL, nullptr, &g_cap.motion_handles[i]);
+      }
+    }
+    if (FAILED(hr)) {
+      for (int i = 0; i < gc::kSlots; ++i) {
+        safe_release(g_cap.motion12[i]);
+      }
+      close_handles(g_cap.motion_handles);
+      log("D3D12 motion textures %ux%u format %d could not be created (0x%08lx): frames go without motion vectors", want.width, want.height, want.format, hr);
+      return false;
+    }
+    g_cap.motion_format = want.format;
+    g_cap.motion_width = want.width;
+    g_cap.motion_height = want.height;
+    return true;
+  }
+
+  bool ensure_textures12(const D3D12_RESOURCE_DESC &back, HWND hwnd, const motion_want_t &motion = {}) {
     const DXGI_FORMAT format = shareable_format(back.Format);
     const auto width = static_cast<UINT>(back.Width);
-    if (g_cap.textures12[0] && g_cap.width == width && g_cap.height == back.Height && g_cap.format == format) {
+    if (g_cap.textures12[0] && g_cap.width == width && g_cap.height == back.Height && g_cap.format == format && motion_satisfied(motion)) {
       return true;
     }
     retire_generation(hwnd);
@@ -1440,11 +1630,15 @@ namespace {
     g_cap.width = width;
     g_cap.height = back.Height;
     g_cap.format = format;
+    if (motion.format != DXGI_FORMAT_UNKNOWN && !(motion == g_motion_refused) && !create_motion12(motion)) {
+      g_motion_refused = motion;
+    }
     if (g_current_generation.load(std::memory_order_acquire) == 0) {
       g_current_generation.store(1, std::memory_order_release);
     }
     publish_setup(hwnd, true);
-    log("D3D12 capture textures %ux%u format %d, generation %u", width, back.Height, format, g_current_generation.load());
+    log("D3D12 capture textures %ux%u format %d, generation %u%s", width, back.Height, format, g_current_generation.load(),
+        g_cap.motion_format != DXGI_FORMAT_UNKNOWN ? " (with motion textures)" : "");
     return true;
   }
 
@@ -1456,6 +1650,693 @@ namespace {
     b.Transition.StateBefore = before;
     b.Transition.StateAfter = after;
     return b;
+  }
+
+  // ---- DLSS motion vectors -------------------------------------------------
+  //
+  // Games that use DLSS hand it, every frame, screen-space motion vectors
+  // ("the location the pixel occupied in the previous frame" = pixel +
+  // vector, in pixels of the region they cover, times MV.Scale). They reach
+  // the driver's NGX (_nvngx.dll) through its EvaluateFeature entry points,
+  // whichever SDK or Streamline sits in between, so those are detoured
+  // (once _nvngx.dll is loaded, by a watcher thread; the module is pinned).
+  //
+  // After a successful evaluation of an upscaling feature (super sampling or
+  // ray reconstruction), its motion-vector region is copied, on the game's own
+  // command list (D3D12: after the evaluation's work; the vectors are in
+  // NON_PIXEL_SHADER_RESOURCE there, which DLSS requires) or immediate context
+  // (D3D11), into a ring of hook-owned textures. A captured frame takes the
+  // newest evaluation submitted before its Present (D3D12: seen in
+  // ExecuteCommandLists; D3D11: the immediate context is ordered by call) and
+  // its capture copy moves those vectors into the slot's motion texture. Queue
+  // order keeps each ring entry intact until then: the game submits the next
+  // frame's evaluation after this Present. The ring textures rest in
+  // COPY_SOURCE between uses (D3D12).
+  //
+  // Nothing here waits: the motion lock is only try-locked by the game's
+  // threads (a busy lock costs that frame its vectors), and an evaluation we
+  // cannot use is left alone.
+
+  constexpr int kMotionRing = 4;
+  constexpr int kMotionEvals = 8;  // evaluations remembered (D3D12: until submitted)
+  constexpr int kMotionOldRings = 4;
+  constexpr std::uint32_t kNgxFeatureSuperSampling = 1;
+  constexpr std::uint32_t kNgxFeatureRayReconstruction = 13;
+  constexpr int kNgxFlagMvLowRes = 1 << 1;  // DLSS.Feature.Create.Flags: vectors at render resolution
+
+  struct motion_ring_t {
+    gc::api_e api = gc::api_e::unknown;
+    IUnknown *device = nullptr;  // a reference (ID3D11Device / ID3D12Device)
+    motion_want_t desc;  // format and size of each texture
+    ID3D11Texture2D *tex11[kMotionRing] = {};
+    ID3D12Resource *tex12[kMotionRing] = {};
+    std::uint64_t retired_qpc = 0;
+
+    void release() {
+      for (int i = 0; i < kMotionRing; ++i) {
+        safe_release(tex11[i]);
+        safe_release(tex12[i]);
+      }
+      safe_release(device);
+      *this = motion_ring_t {};
+    }
+  };
+
+  struct motion_eval_t {
+    std::uint64_t id = 0;  // 0 = empty
+    const void *list = nullptr;  // D3D12: the command list it was recorded into (identity)
+    bool submitted = false;
+    UINT width = 0;
+    UINT height = 0;
+    UINT out_width = 0;
+    UINT out_height = 0;
+    float scale_x = 1;
+    float scale_y = 1;
+  };
+
+  struct motion_feature_t {
+    const void *handle = nullptr;
+    std::uint32_t id = 0;
+  };
+
+  SRWLOCK g_motion_lock = SRWLOCK_INIT;
+  motion_ring_t g_motion_ring;  // the current device's
+  motion_ring_t g_motion_old[kMotionOldRings];  // replaced rings, released two seconds later (the GPU may still use them)
+  motion_eval_t g_motion_evals[kMotionEvals];
+  motion_feature_t g_motion_features[16];
+  std::uint64_t g_motion_next_id = 1;
+  std::uint64_t g_motion_latest = 0;  // the newest submitted evaluation
+  std::uint64_t g_motion_paired = 0;  // the newest one a captured frame took
+  std::atomic<int> g_motion_unsubmitted {0};  // D3D12 evaluations not yet seen submitted (the ExecuteCommandLists fast path)
+
+  bool motion_wanted() {
+    return g_block && g_block->motion_enabled.load(std::memory_order_acquire) != 0;
+  }
+
+  // Whatever kind of lock: a try-lock that gives up after a few spins
+  struct motion_lock_t {
+    bool held = false;
+
+    motion_lock_t() {
+      for (int i = 0; i < 64 && !held; ++i) {
+        held = TryAcquireSRWLockExclusive(&g_motion_lock);
+        if (!held) {
+          YieldProcessor();
+        }
+      }
+    }
+
+    ~motion_lock_t() {
+      if (held) {
+        ReleaseSRWLockExclusive(&g_motion_lock);
+      }
+    }
+  };
+
+  // NVSDK_NGX_Parameter is an MSVC-compiled interface: its overloaded
+  // virtuals sit in reverse declaration order, the eight Set overloads in
+  // slots 0-7, the Get overloads in 8-15 (void**, ID3D12Resource**,
+  // ID3D11Resource**, int*, unsigned*, double*, float*, unsigned long long*).
+  // A Get is a plain x64 call with `this` first.
+  enum ngx_get_e : int {
+    kNgxGetVoid = 8,
+    kNgxGetD3d12 = 9,
+    kNgxGetD3d11 = 10,
+    kNgxGetInt = 11,
+    kNgxGetUInt = 12,
+    kNgxGetFloat = 14,
+  };
+
+  bool ngx_ok(std::uint32_t result) {
+    return (result & 0xfff00000u) != 0xbad00000u;
+  }
+
+  template<class T>
+  bool ngx_get(const void *params, ngx_get_e slot, const char *key, T &out) {
+    using get_fn = std::uint32_t (*)(const void *, const char *, T *);
+    void *const *vtable = *static_cast<void *const *const *>(params);
+    T value {};
+    if (!ngx_ok(reinterpret_cast<get_fn>(vtable[slot])(params, key, &value))) {
+      return false;
+    }
+    out = value;
+    return true;
+  }
+
+  // A resource parameter, by its name or its encoded name, typed or not
+  void *ngx_resource(const void *params, ngx_get_e typed, const char *key, const char *encoded) {
+    void *r = nullptr;
+    if ((ngx_get(params, typed, key, r) && r) || (ngx_get(params, typed, encoded, r) && r) ||
+        (ngx_get(params, kNgxGetVoid, key, r) && r) || (ngx_get(params, kNgxGetVoid, encoded, r) && r)) {
+      return r;
+    }
+    return nullptr;
+  }
+
+  // Float formats DLSS takes vectors in, as the typed format of our copies
+  DXGI_FORMAT motion_format(DXGI_FORMAT f) {
+    switch (f) {
+      case DXGI_FORMAT_R16G16_FLOAT:
+      case DXGI_FORMAT_R16G16_TYPELESS:
+        return DXGI_FORMAT_R16G16_FLOAT;
+      case DXGI_FORMAT_R32G32_FLOAT:
+      case DXGI_FORMAT_R32G32_TYPELESS:
+        return DXGI_FORMAT_R32G32_FLOAT;
+      default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+  }
+
+  // What one evaluation says about its vectors
+  struct motion_region_t {
+    UINT x = 0, y = 0, width = 0, height = 0;  // in the vector texture
+    UINT out_width = 0, out_height = 0;
+    float scale_x = 1, scale_y = 1;
+    bool low_res = true;
+  };
+
+  bool read_motion_region(const void *params, UINT mv_width, UINT mv_height, UINT out_width, UINT out_height, motion_region_t &r) {
+    std::uint32_t base_x = 0, base_y = 0, render_w = 0, render_h = 0;
+    ngx_get(params, kNgxGetUInt, "DLSS.Input.MV.Subrect.Base.X", base_x);
+    ngx_get(params, kNgxGetUInt, "DLSS.Input.MV.Subrect.Base.Y", base_y);
+    if (!ngx_get(params, kNgxGetUInt, "DLSS.Render.Subrect.Dimensions.Width", render_w) || !render_w ||
+        !ngx_get(params, kNgxGetUInt, "DLSS.Render.Subrect.Dimensions.Height", render_h) || !render_h) {
+      render_w = render_h = 0;
+      if (!(ngx_get(params, kNgxGetUInt, "Width", render_w) || ngx_get(params, kNgxGetUInt, "#\x10", render_w)) ||
+          !(ngx_get(params, kNgxGetUInt, "Height", render_h) || ngx_get(params, kNgxGetUInt, "#\x11", render_h))) {
+        render_w = render_h = 0;
+      }
+    }
+    int flags = 0;
+    // Without the creation flags: vectors smaller than the output are at render resolution
+    r.low_res = ngx_get(params, kNgxGetInt, "DLSS.Feature.Create.Flags", flags) ? (flags & kNgxFlagMvLowRes) != 0 : mv_width < out_width;
+    if (base_x >= mv_width || base_y >= mv_height) {
+      return false;
+    }
+    UINT w = r.low_res ? render_w : out_width;
+    UINT h = r.low_res ? render_h : out_height;
+    if (!w || !h) {
+      w = mv_width - base_x;
+      h = mv_height - base_y;
+    }
+    r.x = base_x;
+    r.y = base_y;
+    r.width = std::min(w, mv_width - base_x);
+    r.height = std::min(h, mv_height - base_y);
+    r.out_width = out_width;
+    r.out_height = out_height;
+    float sx = 1, sy = 1;
+    if (!(ngx_get(params, kNgxGetFloat, "MV.Scale.X", sx) || ngx_get(params, kNgxGetFloat, "#\x2c", sx))) {
+      sx = 1;
+    }
+    if (!(ngx_get(params, kNgxGetFloat, "MV.Scale.Y", sy) || ngx_get(params, kNgxGetFloat, "#\x2d", sy))) {
+      sy = 1;
+    }
+    r.scale_x = sx;
+    r.scale_y = sy;
+    return r.width > 0 && r.height > 0 && std::isfinite(sx) && std::isfinite(sy) && sx != 0 && sy != 0;
+  }
+
+  // Motion lock held. Whether this evaluation is an upscaler's (its vectors
+  // are the frame's): by the feature its handle was created for, or, for one
+  // created before we came, by its inputs (upscalers take colour, output and
+  // vectors under these names)
+  bool upscaler_feature(const void *handle, const void *params, ngx_get_e typed) {
+    for (const auto &f : g_motion_features) {
+      if (f.handle && f.handle == handle) {
+        return f.id == kNgxFeatureSuperSampling || f.id == kNgxFeatureRayReconstruction;
+      }
+    }
+    return ngx_resource(params, typed, "Color", "#\x1e") != nullptr;
+  }
+
+  void motion_note_feature(const void *handle, std::uint32_t feature) {
+    motion_lock_t lock;
+    if (!lock.held || !handle) {
+      return;
+    }
+    motion_feature_t *free = nullptr;
+    for (auto &f : g_motion_features) {
+      if (f.handle == handle) {
+        f.id = feature;
+        return;
+      }
+      if (!f.handle && !free) {
+        free = &f;
+      }
+    }
+    if (free) {
+      *free = {handle, feature};
+    }
+  }
+
+  void motion_forget_feature(const void *handle) {
+    motion_lock_t lock;
+    if (!lock.held) {
+      return;
+    }
+    for (auto &f : g_motion_features) {
+      if (f.handle == handle) {
+        f = motion_feature_t {};
+      }
+    }
+  }
+
+  // Motion lock held. Releases replaced rings that are old enough; false if
+  // there is no room to replace the current one
+  bool motion_collect_old(bool need_room) {
+    const auto now = qpc_now();
+    bool room = false;
+    for (auto &r : g_motion_old) {
+      if (r.api != gc::api_e::unknown && now - r.retired_qpc > 2 * qpc_frequency()) {
+        r.release();
+      }
+      room = room || r.api == gc::api_e::unknown;
+    }
+    return room || !need_room;
+  }
+
+  // Motion lock held. A ring on `device` for vectors of `desc`, replacing one
+  // of another device or shape; false if none can be had now
+  bool motion_ensure_ring(gc::api_e api, IUnknown *device, const motion_want_t &desc) {
+    if (g_motion_ring.api == api && g_motion_ring.device == device && g_motion_ring.desc == desc) {
+      return true;
+    }
+    if (!motion_collect_old(g_motion_ring.api != gc::api_e::unknown)) {
+      return false;
+    }
+    if (g_motion_ring.api != gc::api_e::unknown) {
+      for (auto &r : g_motion_old) {
+        if (r.api == gc::api_e::unknown) {
+          r = g_motion_ring;
+          r.retired_qpc = qpc_now();
+          g_motion_ring = motion_ring_t {};
+          break;
+        }
+      }
+    }
+    // (evaluations recorded into the old ring are forgotten: no frame takes them)
+    for (auto &e : g_motion_evals) {
+      if (e.id && !e.submitted) {
+        g_motion_unsubmitted.fetch_sub(1, std::memory_order_relaxed);
+      }
+      e = motion_eval_t {};
+    }
+    g_motion_latest = 0;
+
+    motion_ring_t ring;
+    ring.api = api;
+    ring.desc = desc;
+    HRESULT hr = S_OK;
+    if (api == gc::api_e::d3d12) {
+      auto *device12 = static_cast<ID3D12Device *>(device);
+      D3D12_HEAP_PROPERTIES heap {};
+      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      D3D12_RESOURCE_DESC rd {};
+      rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      rd.Width = desc.width;
+      rd.Height = desc.height;
+      rd.DepthOrArraySize = 1;
+      rd.MipLevels = 1;
+      rd.Format = desc.format;
+      rd.SampleDesc.Count = 1;
+      rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      for (int i = 0; i < kMotionRing && SUCCEEDED(hr); ++i) {
+        hr = device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                                               __uuidof(ID3D12Resource), reinterpret_cast<void **>(&ring.tex12[i]));
+      }
+    } else {
+      auto *device11 = static_cast<ID3D11Device *>(device);
+      D3D11_TEXTURE2D_DESC td {};
+      td.Width = desc.width;
+      td.Height = desc.height;
+      td.MipLevels = 1;
+      td.ArraySize = 1;
+      td.Format = desc.format;
+      td.SampleDesc.Count = 1;
+      td.Usage = D3D11_USAGE_DEFAULT;
+      td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+      for (int i = 0; i < kMotionRing && SUCCEEDED(hr); ++i) {
+        hr = device11->CreateTexture2D(&td, nullptr, &ring.tex11[i]);
+      }
+    }
+    if (FAILED(hr)) {
+      ring.release();
+      log("DLSS motion vectors: the ring (%ux%u format %d) could not be created: 0x%08lx", desc.width, desc.height, desc.format, hr);
+      return false;
+    }
+    device->AddRef();
+    ring.device = device;
+    g_motion_ring = ring;
+    log("DLSS motion vectors: copying %s vectors (%ux%u format %d)", api == gc::api_e::d3d12 ? "D3D12" : "D3D11", desc.width, desc.height, desc.format);
+    return true;
+  }
+
+  // Motion lock held. The ring entry and record for the next evaluation
+  motion_eval_t &motion_new_eval(const motion_region_t &r, const void *list, bool submitted, int &ring_index) {
+    const auto id = g_motion_next_id++;
+    auto &e = g_motion_evals[id % kMotionEvals];
+    if (e.id && !e.submitted) {
+      g_motion_unsubmitted.fetch_sub(1, std::memory_order_relaxed);
+    }
+    e = motion_eval_t {};
+    e.id = id;
+    e.list = list;
+    e.submitted = submitted;
+    e.width = r.width;
+    e.height = r.height;
+    e.out_width = r.out_width;
+    e.out_height = r.out_height;
+    e.scale_x = r.scale_x;
+    e.scale_y = r.scale_y;
+    ring_index = static_cast<int>(id % kMotionRing);
+    if (submitted) {
+      g_motion_latest = id;
+    } else {
+      g_motion_unsubmitted.fetch_add(1, std::memory_order_relaxed);
+    }
+    return e;
+  }
+
+  void log_first_eval(const char *api, const motion_region_t &r, UINT mv_w, UINT mv_h, DXGI_FORMAT format) {
+    static std::atomic<bool> logged {false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+      log("DLSS evaluation seen (%s): vectors %ux%u format %d, region %u,%u %ux%u (%s resolution), output %ux%u, scale %g,%g", api, mv_w, mv_h, format,
+          r.x, r.y, r.width, r.height, r.low_res ? "render" : "output", r.out_width, r.out_height, r.scale_x, r.scale_y);
+    }
+  }
+
+  void motion_after_eval12(ID3D12GraphicsCommandList *list, const void *handle, const void *params) {
+    const auto type = list->GetType();
+    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+      return;
+    }
+    auto *mv = static_cast<ID3D12Resource *>(ngx_resource(params, kNgxGetD3d12, "MotionVectors", "#\x27"));
+    auto *out = static_cast<ID3D12Resource *>(ngx_resource(params, kNgxGetD3d12, "Output", "#\x22"));
+    if (!mv || !out) {
+      return;
+    }
+    const auto mvd = mv->GetDesc();
+    const auto od = out->GetDesc();
+    const DXGI_FORMAT format = motion_format(mvd.Format);
+    if (mvd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || mvd.SampleDesc.Count != 1 || format == DXGI_FORMAT_UNKNOWN ||
+        mvd.Width > 16384 || mvd.Height > 16384) {
+      return;
+    }
+    motion_region_t r;
+    if (!read_motion_region(params, static_cast<UINT>(mvd.Width), mvd.Height, static_cast<UINT>(od.Width), od.Height, r)) {
+      return;
+    }
+    ID3D12Device *device = nullptr;
+    if (FAILED(list->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device)))) {
+      return;
+    }
+    struct release_t {
+      ID3D12Device *&d;
+
+      ~release_t() {
+        safe_release(d);
+      }
+    } release {device};
+
+    motion_lock_t lock;
+    if (!lock.held || !upscaler_feature(handle, params, kNgxGetD3d12)) {
+      return;
+    }
+    log_first_eval("D3D12", r, static_cast<UINT>(mvd.Width), mvd.Height, mvd.Format);
+    if (!motion_ensure_ring(gc::api_e::d3d12, device, {format, static_cast<UINT>(mvd.Width), mvd.Height})) {
+      return;
+    }
+    int k = 0;
+    motion_new_eval(r, list, false, k);
+    auto *ring = g_motion_ring.tex12[k];
+
+    // The vectors are in NON_PIXEL_SHADER_RESOURCE at the evaluation (DLSS
+    // requires it); a simultaneous-access resource needs no transition
+    const bool transition_mv = !(mvd.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+    D3D12_RESOURCE_BARRIER before[2] = {
+      transition(ring, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+      transition(mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+    };
+    D3D12_RESOURCE_BARRIER after[2] = {
+      transition(ring, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+      transition(mv, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+    };
+    before[1].Transition.Subresource = after[1].Transition.Subresource = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst {};
+    dst.pResource = ring;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src {};
+    src.pResource = mv;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const D3D12_BOX box {r.x, r.y, 0, r.x + r.width, r.y + r.height, 1};
+    list->ResourceBarrier(transition_mv ? 2 : 1, before);
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    list->ResourceBarrier(transition_mv ? 2 : 1, after);
+  }
+
+  void motion_after_eval11(ID3D11DeviceContext *context, const void *handle, const void *params) {
+    if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+      return;  // (a deferred context's work runs whenever the game executes it)
+    }
+    auto *mv_resource = static_cast<ID3D11Resource *>(ngx_resource(params, kNgxGetD3d11, "MotionVectors", "#\x27"));
+    auto *out_resource = static_cast<ID3D11Resource *>(ngx_resource(params, kNgxGetD3d11, "Output", "#\x22"));
+    if (!mv_resource || !out_resource) {
+      return;
+    }
+    ID3D11Texture2D *mv = nullptr, *out = nullptr;
+    ID3D11Device *device = nullptr;
+    struct release_t {
+      ID3D11Texture2D *&a, *&b;
+      ID3D11Device *&d;
+
+      ~release_t() {
+        safe_release(a);
+        safe_release(b);
+        safe_release(d);
+      }
+    } release {mv, out, device};
+    if (FAILED(mv_resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&mv))) ||
+        FAILED(out_resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&out)))) {
+      return;
+    }
+    D3D11_TEXTURE2D_DESC mvd {}, od {};
+    mv->GetDesc(&mvd);
+    out->GetDesc(&od);
+    const DXGI_FORMAT format = motion_format(mvd.Format);
+    if (mvd.SampleDesc.Count != 1 || format == DXGI_FORMAT_UNKNOWN || mvd.Width > 16384 || mvd.Height > 16384) {
+      return;
+    }
+    motion_region_t r;
+    if (!read_motion_region(params, mvd.Width, mvd.Height, od.Width, od.Height, r)) {
+      return;
+    }
+    context->GetDevice(&device);
+
+    motion_lock_t lock;
+    if (!lock.held || !device || !upscaler_feature(handle, params, kNgxGetD3d11)) {
+      return;
+    }
+    log_first_eval("D3D11", r, mvd.Width, mvd.Height, mvd.Format);
+    if (!motion_ensure_ring(gc::api_e::d3d11, device, {format, mvd.Width, mvd.Height})) {
+      return;
+    }
+    int k = 0;
+    motion_new_eval(r, nullptr, true, k);  // (the immediate context orders it before the next Present)
+    const D3D11_BOX box {r.x, r.y, 0, r.x + r.width, r.y + r.height, 1};
+    context->CopySubresourceRegion(g_motion_ring.tex11[k], 0, 0, 0, 0, mv, 0, &box);
+  }
+
+  bool motion_submissions_pending() {
+    return g_motion_unsubmitted.load(std::memory_order_relaxed) > 0;
+  }
+
+  // D3D12, from the ExecuteCommandLists detour: evaluations recorded into
+  // these lists are submitted now
+  void motion_note_submission(UINT count, ID3D12CommandList *const *lists) {
+    motion_lock_t lock;
+    if (!lock.held) {
+      return;  // (those evaluations stay unsubmitted: no frame takes them)
+    }
+    for (auto &e : g_motion_evals) {
+      if (!e.id || e.submitted) {
+        continue;
+      }
+      for (UINT i = 0; i < count; ++i) {
+        if (static_cast<const void *>(lists[i]) == e.list) {  // (single inheritance: the list's own pointer)
+          e.submitted = true;
+          g_motion_unsubmitted.fetch_sub(1, std::memory_order_relaxed);
+          g_motion_latest = std::max(g_motion_latest, e.id);
+          break;
+        }
+      }
+    }
+  }
+
+  // Capture lock held, before the capture copy is recorded: the vectors of
+  // the newest evaluation submitted since the last captured frame, if it was
+  // made on `device` (a reference to its ring texture). False if there are
+  // none; `want` then still names the ring's shape, so the generation keeps
+  // (or gets) motion textures.
+  bool motion_pick(gc::api_e api, IUnknown *device, motion_pick_t &pick, motion_want_t &want) {
+    pick = motion_pick_t {};
+    want = motion_want_t {};
+    if (!motion_wanted()) {
+      return false;
+    }
+    motion_lock_t lock;
+    if (!lock.held) {
+      return false;
+    }
+    motion_collect_old(false);
+    if (g_motion_ring.api != api || g_motion_ring.device != device) {
+      return false;
+    }
+    want = g_motion_ring.desc;
+    const auto id = g_motion_latest;
+    if (!id || id <= g_motion_paired) {
+      return false;
+    }
+    const auto &e = g_motion_evals[id % kMotionEvals];
+    if (e.id != id || !e.submitted) {
+      return false;
+    }
+    g_motion_paired = id;
+    const int k = static_cast<int>(id % kMotionRing);
+    pick.id = id;
+    pick.width = e.width;
+    pick.height = e.height;
+    pick.out_width = e.out_width;
+    pick.out_height = e.out_height;
+    pick.scale_x = e.scale_x;
+    pick.scale_y = e.scale_y;
+    pick.textures = g_motion_ring.desc;
+    if (api == gc::api_e::d3d12) {
+      pick.src12 = g_motion_ring.tex12[k];
+      pick.src12->AddRef();
+    } else {
+      pick.src11 = g_motion_ring.tex11[k];
+      pick.src11->AddRef();
+    }
+    return true;
+  }
+
+  // Whether the current generation's motion textures can take `pick`
+  bool motion_fits(const motion_pick_t &pick) {
+    return pick.id && g_cap.motion_format == pick.textures.format && g_cap.motion_width == pick.textures.width && g_cap.motion_height == pick.textures.height;
+  }
+
+  // ---- the NGX detours
+
+  using ngx_eval12_fn = std::uint32_t (*)(ID3D12GraphicsCommandList *, const void *, const void *, void *);
+  using ngx_eval11_fn = std::uint32_t (*)(ID3D11DeviceContext *, const void *, const void *, void *);
+  using ngx_create_fn = std::uint32_t (*)(void *, std::uint32_t, void *, void **);
+  using ngx_release_fn = std::uint32_t (*)(void *);
+
+  ngx_eval12_fn g_real_ngx_eval12 = nullptr;
+  ngx_eval12_fn g_real_ngx_eval12_c = nullptr;
+  ngx_eval11_fn g_real_ngx_eval11 = nullptr;
+  ngx_eval11_fn g_real_ngx_eval11_c = nullptr;
+  ngx_create_fn g_real_ngx_create12 = nullptr;
+  ngx_create_fn g_real_ngx_create11 = nullptr;
+  ngx_release_fn g_real_ngx_release12 = nullptr;
+  ngx_release_fn g_real_ngx_release11 = nullptr;
+
+  template<ngx_eval12_fn *Real>
+  std::uint32_t hook_ngx_eval12(ID3D12GraphicsCommandList *list, const void *handle, const void *params, void *callback) {
+    const auto result = (*Real)(list, handle, params, callback);
+    if (ngx_ok(result) && list && params && motion_wanted()) {
+      const DWORD error = GetLastError();
+      motion_after_eval12(list, handle, params);
+      SetLastError(error);
+    }
+    return result;
+  }
+
+  template<ngx_eval11_fn *Real>
+  std::uint32_t hook_ngx_eval11(ID3D11DeviceContext *context, const void *handle, const void *params, void *callback) {
+    const auto result = (*Real)(context, handle, params, callback);
+    if (ngx_ok(result) && context && params && motion_wanted()) {
+      const DWORD error = GetLastError();
+      motion_after_eval11(context, handle, params);
+      SetLastError(error);
+    }
+    return result;
+  }
+
+  template<ngx_create_fn *Real>
+  std::uint32_t hook_ngx_create(void *list_or_context, std::uint32_t feature, void *params, void **out_handle) {
+    const auto result = (*Real)(list_or_context, feature, params, out_handle);
+    if (ngx_ok(result) && out_handle && *out_handle) {
+      const DWORD error = GetLastError();
+      motion_note_feature(*out_handle, feature);
+      SetLastError(error);
+    }
+    return result;
+  }
+
+  template<ngx_release_fn *Real>
+  std::uint32_t hook_ngx_release(void *handle) {
+    motion_forget_feature(handle);
+    return (*Real)(handle);
+  }
+
+  // Detours whichever of the entry points _nvngx.dll exports; true once any
+  // evaluation entry is detoured
+  bool install_ngx_hooks(HMODULE ngx) {
+    struct entry_t {
+      const char *name;
+      void *detour;
+      void **real;
+    };
+    const entry_t entries[] = {
+      {"NVSDK_NGX_D3D12_EvaluateFeature", reinterpret_cast<void *>(&hook_ngx_eval12<&g_real_ngx_eval12>), reinterpret_cast<void **>(&g_real_ngx_eval12)},
+      {"NVSDK_NGX_D3D12_EvaluateFeature_C", reinterpret_cast<void *>(&hook_ngx_eval12<&g_real_ngx_eval12_c>), reinterpret_cast<void **>(&g_real_ngx_eval12_c)},
+      {"NVSDK_NGX_D3D11_EvaluateFeature", reinterpret_cast<void *>(&hook_ngx_eval11<&g_real_ngx_eval11>), reinterpret_cast<void **>(&g_real_ngx_eval11)},
+      {"NVSDK_NGX_D3D11_EvaluateFeature_C", reinterpret_cast<void *>(&hook_ngx_eval11<&g_real_ngx_eval11_c>), reinterpret_cast<void **>(&g_real_ngx_eval11_c)},
+      {"NVSDK_NGX_D3D12_CreateFeature", reinterpret_cast<void *>(&hook_ngx_create<&g_real_ngx_create12>), reinterpret_cast<void **>(&g_real_ngx_create12)},
+      {"NVSDK_NGX_D3D11_CreateFeature", reinterpret_cast<void *>(&hook_ngx_create<&g_real_ngx_create11>), reinterpret_cast<void **>(&g_real_ngx_create11)},
+      {"NVSDK_NGX_D3D12_ReleaseFeature", reinterpret_cast<void *>(&hook_ngx_release<&g_real_ngx_release12>), reinterpret_cast<void **>(&g_real_ngx_release12)},
+      {"NVSDK_NGX_D3D11_ReleaseFeature", reinterpret_cast<void *>(&hook_ngx_release<&g_real_ngx_release11>), reinterpret_cast<void **>(&g_real_ngx_release11)},
+    };
+    const auto init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+      log("DLSS motion vectors: MinHook unavailable (%d)", static_cast<int>(init));
+      return false;
+    }
+    int evaluations = 0;
+    for (const auto &e : entries) {
+      void *target = reinterpret_cast<void *>(GetProcAddress(ngx, e.name));
+      if (!target) {
+        continue;
+      }
+      if (MH_CreateHook(target, e.detour, e.real) != MH_OK || MH_EnableHook(target) != MH_OK) {
+        *e.real = nullptr;
+        log("DLSS motion vectors: %s could not be detoured", e.name);
+        continue;
+      }
+      if (std::strstr(e.name, "Evaluate")) {
+        ++evaluations;
+      }
+    }
+    log("DLSS motion vectors: %d NGX evaluation entry points detoured", evaluations);
+    return evaluations > 0;
+  }
+
+  // Waits for the driver's NGX to be loaded (games load it when they set up
+  // DLSS, maybe long after we came) while motion vectors are wanted, then
+  // detours it and exits. The module is pinned: our detours live in it.
+  DWORD WINAPI ngx_watch_main(void *) {
+    for (;;) {
+      if (motion_wanted()) {
+        HMODULE ngx = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"_nvngx.dll", &ngx) && ngx) {
+          install_ngx_hooks(ngx);
+          return 0;
+        }
+      }
+      Sleep(500);
+    }
   }
 
   // Capture lock held. `device` is the swapchain's (borrowed).
@@ -1552,7 +2433,19 @@ namespace {
     if (back_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || back_desc.SampleDesc.Count != 1 || back_desc.DepthOrArraySize != 1) {
       return;  // not a flip-model back buffer we know how to copy
     }
-    if (!ensure_textures12(back_desc, hwnd)) {
+    // The DLSS vectors this frame carries: the newest evaluation the game
+    // submitted before this Present (see the motion section)
+    motion_pick_t pick;
+    motion_want_t want;
+    motion_pick(gc::api_e::d3d12, device, pick, want);
+    struct release_pick_t {
+      motion_pick_t &p;
+
+      ~release_pick_t() {
+        p.release();
+      }
+    } release_pick {pick};
+    if (!ensure_textures12(back_desc, hwnd, want)) {
       return;
     }
     const std::uint32_t color_space = swapchain_color_space(swapchain);
@@ -1581,6 +2474,19 @@ namespace {
     list->ResourceBarrier(1, &to_copy);
     list->CopyResource(target, back);  // target: promoted to COPY_DEST, decays to COMMON
     list->ResourceBarrier(1, &to_present);
+    const bool motion = motion_fits(pick) && g_cap.motion12[slot];
+    if (motion) {
+      // The ring entry rests in COPY_SOURCE; the motion texture is promoted
+      // and decays like the frame texture
+      D3D12_TEXTURE_COPY_LOCATION dst {};
+      dst.pResource = g_cap.motion12[slot];
+      dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      D3D12_TEXTURE_COPY_LOCATION src {};
+      src.pResource = pick.src12;
+      src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      const D3D12_BOX box {0, 0, 0, pick.width, pick.height, 1};
+      list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    }
     if (const HRESULT closed = list->Close(); FAILED(closed)) {
       log("Closing the command list of slot %d failed: 0x%08lx", slot, closed);
       recreate_list(slot);
@@ -1596,7 +2502,7 @@ namespace {
     p.fence = g_cap.fence12;
     p.generation = g_current_generation.load(std::memory_order_acquire);
     p.frame_id = ++g_cap.next_frame_id;
-    p.version = write_slot_record(slot, p.generation, color_space, p.frame_id, present_qpc, release_qpc);
+    p.version = write_slot_record(slot, p.generation, color_space, p.frame_id, present_qpc, release_qpc, motion ? &pick : nullptr);
     if (prepare) {
       *prepare = p;  // submitted from inside the real Present (run_armed_capture)
       return;
@@ -1876,6 +2782,9 @@ namespace {
     std::uint32_t version = 0;
     std::uint32_t generation = 0;
     std::uint64_t frame_id = 0;
+    ID3D11Texture2D *motion_src = nullptr;  // the frame's DLSS vectors (a ring texture) and the slot's motion texture (references), or null
+    ID3D11Texture2D *motion_target = nullptr;
+    D3D11_BOX motion_box {};
   };
 
   struct armed11_t {
@@ -1913,6 +2822,8 @@ namespace {
     safe_release(p.back);
     safe_release(p.target);
     safe_release(p.context);
+    safe_release(p.motion_src);
+    safe_release(p.motion_target);
     p.valid = false;
   }
 
@@ -2121,6 +3032,10 @@ namespace {
     } else {
       p.context->CopyResource(p.target, p.back);
     }
+    if (p.motion_src && p.motion_target) {
+      // (before the slot is let go: the host reads the vectors under it)
+      p.context->CopySubresourceRegion(p.motion_target, 0, 0, 0, 0, p.motion_src, 0, &p.motion_box);
+    }
     if (p.mutex) {
       p.mutex->ReleaseSync(0);
     } else {
@@ -2157,6 +3072,8 @@ namespace {
     safe_release(p.back);
     safe_release(p.target);
     safe_release(p.context);
+    safe_release(p.motion_src);
+    safe_release(p.motion_target);
     note_capturing(swapchain, at_boundary ? "D3D11 (at PresentImpl, overlays included)" : "D3D11");
   }
 
@@ -2172,7 +3089,19 @@ namespace {
     }
     D3D11_TEXTURE2D_DESC back_desc {};
     back->GetDesc(&back_desc);
-    if (!ensure_textures(back_desc, hwnd)) {
+    // The DLSS vectors this frame carries (their ring's shape also says what
+    // motion textures the generation needs)
+    motion_pick_t pick;
+    motion_want_t want;
+    motion_pick(gc::api_e::d3d11, device, pick, want);
+    struct release_pick_t {
+      motion_pick_t &p;
+
+      ~release_pick_t() {
+        p.release();
+      }
+    } release_pick {pick};
+    if (!ensure_textures(back_desc, hwnd, sharing_e::any, true, want)) {
       back->Release();
       return;
     }
@@ -2209,9 +3138,17 @@ namespace {
     }
     p.resolve = back_desc.SampleDesc.Count > 1;
     p.format = g_cap.format;
+    const bool motion = motion_fits(pick) && g_cap.motion11[slot];
+    if (motion) {
+      p.motion_src = pick.src11;
+      p.motion_src->AddRef();
+      p.motion_target = g_cap.motion11[slot];
+      p.motion_target->AddRef();
+      p.motion_box = {0, 0, 0, pick.width, pick.height, 1};
+    }
     p.generation = g_current_generation.load(std::memory_order_acquire);
     p.frame_id = ++g_cap.next_frame_id;
-    p.version = write_slot_record(slot, p.generation, color_space, p.frame_id, present_qpc, release_qpc);
+    p.version = write_slot_record(slot, p.generation, color_space, p.frame_id, present_qpc, release_qpc, motion ? &pick : nullptr);
 
     if (!late_copy11(swapchain)) {
       submit11(p, swapchain, false);
@@ -3923,6 +4860,12 @@ namespace {
     g_vk_layer_present = GetModuleHandleW(vvk::kModuleName) != nullptr;
     const bool dxgi = install_hooks();
     const bool vk = vk_attach();
+    if (dxgi) {
+      // DLSS motion vectors (D3D11/D3D12): hooked once the driver's NGX is loaded
+      if (HANDLE watcher = CreateThread(nullptr, 0, ngx_watch_main, nullptr, 0, nullptr)) {
+        CloseHandle(watcher);
+      }
+    }
     if (!dxgi && !vk) {
       return 1;
     }
