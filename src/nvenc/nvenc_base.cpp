@@ -726,6 +726,7 @@ namespace nvenc {
     // of each 64x64 superblock (AV1), L0 only. An encoder that refuses them
     // is set up again without.
     motion_hints_enabled = false;
+    first_frame_after_init = true;
     if (config.motion_hints && !api::api_version_less(selected_api_version, api::make_api_version(12U, 0U))) {
       init_params.enableExternalMEHints = 1;
       if (client_config.videoFormat == 2) {
@@ -937,16 +938,20 @@ namespace nvenc {
     pending_motion_hints = std::move(hints);
   }
 
-  // The pending hints in the codec's layout (mb_hints / sb_hints); false if
-  // there are none for this picture
-  bool nvenc_base::pack_motion_hints() {
+  // A hint set in the codec's layout (mb_hints / sb_hints): the pending
+  // hints if `use_pending` and they fit the picture, otherwise every block
+  // marked invalid
+  void nvenc_base::pack_motion_hints(bool use_pending) {
     const auto &h = pending_motion_hints;
     const uint32_t cols = (encoder_params.width + 15) / 16;
     const uint32_t rows = (encoder_params.height + 15) / 16;
-    if (h.cols != cols || h.rows != rows || h.vectors.size() != static_cast<size_t>(cols) * rows * 2) {
-      return false;
-    }
+    const bool have = use_pending && h.cols == cols && h.rows == rows && h.vectors.size() == static_cast<size_t>(cols) * rows * 2;
     auto at = [&](uint32_t x, uint32_t y, int32_t &vx, int32_t &vy) {
+      if (!have) {
+        vx = motion_hints_t::kNone;
+        vy = 0;
+        return false;
+      }
       const size_t i = (static_cast<size_t>(y) * cols + x) * 2;
       vx = h.vectors[i];
       vy = h.vectors[i + 1];
@@ -986,7 +991,7 @@ namespace nvenc {
           }
         }
       }
-      return true;
+      return;
     }
 
     // H.264 / HEVC: one 16x16 candidate per macroblock, raster order,
@@ -1008,7 +1013,6 @@ namespace nvenc {
         hint.lastOfMB = -1;
       }
     }
-    return true;
   }
 
   nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
@@ -1048,10 +1052,19 @@ namespace nvenc {
     pic_params.outputBitstream = output_bitstream;
     pic_params.completionEvent = async_event_handle;
 
-    // This frame's motion hints (only for the step from the previous frame)
-    const bool use_hints = motion_hints_enabled && !force_idr && !rfi_since_last_frame && pack_motion_hints();
+    // Motion hints: an encoder created with them takes a hint set for every
+    // predicted picture (NvEncEncodePicture fails without one: "Failed to
+    // setup external hints" / "SetupCEAHints failed"), so a picture without
+    // hints of its own (not a game frame, the first after an invalidation)
+    // gets a set that marks every block invalid. None for the first picture
+    // after creation or a forced IDR.
+    const bool use_hints = motion_hints_enabled && !force_idr && !first_frame_after_init;
+    if (use_hints) {
+      pack_motion_hints(!rfi_since_last_frame);
+    }
     pending_motion_hints = {};
     rfi_since_last_frame = false;
+    first_frame_after_init = false;
     if (use_hints) {
       if (encoder_params.video_format == 2) {
         pic_params.meHintCountsPerBlock[0].numCandsPerSb = 16;

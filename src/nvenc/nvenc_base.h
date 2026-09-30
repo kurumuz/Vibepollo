@@ -114,7 +114,8 @@ namespace nvenc {
      * @brief Hints for the next `encode_frame()` only (an empty set: none).
      *        Used only when the encoder was created with `motion_hints`, the
      *        frame is not an IDR and no reference was invalidated since the
-     *        previous frame (the hints describe the step from that frame).
+     *        previous frame (the hints describe the step from that frame);
+     *        otherwise the picture gets a set that marks every block invalid.
      */
     void set_motion_hints(motion_hints_t hints);
 
@@ -200,10 +201,11 @@ namespace nvenc {
     bool hdr_metadata_valid = false;
     SS_HDR_METADATA hdr_metadata {};
 
-    bool pack_motion_hints();
+    void pack_motion_hints(bool use_pending);
 
     bool motion_hints_enabled = false;  ///< the encoder accepted external motion hints
     bool rfi_since_last_frame = false;  ///< a reference was invalidated: the next frame's reference is not the previous frame
+    bool first_frame_after_init = true;  ///< no reference yet: no hint set
     motion_hints_t pending_motion_hints;
     std::vector<NVENC_EXTERNAL_ME_HINT> mb_hints;
     std::vector<NVENC_EXTERNAL_ME_SB_HINT> sb_hints;
