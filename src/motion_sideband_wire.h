@@ -9,8 +9,19 @@
  * it, each such frame marked with VIDEO_PACKET_EXTRA_FLAG_MOTION_SIDEBAND in
  * every datagram's NV_VIDEO_PACKET::extraFlags. The frame's payload is then
  *
- *     bitstream | 0xFF | escaped MVC2 stream | length (5 bytes) | interval (5 bytes) | 'M' 'V' 'S' '1'
+ *     bitstream | 0xFF | escaped payload | length (5 bytes) | interval (5 bytes) | 'M' 'V' 'S' '2'
  *
+ *   payload = varint mvc2 length | MVC2 stream | mask
+ *   mask    = u16 cols | u16 rows (little-endian) | varint run lengths
+ *
+ * - The mask covers the encoded picture in 4x4 cells (cols = ceil(width / 4),
+ *   rows = ceil(height / 4); 0 x 0 = none), row by row: a set cell did not
+ *   change from the previous frame (the HUD, drawn after DLSS, and anything
+ *   else standing still), so a client warping the frame along the field
+ *   holds it still whatever its block's vector says. Runs alternate between
+ *   clear and set cells, the first a clear run (possibly 0), and cover every
+ *   cell. Varints are LEB128 (7 bits a byte, least significant first).
+ *   ('M' 'V' 'S' '1', from earlier hosts: the payload is the MVC2 stream alone.)
  * - The MVC2 stream is escaped like an H.264/HEVC NAL payload (a 0x03 after
  *   every two zero bytes that precede a byte <= 3), so it never contains an
  *   Annex B start code; the 0xFF guard keeps the bitstream's last bytes from
@@ -26,6 +37,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -34,7 +46,62 @@ namespace motion_sideband {
   constexpr std::uint32_t ML_FF_MOTION_SIDEBAND = 0x08000000;
   constexpr std::uint8_t VIDEO_PACKET_EXTRA_FLAG_MOTION_SIDEBAND = 0x4;
   constexpr std::uint8_t kGuard = 0xff;
-  constexpr std::uint8_t kMagic[4] = {'M', 'V', 'S', '1'};
+  constexpr std::uint8_t kMagic[4] = {'M', 'V', 'S', '2'};
+  constexpr std::size_t kMaxMaskBytes = 48 * 1024;  ///< a mask too fragmented to be worth it goes as none
+
+  inline void put_varint(std::vector<std::uint8_t> &out, std::uint64_t v) {
+    while (v >= 0x80) {
+      out.push_back(static_cast<std::uint8_t>(0x80 | (v & 0x7f)));
+      v >>= 7;
+    }
+    out.push_back(static_cast<std::uint8_t>(v));
+  }
+
+  /**
+   * @brief Appends a mask section (the format above) for `cols` x `rows`
+   *        cells, one bit each in `bits` (row by row, 32 a word, lowest
+   *        first); an empty one when there is none or it would exceed
+   *        kMaxMaskBytes.
+   */
+  inline void append_mask(std::vector<std::uint8_t> &out, const std::uint32_t *bits, std::uint32_t cols, std::uint32_t rows) {
+    const auto start = out.size();
+    const auto header = [&](std::uint32_t c, std::uint32_t r) {
+      out.push_back(static_cast<std::uint8_t>(c));
+      out.push_back(static_cast<std::uint8_t>(c >> 8));
+      out.push_back(static_cast<std::uint8_t>(r));
+      out.push_back(static_cast<std::uint8_t>(r >> 8));
+    };
+    if (!bits || !cols || !rows || cols > 0xffff || rows > 0xffff) {
+      header(0, 0);
+      return;
+    }
+    header(cols, rows);
+    const std::uint64_t n = static_cast<std::uint64_t>(cols) * rows;
+    std::uint64_t i = 0;
+    bool set = false;
+    while (i < n) {
+      // The next cell after i that differs from the run's value, a word at a time
+      std::uint64_t j = i;
+      while (j < n) {
+        std::uint32_t w = bits[j >> 5] ^ (set ? ~0u : 0u);
+        w >>= (j & 31);
+        if (w) {
+          j += static_cast<std::uint64_t>(__builtin_ctz(w));
+          break;
+        }
+        j = (j | 31) + 1;
+      }
+      j = std::min(j, n);
+      put_varint(out, j - i);
+      if (out.size() - start > kMaxMaskBytes) {
+        out.resize(start);
+        header(0, 0);
+        return;
+      }
+      i = j;
+      set = !set;
+    }
+  }
 
   inline void put_groups(std::vector<std::uint8_t> &out, std::uint32_t v) {
     for (int i = 0; i < 5; ++i) {

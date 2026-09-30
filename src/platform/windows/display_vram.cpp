@@ -34,6 +34,7 @@ extern "C" {
 #endif
 #include "src/config.h"
 #include "src/logging.h"
+#include "src/motion_sideband_wire.h"
 #include "src/nvenc/nvenc_config.h"
 #include "src/nvenc/nvenc_d3d11_native.h"
 #include "src/nvenc/nvenc_d3d11_on_cuda.h"
@@ -2108,9 +2109,20 @@ namespace platf::dxgi {
         return {};
       }
       auto stream = mvc2.collect(base.device_ctx.get());
+      std::vector<std::uint8_t> payload;
       if (!stream.empty()) {
         *interval_us = sideband_interval_us;
+        // (the payload: the field, then the still-cell mask made with it)
+        payload.reserve(stream.size() + sideband_mask.size() + 8);
+        motion_sideband::put_varint(payload, stream.size());
+        payload.insert(payload.end(), stream.begin(), stream.end());
+        if (sideband_mask.empty()) {
+          motion_sideband::append_mask(payload, nullptr, 0, 0);
+        } else {
+          payload.insert(payload.end(), sideband_mask.begin(), sideband_mask.end());
+        }
       }
+      sideband_mask.clear();
       if (++sideband_log_frames >= 1200) {
         sideband_log_frames = 0;
         auto s = mvc2.stats();
@@ -2118,7 +2130,7 @@ namespace platf::dxgi {
           BOOST_LOG(info) << s;
         }
       }
-      return stream;
+      return payload;
     }
 
   private:
@@ -2141,6 +2153,7 @@ namespace platf::dxgi {
         last_game_frame_id = id;
         last_game_frame_timestamp = img.frame_timestamp;
       }
+      sideband_mask.clear();
       const auto *field = img.motion.get();
       // (a rotated display is converted rotated: its blocks and vectors would need the same turn)
       const auto rotation = base.display->display_rotation;
@@ -2183,13 +2196,57 @@ namespace platf::dxgi {
       if (motion_sideband) {
         // Queued behind the conversion; collected after the frame's encode
         mvc2.submit(base.device.get(), base.device_ctx.get(), hints.cols, hints.rows, hints.vectors, nvenc::nvenc_base::motion_hints_t::kNone);
+        make_sideband_mask(*field, vp);
       }
       if (config::video.nv.motion_hints) {
         nvenc_d3d->set_motion_hints(std::move(hints));
       }
     }
 
+    // The field's still-cell mask on the encoded picture's 4x4 cells (the
+    // viewport mapping, as for the vectors; outside the game's image none
+    // are held), as the sideband's mask section
+    void make_sideband_mask(const game_capture::motion_field_t &field, const D3D11_VIEWPORT &vp) {
+      if (field.mask.empty() || !field.mask_cols || !field.mask_rows) {
+        return;
+      }
+      const std::uint32_t cols = (encode_width + 3) / 4;
+      const std::uint32_t rows = (encode_height + 3) / 4;
+      const bool direct = vp.TopLeftX == 0 && vp.TopLeftY == 0 && static_cast<std::uint32_t>(vp.Width) == encode_width &&
+                          static_cast<std::uint32_t>(vp.Height) == encode_height && field.width == encode_width && field.height == encode_height &&
+                          field.mask_cols == cols && field.mask_rows == rows;
+      if (direct) {
+        motion_sideband::append_mask(sideband_mask, field.mask.data(), cols, rows);
+        return;
+      }
+      sideband_mask_bits.assign((static_cast<std::size_t>(cols) * rows + 31) / 32, 0);
+      const float to_field_x = static_cast<float>(field.width) / vp.Width;
+      const float to_field_y = static_cast<float>(field.height) / vp.Height;
+      for (std::uint32_t y = 0; y < rows; ++y) {
+        const float cy = y * 4 + 2.0f - vp.TopLeftY;
+        if (cy < 0 || cy >= vp.Height) {
+          continue;
+        }
+        const auto fy = std::min(static_cast<std::uint32_t>(cy * to_field_y) / 4, field.mask_rows - 1);
+        for (std::uint32_t x = 0; x < cols; ++x) {
+          const float cx = x * 4 + 2.0f - vp.TopLeftX;
+          if (cx < 0 || cx >= vp.Width) {
+            continue;
+          }
+          const auto fx = std::min(static_cast<std::uint32_t>(cx * to_field_x) / 4, field.mask_cols - 1);
+          const std::size_t fbit = static_cast<std::size_t>(fy) * field.mask_cols + fx;
+          if (field.mask[fbit >> 5] & (1u << (fbit & 31))) {
+            const std::size_t bit = static_cast<std::size_t>(y) * cols + x;
+            sideband_mask_bits[bit >> 5] |= 1u << (bit & 31);
+          }
+        }
+      }
+      motion_sideband::append_mask(sideband_mask, sideband_mask_bits.data(), cols, rows);
+    }
+
     bool motion_sideband = false;
+    std::vector<std::uint8_t> sideband_mask;  // this frame's mask section (see motion_sideband_wire.h)
+    std::vector<std::uint32_t> sideband_mask_bits;  // (scratch)
     game_capture::mvc2_encoder_t mvc2;
     std::uint32_t sideband_interval_us = 0;
     std::optional<std::chrono::steady_clock::time_point> last_game_frame_timestamp;

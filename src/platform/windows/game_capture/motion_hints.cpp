@@ -34,6 +34,9 @@ namespace platf::dxgi::game_capture {
       std::uint32_t field_base;
       std::uint32_t score_cap;
       std::uint32_t pad;
+      std::uint32_t cells[2];
+      float static_luma;
+      std::uint32_t pad2;
     };
 
     constexpr int kSets = ::game_capture::kMotionCandidates;
@@ -53,11 +56,14 @@ namespace platf::dxgi::game_capture {
     if (!_luma_cs) {
       auto luma = compile_shader(GAME_CAPTURE_SHADERS_DIR "/game_capture_motion_cs.hlsl", "luma_cs", "cs_5_0");
       auto blocks = compile_shader(GAME_CAPTURE_SHADERS_DIR "/game_capture_motion_cs.hlsl", "blocks_cs", "cs_5_0");
-      if (!luma || !blocks ||
+      auto mask = compile_shader(GAME_CAPTURE_SHADERS_DIR "/game_capture_motion_cs.hlsl", "mask_cs", "cs_5_0");
+      if (!luma || !blocks || !mask ||
           FAILED(device->CreateComputeShader(luma->GetBufferPointer(), luma->GetBufferSize(), nullptr, _luma_cs.put())) ||
-          FAILED(device->CreateComputeShader(blocks->GetBufferPointer(), blocks->GetBufferSize(), nullptr, _blocks_cs.put()))) {
+          FAILED(device->CreateComputeShader(blocks->GetBufferPointer(), blocks->GetBufferSize(), nullptr, _blocks_cs.put())) ||
+          FAILED(device->CreateComputeShader(mask->GetBufferPointer(), mask->GetBufferSize(), nullptr, _mask_cs.put()))) {
         _luma_cs = nullptr;
         _blocks_cs = nullptr;
+        _mask_cs = nullptr;
         return false;
       }
       D3D11_BUFFER_DESC bd {};
@@ -102,6 +108,32 @@ namespace platf::dxgi::game_capture {
     if (FAILED(device->CreateBuffer(&fd, nullptr, _field.put())) ||
         FAILED(device->CreateUnorderedAccessView(_field.get(), nullptr, _field_uav.put()))) {
       return false;
+    }
+    // The mask: a bit per 4x4 cell, and its readback
+    _mask_words = (((width + 3) / 4) * ((height + 3) / 4) + 31) / 32;
+    _mask = nullptr;
+    _mask_uav = nullptr;
+    _mask_staging = nullptr;
+    {
+      D3D11_BUFFER_DESC md {};
+      md.ByteWidth = _mask_words * 4;
+      md.Usage = D3D11_USAGE_DEFAULT;
+      md.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+      md.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+      D3D11_UNORDERED_ACCESS_VIEW_DESC mud {};
+      mud.Format = DXGI_FORMAT_R32_TYPELESS;
+      mud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+      mud.Buffer.NumElements = _mask_words;
+      mud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+      D3D11_BUFFER_DESC msd = md;
+      msd.Usage = D3D11_USAGE_STAGING;
+      msd.BindFlags = 0;
+      msd.MiscFlags = 0;
+      msd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      if (FAILED(device->CreateBuffer(&md, nullptr, _mask.put())) || FAILED(device->CreateUnorderedAccessView(_mask.get(), &mud, _mask_uav.put())) ||
+          FAILED(device->CreateBuffer(&msd, nullptr, _mask_staging.put()))) {
+        return false;
+      }
     }
     D3D11_BUFFER_DESC sd {};
     sd.ByteWidth = count / kSets * 8;  // (the chosen set's field only)
@@ -229,6 +261,9 @@ namespace platf::dxgi::game_capture {
     frame.texture->GetDesc(&color_desc);
     p.linear_light = linear_format(color_desc.Format) ? 1 : 0;
     p.verify = verify ? 1 : 0;
+    p.cells[0] = (frame.width + 3) / 4;
+    p.cells[1] = (frame.height + 3) / 4;
+    p.static_luma = kStaticLuma;
     context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
 
     const int cur = _current;
@@ -285,9 +320,17 @@ namespace platf::dxgi::game_capture {
       context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
       context->Dispatch((p.blocks[0] + 7) / 8, (p.blocks[1] + 7) / 8, 1);
     }
+    // The still cells, from the same two lumas
+    context->ClearUnorderedAccessViewUint(_mask_uav.get(), zero);
+    ID3D11UnorderedAccessView *mask_out[1] = {_mask_uav.get()};
+    context->CSSetUnorderedAccessViews(3, 1, mask_out, nullptr);
+    context->CSSetShader(_mask_cs.get(), nullptr, 0);
+    context->Dispatch((p.cells[0] + 7) / 8, (p.cells[1] + 7) / 8, 1);
+    context->CopyResource(_mask_staging.get(), _mask.get());
     ID3D11ShaderResourceView *null_srv[4] = {};
     context->CSSetShaderResources(0, 4, null_srv);
-    context->CSSetUnorderedAccessViews(0, 3, null_uav, nullptr);
+    ID3D11UnorderedAccessView *null_uav4[4] = {};
+    context->CSSetUnorderedAccessViews(0, 4, null_uav4, nullptr);
     context->CSSetShader(nullptr, nullptr, 0);
 
     // Read back now: the encoder needs the field on the CPU with the frame,
@@ -345,6 +388,13 @@ namespace platf::dxgi::game_capture {
     field->vectors.resize(static_cast<std::size_t>(field->cols) * field->rows * 2);
     std::memcpy(field->vectors.data(), mapped.pData, field->vectors.size() * sizeof(std::int32_t));
     context->Unmap(_staging.get(), 0);
+    if (SUCCEEDED(context->Map(_mask_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+      field->mask_cols = p.cells[0];
+      field->mask_rows = p.cells[1];
+      field->mask.resize(_mask_words);
+      std::memcpy(field->mask.data(), mapped.pData, field->mask.size() * sizeof(std::uint32_t));
+      context->Unmap(_mask_staging.get(), 0);
+    }
     return field;
   }
 

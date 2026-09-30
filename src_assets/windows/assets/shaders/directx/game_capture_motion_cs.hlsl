@@ -9,6 +9,11 @@
 // motion does (the game's vectors know nothing of what is drawn after DLSS,
 // such as the HUD). Output: quarter pixels, pointing from the block to where
 // it was in the previous frame; x = kNone for no vector.
+// mask_cs: per 4x4 cell, a bit where no pixel's luma changed from the
+// previous frame -- content that did not move whatever its block's vector
+// says (the HUD, drawn after DLSS, or anything static): what a timewarp on
+// the client must hold still. Finer than the blocks, whose check a HUD
+// element covering part of a moving block loses.
 
 cbuffer params : register(b0) {
   uint2 frame_size;  // pixels
@@ -23,6 +28,9 @@ cbuffer params : register(b0) {
   uint field_base;  // ... and first field entry
   uint score_cap;  // the most one block adds to the score (so the frame's total fits 32 bits)
   uint pad;
+  uint2 cells;  // 4x4 mask cells (columns, rows)
+  float static_luma;  // the largest luma change a still pixel may show (noise, dithering)
+  uint pad2;
 };
 
 Texture2D<float4> color : register(t0);
@@ -39,6 +47,7 @@ RWStructuredBuffer<int2> field : register(u1);
 // does, 9 such blocks. 10: the score, the sum over blocks of the best
 // prediction error (the vector's or zero's), which picks the candidate.
 RWByteAddressBuffer stats : register(u2);
+RWByteAddressBuffer mask : register(u3);  // mask_cs: a bit per cell, row by row
 
 void count(uint i) {
   stats.InterlockedAdd((stats_base + i) * 4, 1);
@@ -175,4 +184,24 @@ float luma_of(float3 c) {
     score(sad_0);
   }
   field[index] = int2(round(v * 4));
+}
+
+[numthreads(8, 8, 1)] void mask_cs(uint3 id: SV_DispatchThreadID) {
+  if (any(id.xy >= cells)) {
+    return;
+  }
+  const uint2 base = id.xy * 4;
+  const uint2 last = frame_size - 1;
+  float worst = 0;
+  [unroll] for (uint y = 0; y < 4; ++y) {
+    [unroll] for (uint x = 0; x < 4; ++x) {
+      const int3 q = int3(min(base + uint2(x, y), last), 0);
+      worst = max(worst, abs(cur_luma_in.Load(q) - prev_luma.Load(q)));
+    }
+  }
+  // (a non-finite difference compares false: not held)
+  if (worst <= static_luma) {
+    const uint bit = id.y * cells.x + id.x;
+    mask.InterlockedOr((bit >> 5) * 4, 1u << (bit & 31));
+  }
 }

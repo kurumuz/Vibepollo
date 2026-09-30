@@ -32,6 +32,13 @@ namespace platf::dxgi::game_capture {
     std::uint32_t cols = 0;  ///< blocks
     std::uint32_t rows = 0;
     std::vector<std::int32_t> vectors;  ///< (x, y) per block, row by row
+    /// Per 4x4 cell of the frame, a bit (row by row, 32 a word, lowest first)
+    /// where it did not change from the previous frame: the HUD and other
+    /// content that stands still whatever its block's vector says. Empty
+    /// when not computed.
+    std::uint32_t mask_cols = 0;
+    std::uint32_t mask_rows = 0;
+    std::vector<std::uint32_t> mask;
   };
 
   /**
@@ -69,6 +76,12 @@ namespace platf::dxgi::game_capture {
     std::uint32_t _height = 0;
     winrt::com_ptr<ID3D11ComputeShader> _luma_cs;
     winrt::com_ptr<ID3D11ComputeShader> _blocks_cs;
+    winrt::com_ptr<ID3D11ComputeShader> _mask_cs;
+    winrt::com_ptr<ID3D11Buffer> _mask;  // mask_cs's bits (raw buffer) ...
+    winrt::com_ptr<ID3D11UnorderedAccessView> _mask_uav;
+    winrt::com_ptr<ID3D11Buffer> _mask_staging;  // ... and their readback
+    std::uint32_t _mask_words = 0;
+    static constexpr float kStaticLuma = 2.0f / 255.0f;  // a still pixel's largest luma change (dithering, noise)
     winrt::com_ptr<ID3D11Buffer> _params;
     winrt::com_ptr<ID3D11Texture2D> _luma[2];
     winrt::com_ptr<ID3D11ShaderResourceView> _luma_srv[2];
