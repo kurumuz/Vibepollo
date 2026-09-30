@@ -2113,7 +2113,10 @@ namespace platf::dxgi {
         last_game_frame_id = id;
       }
       const auto *field = img.motion.get();
-      if (!step || !field || field->frame_id != id || !field->width || !field->height) {
+      // (a rotated display is converted rotated: its blocks and vectors would need the same turn)
+      const auto rotation = base.display->display_rotation;
+      const bool rotated = rotation != DXGI_MODE_ROTATION_UNSPECIFIED && rotation != DXGI_MODE_ROTATION_IDENTITY;
+      if (!step || rotated || !field || field->frame_id != id || !field->width || !field->height) {
         nvenc_d3d->set_motion_hints({});
         return;
       }

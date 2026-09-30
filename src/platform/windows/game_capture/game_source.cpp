@@ -434,6 +434,7 @@ namespace platf::dxgi::game_capture {
     ~attach_job_t() {
       if (block) {
         block->capture_enabled.store(0, std::memory_order_release);
+        block->motion_enabled.store(0, std::memory_order_release);
         UnmapViewOfFile(block);
       }
     }
@@ -497,6 +498,7 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<IDXGIKeyedMutex> mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC texture_desc {};
     winrt::com_ptr<ID3D11Texture2D> motion_textures[gc::kSlots];  // of the opened generation; empty: none
+    winrt::com_ptr<IDXGIKeyedMutex> motion_mutexes[gc::kSlots];  // keyed-mutex sync: each motion texture's own
     D3D11_TEXTURE2D_DESC motion_desc {};
     std::uint32_t motion_logged_generation = 0;
     gc::sync_e sync = gc::sync_e::keyed_mutex;  // of the opened generation
@@ -517,6 +519,7 @@ namespace platf::dxgi::game_capture {
       given_up = true;
       if (block) {
         block->capture_enabled.store(0, std::memory_order_release);
+        block->motion_enabled.store(0, std::memory_order_release);
       }
     }
 
@@ -592,6 +595,7 @@ namespace platf::dxgi::game_capture {
       }
       // Stop the hook first: no new copies, and the game runs unpaced
       t->block->capture_enabled.store(0, std::memory_order_release);
+      t->block->motion_enabled.store(0, std::memory_order_release);
       t->block->limiter_period_ps.store(0, std::memory_order_release);
       if (!t->exited()) {
         release_reads(*t, true);
@@ -705,6 +709,7 @@ namespace platf::dxgi::game_capture {
       unlock();
       if (auto *previous = current(); previous && previous->attached && previous->block && previous->host_locked) {
         previous->block->capture_enabled.store(0, std::memory_order_release);
+        previous->block->motion_enabled.store(0, std::memory_order_release);
       }
       _current_pid = pid;
     }
@@ -945,6 +950,7 @@ namespace platf::dxgi::game_capture {
     // The generation's motion textures, if it has them: optional (a failure
     // here only costs the frames their vectors)
     winrt::com_ptr<ID3D11Texture2D> motion_textures[gc::kSlots];
+    winrt::com_ptr<IDXGIKeyedMutex> motion_mutexes[gc::kSlots];
     D3D11_TEXTURE2D_DESC motion_desc {};
     if (motion_setup.format != 0) {
       std::string why;
@@ -967,16 +973,20 @@ namespace platf::dxgi::game_capture {
         }
         D3D11_TEXTURE2D_DESC d {};
         motion_textures[i]->GetDesc(&d);
+        // Guarded like the frames: its own keyed mutex, or the slot's owner word
+        const bool keyed = (d.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) != 0;
         if (d.Width != motion_setup.width || d.Height != motion_setup.height || d.Format != static_cast<DXGI_FORMAT>(motion_setup.format) ||
-            d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+            d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE) || keyed == owner_sync ||
+            (keyed && FAILED(motion_textures[i]->QueryInterface(__uuidof(IDXGIKeyedMutex), motion_mutexes[i].put_void())))) {
           why = "a motion texture has an unexpected shape";
           break;
         }
         motion_desc = d;
       }
       if (!why.empty()) {
-        for (auto &m : motion_textures) {
-          m = nullptr;
+        for (int i = 0; i < gc::kSlots; ++i) {
+          motion_textures[i] = nullptr;
+          motion_mutexes[i] = nullptr;
         }
         if (t.motion_logged_generation != generation) {
           t.motion_logged_generation = generation;
@@ -1008,6 +1018,7 @@ namespace platf::dxgi::game_capture {
       t.textures[i] = std::move(textures[i]);
       t.mutexes[i] = std::move(mutexes[i]);
       t.motion_textures[i] = std::move(motion_textures[i]);
+      t.motion_mutexes[i] = std::move(motion_mutexes[i]);
     }
     t.motion_desc = motion_desc;
     t.sync = owner_sync ? gc::sync_e::owner : gc::sync_e::keyed_mutex;
@@ -1139,11 +1150,24 @@ namespace platf::dxgi::game_capture {
       // describes a region inside them
       frame.motion = nullptr;
       frame.motion_id = 0;
-      const bool motion_ok = motion.id != 0 && t->motion_textures[slot] && motion.width > 0 && motion.height > 0 &&
+      bool motion_ok = motion.id != 0 && t->motion_textures[slot] && motion.width > 0 && motion.height > 0 &&
                              motion.width <= t->motion_desc.Width && motion.height <= t->motion_desc.Height &&
                              motion.out_width > 0 && motion.out_height > 0 && motion.out_width <= kMaxDimension && motion.out_height <= kMaxDimension &&
                              std::isfinite(motion.scale_x) && std::isfinite(motion.scale_y) && motion.scale_x != 0 && motion.scale_y != 0 &&
                              std::abs(motion.scale_x) < 1e6f && std::abs(motion.scale_y) < 1e6f;
+      // (keyed-mutex sync: the motion texture's own mutex, given back by the
+      // hook with the slot's; busy means this frame goes without vectors)
+      if (motion_ok && !owner_sync) {
+        const HRESULT hr = t->motion_mutexes[slot] ? t->motion_mutexes[slot]->AcquireSync(0, 0) : E_FAIL;
+        if (hr == static_cast<HRESULT>(WAIT_ABANDONED)) {
+          t->motion_mutexes[slot]->ReleaseSync(0);
+        }
+        if (hr == S_OK) {
+          _locked_motion = true;
+        } else {
+          motion_ok = false;
+        }
+      }
       if (motion_ok) {
         frame.motion = t->motion_textures[slot].get();
         frame.motion_id = motion.id;
@@ -1174,6 +1198,10 @@ namespace platf::dxgi::game_capture {
     } else if (t && t->mutexes[_locked_slot]) {
       t->mutexes[_locked_slot]->ReleaseSync(0);
     }
+    if (auto *t = current(); _locked_motion && t && t->motion_mutexes[_locked_slot]) {
+      t->motion_mutexes[_locked_slot]->ReleaseSync(0);
+    }
+    _locked_motion = false;
     _locked_slot = -1;
   }
 

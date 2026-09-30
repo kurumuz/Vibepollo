@@ -108,6 +108,7 @@ namespace platf::dxgi::game_capture {
     std::map<DWORD, std::unique_ptr<target_t>> _targets;
     DWORD _current_pid = 0;
     int _locked_slot = -1;
+    bool _locked_motion = false;  ///< the locked slot's motion texture mutex is held too
     std::chrono::steady_clock::time_point _last_reap {};
   };
 
