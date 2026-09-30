@@ -79,8 +79,11 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<ID3D11Buffer> _stats;  // the shader's counters (raw buffer)
     winrt::com_ptr<ID3D11UnorderedAccessView> _stats_uav;
     winrt::com_ptr<ID3D11Buffer> _stats_staging;
-    std::uint64_t _counts[8] = {};  // accumulated counters (see the shader)
+    static constexpr int kCounters = 10;
+    std::uint64_t _counts[kCounters] = {};  // accumulated counters (see the shader)
     std::uint64_t _fields = 0;  // fields handed out
+    std::uint64_t _unchecked = 0;  // frames with vectors whose predecessor was not the game's previous frame
+    std::uint32_t _diagnose_tick = 0;
     int _current = 0;  // _luma[_current] takes the next frame's luma
 
     // The previous frame whose luma is in _luma[1 - _current]

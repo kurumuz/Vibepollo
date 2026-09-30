@@ -28,7 +28,8 @@ namespace platf::dxgi::game_capture {
       float pixel_per_unit[2];
       std::uint32_t linear_light;
       std::uint32_t verify;
-      std::uint32_t pad[2];
+      std::uint32_t diagnose;
+      std::uint32_t pad;
     };
 
     static_assert(sizeof(params_t) % 16 == 0, "constant buffer size");
@@ -104,14 +105,14 @@ namespace platf::dxgi::game_capture {
       return false;
     }
     D3D11_BUFFER_DESC cd {};
-    cd.ByteWidth = sizeof(std::uint32_t) * 8;
+    cd.ByteWidth = sizeof(std::uint32_t) * kCounters;
     cd.Usage = D3D11_USAGE_DEFAULT;
     cd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
     cd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
     D3D11_UNORDERED_ACCESS_VIEW_DESC ud {};
     ud.Format = DXGI_FORMAT_R32_TYPELESS;
     ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    ud.Buffer.NumElements = 8;
+    ud.Buffer.NumElements = kCounters;
     ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
     D3D11_BUFFER_DESC csd = cd;
     csd.Usage = D3D11_USAGE_STAGING;
@@ -137,7 +138,7 @@ namespace platf::dxgi::game_capture {
   }
 
   std::string motion_pass_t::stats() {
-    if (!_counts[0]) {
+    if (!_counts[0] && !_unchecked) {
       return {};
     }
     const auto pct = [](std::uint64_t n, std::uint64_t of) {
@@ -145,12 +146,14 @@ namespace platf::dxgi::game_capture {
       std::snprintf(buf, sizeof(buf), "%.1f%%", of ? 100.0 * static_cast<double>(n) / static_cast<double>(of) : 0.0);
       return std::string(buf);
     };
-    const auto checked = _counts[3] + _counts[4];
-    std::string s = " motion: fields=" + std::to_string(_fields) + " blocks: none " + pct(_counts[1], _counts[0]) + ", DLSS zero " + pct(_counts[2], _counts[0]) +
-                    ", vector won " + pct(_counts[3], _counts[0]) + ", zero won " + pct(_counts[4], _counts[0]) + "; of " + std::to_string(checked) +
-                    " checked: flip fits better " + pct(_counts[5], checked) + ", half " + pct(_counts[6], checked) + ", double " + pct(_counts[7], checked);
+    const auto diagnosed = _counts[9];
+    std::string s = " motion: fields=" + std::to_string(_fields) + " (unchecked frames " + std::to_string(_unchecked) + ") blocks: none " + pct(_counts[1], _counts[0]) +
+                    ", DLSS zero " + pct(_counts[2], _counts[0]) + ", under half a pixel " + pct(_counts[8], _counts[0]) + ", vector won " + pct(_counts[3], _counts[0]) +
+                    ", zero won " + pct(_counts[4], _counts[0]) + "; of " + std::to_string(diagnosed) + " diagnosed: flip fits better " + pct(_counts[5], diagnosed) +
+                    ", half " + pct(_counts[6], diagnosed) + ", double " + pct(_counts[7], diagnosed);
     std::memset(_counts, 0, sizeof(_counts));
     _fields = 0;
+    _unchecked = 0;
     return s;
   }
 
@@ -217,6 +220,10 @@ namespace platf::dxgi::game_capture {
     frame.texture->GetDesc(&color_desc);
     p.linear_light = linear_format(color_desc.Format) ? 1 : 0;
     p.verify = verify ? 1 : 0;
+    p.diagnose = (_diagnose_tick++ % 4) == 0 ? 1 : 0;  // (every 4th frame: the extra tests cost three more loads a pixel)
+    if (!verify) {
+      ++_unchecked;
+    }
     context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
 
     const int cur = _current;
@@ -265,7 +272,7 @@ namespace platf::dxgi::game_capture {
     D3D11_MAPPED_SUBRESOURCE mapped {};
     if (SUCCEEDED(context->Map(_stats_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
       const auto *c = static_cast<const std::uint32_t *>(mapped.pData);
-      for (int i = 0; i < 8; ++i) {
+      for (int i = 0; i < kCounters; ++i) {
         _counts[i] += c[i];
       }
       context->Unmap(_stats_staging.get(), 0);

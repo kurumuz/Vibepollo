@@ -17,7 +17,8 @@ cbuffer params : register(b0) {
   float2 pixel_per_unit;  // stored vector -> frame pixels (region/frame ratio and DLSS's scale)
   uint linear_light;  // the colour is linear (scRGB, or read through an _SRGB view): compress it
   uint verify;  // prev_luma holds the previous frame (blocks_cs sends nothing otherwise)
-  uint2 pad;
+  uint diagnose;  // also test the flipped, halved and doubled vector (counters 5-7)
+  uint pad;
 };
 
 Texture2D<float4> color : register(t0);
@@ -27,9 +28,10 @@ Texture2D<float> cur_luma_in : register(t3);
 RWTexture2D<float> cur_luma : register(u0);
 RWStructuredBuffer<int2> field : register(u1);
 // Counters (uints): 0 blocks, 1 without a vector (none / out of frame / not
-// checkable), 2 DLSS said no motion, 3 the vector beat zero, 4 zero beat the
-// vector; of the blocks with a vector checked: 5 the flipped vector fits
-// better than it, 6 half of it does, 7 twice it does
+// checkable), 2 DLSS said exactly no motion, 3 the vector beat zero, 4 zero
+// beat the vector, 8 a vector under half a pixel (sent, not checked); of the
+// blocks with a vector checked, on diagnosing frames: 5 the flipped vector
+// fits better than it, 6 half of it does, 7 twice it does, 9 such blocks
 RWByteAddressBuffer stats : register(u2);
 
 void count(uint i) {
@@ -106,11 +108,13 @@ float luma_of(float3 c) {
 
   const int2 d = int2(round(v));
   if (any(d != 0)) {
-    // The vector against zero motion; for the counters also its flip, half
-    // and double (a wrong sign or scale shows up there)
+    // The vector against zero motion; on diagnosing frames also its flip,
+    // half and double (a wrong sign or scale shows up there), each rounded
+    // on its own
     float sad_v = 0, sad_0 = 0, sad_flip = 0, sad_half = 0, sad_double = 0;
     const int2 last = int2(frame_size) - 1;
     const int2 half_d = int2(round(v * 0.5));
+    const int2 double_d = int2(round(v * 2.0));
     for (int y = 0; y < 16; ++y) {
       for (int x = 0; x < 16; ++x) {
         const int2 q = origin + int2(x, y);
@@ -120,19 +124,24 @@ float luma_of(float3 c) {
         const float c = cur_luma_in.Load(int3(q, 0));
         sad_0 += abs(c - prev_luma.Load(int3(q, 0)));
         sad_v += abs(c - prev_luma.Load(int3(clamp(q + d, int2(0, 0), last), 0)));
-        sad_flip += abs(c - prev_luma.Load(int3(clamp(q - d, int2(0, 0), last), 0)));
-        sad_half += abs(c - prev_luma.Load(int3(clamp(q + half_d, int2(0, 0), last), 0)));
-        sad_double += abs(c - prev_luma.Load(int3(clamp(q + 2 * d, int2(0, 0), last), 0)));
+        if (diagnose) {
+          sad_flip += abs(c - prev_luma.Load(int3(clamp(q - d, int2(0, 0), last), 0)));
+          sad_half += abs(c - prev_luma.Load(int3(clamp(q + half_d, int2(0, 0), last), 0)));
+          sad_double += abs(c - prev_luma.Load(int3(clamp(q + double_d, int2(0, 0), last), 0)));
+        }
       }
     }
-    if (sad_flip < sad_v) {
-      count(5);
-    }
-    if (sad_half < sad_v) {
-      count(6);
-    }
-    if (sad_double < sad_v) {
-      count(7);
+    if (diagnose) {
+      count(9);
+      if (sad_flip < sad_v) {
+        count(5);
+      }
+      if (sad_half < sad_v) {
+        count(6);
+      }
+      if (sad_double < sad_v) {
+        count(7);
+      }
     }
     if (sad_0 <= sad_v) {
       v = float2(0, 0);  // (ties to zero: the cheaper vector)
@@ -140,6 +149,8 @@ float luma_of(float3 c) {
     } else {
       count(3);
     }
+  } else if (any(v != 0)) {
+    count(8);
   } else {
     count(2);
   }
