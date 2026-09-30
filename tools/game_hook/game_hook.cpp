@@ -177,6 +177,10 @@ namespace {
     return f;
   }
 
+  std::uint64_t us_to_qpc(std::uint64_t us) {
+    return us * qpc_frequency() / 1000000;
+  }
+
   template<class T>
   void safe_release(T *&p) {
     if (p) {
@@ -212,8 +216,25 @@ namespace {
     std::uint32_t generation = 0;
     std::uint64_t frame_id = 0;
     std::uint64_t fence_value = 0;  // 0 = published at Present time (no fence)
+    // D3D12 transfer: the motion copy's value on g_cap.motion_fence12 (0 =
+    // none), and when the completion thread first saw the frame's own copy
+    // done while that one was not (completion thread, capture lock)
+    std::uint64_t motion_value = 0;
+    std::uint64_t capture_done_qpc = 0;
     HANDLE done_event = nullptr;  // for the life of the DLL
   };
+
+  // A frame whose motion copy (made on the transfer queue) lags its pixels
+  // publishes without its vectors this long after the pixels were done
+  constexpr std::uint64_t kMotionLateUs = 3000;
+
+  // Transfer statistics for the motion log line: frames whose vectors went
+  // through the transfer queue, how long after the pixels their copy
+  // finished (done first / < 0.5 ms / < 1 ms / < 3 ms), and those published
+  // without them
+  std::atomic<std::uint64_t> g_transfer_frames {0};
+  std::atomic<std::uint64_t> g_transfer_lag[4] {};
+  std::atomic<std::uint64_t> g_transfer_late {0};
 
   slot_t g_slots[gc::kSlots];
   HANDLE g_frame_event = nullptr;
@@ -228,14 +249,16 @@ namespace {
 
   SRWLOCK g_capture_lock = SRWLOCK_INIT;  // held by the one thread capturing; Presents try-lock and skip
   std::uint64_t fence_completed();  // the captured device's fence (D3D11 or D3D12); UINT64_MAX without one; capture lock held
+  std::uint64_t motion_fence_completed();  // D3D12: the transfer queue's fence; UINT64_MAX without one; capture lock held
 
   // Runs under the capture lock: nothing here can be retired or rewritten
-  // by the render thread meanwhile (it skips the frame instead).
-  void complete_slot(int slot) {
+  // by the render thread meanwhile (it skips the frame instead). True while
+  // the frame's pixels are done but its motion copy is not (the caller polls).
+  bool complete_slot(int slot) {
     auto &s = g_slots[slot];
     const auto word = s.word.load(std::memory_order_acquire);
     if (word_state(word) != st_pending) {
-      return;  // not in flight: a stale or already-consumed event
+      return false;  // not in flight: a stale or already-consumed event
     }
     const auto version = s.version;
     const auto generation = s.generation;
@@ -249,12 +272,12 @@ namespace {
     if (fence_value) {
       const auto completed = fence_completed();
       if (completed < fence_value) {
-        return;
+        return false;
       }
       if (completed == UINT64_MAX) {
         auto lost = word;
         s.word.compare_exchange_strong(lost, make_word(st_free, word), std::memory_order_acq_rel);
-        return;
+        return false;
       }
     }
 
@@ -263,15 +286,42 @@ namespace {
     if (!current || frame_id <= g_last_published_frame_id) {
       auto stale = word;
       s.word.compare_exchange_strong(stale, make_word(st_free, word), std::memory_order_acq_rel);
-      return;
+      return false;
+    }
+
+    // The vectors, copied on the transfer queue behind the game's DLSS work:
+    // waited for a little past the pixels, then the frame goes without them
+    // (the slot's motion texture stays busy until that copy completes: the
+    // render thread checks before writing it again)
+    bool drop_motion = false;
+    if (s.motion_value) {
+      if (motion_fence_completed() < s.motion_value) {
+        if (!s.capture_done_qpc) {
+          s.capture_done_qpc = done_qpc;
+        }
+        if (done_qpc - s.capture_done_qpc < us_to_qpc(kMotionLateUs)) {
+          return true;
+        }
+        drop_motion = true;
+      } else {
+        const auto lag = s.capture_done_qpc ? done_qpc - s.capture_done_qpc : 0;
+        const int bucket = !lag ? 0 : lag < us_to_qpc(500) ? 1 : lag < us_to_qpc(1000) ? 2 : 3;
+        g_transfer_lag[bucket].fetch_add(1, std::memory_order_relaxed);
+      }
     }
 
     // Claim it: pending -> published on exactly this submission
     auto expected = word;
     if (!s.word.compare_exchange_strong(expected, make_word(st_published, word), std::memory_order_acq_rel)) {
-      return;  // retired or reused under us
+      return false;  // retired or reused under us
     }
     auto &b = *g_block;
+    if (drop_motion) {
+      // (the record is this pending slot's, which only this thread touches
+      // now; the host reads it only after the publish below)
+      b.slots[slot].motion_id.store(0, std::memory_order_relaxed);
+      g_transfer_late.fetch_add(1, std::memory_order_relaxed);
+    }
     b.slots[slot].gpu_done_qpc.store(fence_value ? done_qpc : 0, std::memory_order_release);
     b.latest.store(gc::make_latest(static_cast<std::uint32_t>(slot), version), std::memory_order_release);
     b.publish_qpc.store(done_qpc, std::memory_order_release);
@@ -287,6 +337,7 @@ namespace {
     g_published_slot = slot;
     g_published_word = make_word(st_published, word);
     SetEvent(g_frame_event);
+    return false;
   }
 
   DWORD WINAPI completion_thread_main(void *) {
@@ -294,13 +345,22 @@ namespace {
     for (int i = 0; i < gc::kSlots; ++i) {
       events[i] = g_slots[i].done_event;
     }
+    bool polling = false;  // a frame waits on its motion copy: check again shortly
     for (;;) {
-      const DWORD r = WaitForMultipleObjects(gc::kSlots, events, FALSE, INFINITE);
-      if (r < WAIT_OBJECT_0 || r >= WAIT_OBJECT_0 + gc::kSlots) {
+      const DWORD r = WaitForMultipleObjects(gc::kSlots, events, FALSE, polling ? 1 : INFINITE);
+      if (r != WAIT_TIMEOUT && (r < WAIT_OBJECT_0 || r >= WAIT_OBJECT_0 + gc::kSlots)) {
         return 1;
       }
       AcquireSRWLockExclusive(&g_capture_lock);
-      complete_slot(static_cast<int>(r - WAIT_OBJECT_0));
+      if (r == WAIT_TIMEOUT || polling) {
+        // (every slot: the one waiting on motion, and whatever woke us)
+        polling = false;
+        for (int i = 0; i < gc::kSlots; ++i) {
+          polling = complete_slot(i) || polling;
+        }
+      } else {
+        polling = complete_slot(static_cast<int>(r - WAIT_OBJECT_0));
+      }
       ReleaseSRWLockExclusive(&g_capture_lock);
     }
   }
@@ -320,6 +380,9 @@ namespace {
     HANDLE motion_handles[gc::kSlots] = {};
     ID3D11Fence *fence = nullptr;  // the fence its copies were signalled on (a reference; D3D11)
     ID3D12Fence *fence12 = nullptr;  // ... or D3D12 (then nothing is released before it completes)
+    ID3D12Fence *motion_fence12 = nullptr;  // D3D12: the transfer queue's fence, when its copies wrote the set (a reference) ...
+    std::uint64_t highest_motion_value = 0;  // ... up to this value
+    ID3D12CommandQueue *queue12 = nullptr;  // a retired transfer queue (released with its command storage)
     ID3D12CommandAllocator *allocators[gc::kSlots] = {};  // D3D12 command storage of a released capture
     ID3D12GraphicsCommandList *lists[gc::kSlots] = {};
     std::uint64_t highest_fence_value = 0;
@@ -352,6 +415,19 @@ namespace {
     ID3D12GraphicsCommandList *lists[gc::kSlots] = {};
     std::uint64_t list_fence[gc::kSlots] = {};  // fence value of each list's last submission
     ID3D12Resource *textures12[gc::kSlots] = {};
+    // The transfer queue (see the motion section): a direct queue of ours
+    // that copies vectors made on another queue into a slot's motion texture
+    // once the game's DLSS work there finished, with its own fence and one
+    // command allocator/list per slot. Made the first time a frame's vectors
+    // are unfinished at Present; no queue of the game ever waits on it.
+    ID3D12CommandQueue *motion_queue = nullptr;
+    ID3D12Fence *motion_fence12 = nullptr;
+    std::uint64_t motion_fence_value = 0;
+    ID3D12CommandAllocator *motion_allocators[gc::kSlots] = {};
+    ID3D12GraphicsCommandList *motion_lists[gc::kSlots] = {};
+    std::uint64_t motion_list_fence[gc::kSlots] = {};  // its value after each slot's last transfer (its motion texture busy until then)
+    std::uint64_t highest_motion_value_used = 0;  // ... of this texture set
+    bool motion_queue_failed = false;  // could not be made: not tried again for this device
 
     ID3D11Texture2D *textures[gc::kSlots] = {};
     IDXGIKeyedMutex *mutexes[gc::kSlots] = {};
@@ -408,6 +484,11 @@ namespace {
     float scale_x = 1;
     float scale_y = 1;
     bool reading = false;  // D3D12: the entry is reserved for a capture copy (handed on to it, or given back here)
+    // D3D12 transfer: the producer's fence and value the transfer queue
+    // waits for before copying (borrowed: the reserved entry keeps its queue
+    // slot, and so the fence, alive; null = produced already)
+    ID3D12Fence *wait_fence = nullptr;
+    std::uint64_t wait_value = 0;
   };
 
   // The vector sets a captured frame carries: the one its Present consumed
@@ -422,6 +503,15 @@ namespace {
     UINT rows = 0;  // each candidate's rows in the motion texture (the ring's height)
     int count = 0;
     motion_cand_t cands[gc::kMotionCandidates];
+    // D3D12: the sets are copied on the transfer queue (the frame's own was
+    // unfinished on its producer's queue at Present) ...
+    bool transfer = false;
+    // ... or would have been, had there been a transfer queue: make one
+    bool wants_transfer = false;
+    // The first such frame: its queues, for the log
+    bool log_queues = false;
+    D3D12_COMMAND_QUEUE_DESC producer_desc {};
+    D3D12_COMMAND_QUEUE_DESC present_desc {};
 
     void release() {
       for (auto &c : cands) {
@@ -435,6 +525,7 @@ namespace {
       }
       count = 0;
       id = 0;
+      transfer = false;
     }
   };
 
@@ -448,6 +539,10 @@ namespace {
   }
 
   std::atomic<std::uint64_t> g_vk_completed {0};  // Vulkan: the last copy the fence waiter saw finish (UINT64_MAX: device lost)
+
+  std::uint64_t motion_fence_completed() {
+    return g_cap.motion_fence12 ? g_cap.motion_fence12->GetCompletedValue() : UINT64_MAX;
+  }
 
   std::uint64_t fence_completed() {
     if (g_cap.api == gc::api_e::vulkan) {
@@ -530,6 +625,8 @@ namespace {
     }
     safe_release(r.fence);
     safe_release(r.fence12);
+    safe_release(r.motion_fence12);
+    safe_release(r.queue12);
     r.textures_released = true;
   }
 
@@ -546,7 +643,8 @@ namespace {
       if (!r.textures_released) {
         // (UINT64_MAX = device removed: nothing more will complete; release)
         const auto completed = r.fence12 ? r.fence12->GetCompletedValue() : r.fence ? r.fence->GetCompletedValue() : UINT64_MAX;
-        const bool done = completed >= r.highest_fence_value;  // (UINT64_MAX: device removed)
+        const bool done = completed >= r.highest_fence_value &&  // (UINT64_MAX: device removed)
+                          (!r.motion_fence12 || r.motion_fence12->GetCompletedValue() >= r.highest_motion_value);
         // D3D11 keeps what its GPU work uses alive; D3D12 does not, so a
         // D3D12 set waits for its copies however long they take
         const bool old = !r.fence12 && now - r.retired_qpc > qpc_frequency();
@@ -575,8 +673,9 @@ namespace {
   // Retiring must not allocate (it runs inside Present, and what it keeps
   // must not be dropped), so free entries are reserved up front: enough for
   // the most one capture pass can retire (a recreate, a device switch and a
-  // failed Signal: two texture sets and two command stores, plus one spare)
-  constexpr std::size_t kRetireReserve = 5;
+  // failed Signal: two texture sets and two command stores, the transfer
+  // queue's command store, plus one spare)
+  constexpr std::size_t kRetireReserve = 6;
 
   bool reserve_retirement() {
     const auto free = static_cast<std::size_t>(std::count_if(g_cap.retired.begin(), g_cap.retired.end(), [](const retired_t &r) {
@@ -629,6 +728,11 @@ namespace {
       g_cap.fence12->AddRef();
       slot->fence12 = g_cap.fence12;
     }
+    if (g_cap.motion_fence12 && g_cap.highest_motion_value_used) {
+      g_cap.motion_fence12->AddRef();
+      slot->motion_fence12 = g_cap.motion_fence12;
+      slot->highest_motion_value = g_cap.highest_motion_value_used;
+    }
     for (int i = 0; i < gc::kSlots; ++i) {
       slot->textures[i] = g_cap.textures[i] ? static_cast<IUnknown *>(g_cap.textures[i]) : static_cast<IUnknown *>(g_cap.textures12[i]);
     }
@@ -656,6 +760,7 @@ namespace {
     g_cap.width = g_cap.height = 0;
     g_cap.format = DXGI_FORMAT_UNKNOWN;
     g_cap.highest_fence_value_used = 0;
+    g_cap.highest_motion_value_used = 0;
 
     for (auto &s : g_slots) {
       auto word = s.word.load(std::memory_order_acquire);
@@ -684,6 +789,41 @@ namespace {
     }
   }
 
+  // The transfer queue and its command storage; retired together (queue
+  // included) until its last copy completed
+  void release_transfer_queue() {
+    std::uint64_t last_used = 0;
+    for (int i = 0; i < gc::kSlots; ++i) {
+      last_used = std::max(last_used, g_cap.motion_list_fence[i]);
+    }
+    if (g_cap.motion_queue && g_cap.motion_fence12 && last_used > g_cap.motion_fence12->GetCompletedValue()) {
+      retired_t *slot = &new_retired();
+      slot->in_use = true;
+      slot->retired_qpc = qpc_now();
+      slot->highest_fence_value = last_used;
+      g_cap.motion_fence12->AddRef();
+      slot->fence12 = g_cap.motion_fence12;
+      slot->queue12 = g_cap.motion_queue;
+      g_cap.motion_queue = nullptr;
+      for (int i = 0; i < gc::kSlots; ++i) {
+        slot->lists[i] = g_cap.motion_lists[i];
+        slot->allocators[i] = g_cap.motion_allocators[i];
+        g_cap.motion_lists[i] = nullptr;
+        g_cap.motion_allocators[i] = nullptr;
+      }
+    }
+    for (int i = 0; i < gc::kSlots; ++i) {
+      safe_release(g_cap.motion_lists[i]);
+      safe_release(g_cap.motion_allocators[i]);
+      g_cap.motion_list_fence[i] = 0;
+    }
+    safe_release(g_cap.motion_queue);
+    safe_release(g_cap.motion_fence12);
+    g_cap.motion_fence_value = 0;
+    g_cap.highest_motion_value_used = 0;
+    g_cap.motion_queue_failed = false;
+  }
+
   void release_capture(HWND hwnd) {
     retire_generation(hwnd);
     g_motion_refused = motion_want_t {};  // (another device may take that shape)
@@ -707,6 +847,7 @@ namespace {
       safe_release(g_cap.allocators[i]);
       g_cap.list_fence[i] = 0;
     }
+    release_transfer_queue();
     safe_release(g_cap.fence12);
     safe_release(g_cap.queue);
     safe_release(g_cap.device12);
@@ -1098,12 +1239,15 @@ namespace {
 
   // Hands a submitted copy to the completion thread: the fields first, then
   // the pending word (release). Returns its ticket.
-  std::uint64_t mark_pending(int slot, std::uint32_t version, std::uint32_t generation, std::uint64_t frame_id, std::uint64_t fence_value) {
+  std::uint64_t mark_pending(int slot, std::uint32_t version, std::uint32_t generation, std::uint64_t frame_id, std::uint64_t fence_value,
+                             std::uint64_t motion_value = 0) {
     auto &s = g_slots[slot];
     s.version = version;
     s.generation = generation;
     s.frame_id = frame_id;
     s.fence_value = fence_value;
+    s.motion_value = motion_value;
+    s.capture_done_qpc = 0;
     const auto ticket = g_next_ticket++;
     s.word.store(make_word(st_pending, ticket), std::memory_order_release);
     return ticket;
@@ -1232,6 +1376,11 @@ namespace {
     // until submitted or given back; -1 = none)
     std::uint32_t motion_ring = 0;
     int motion_entries[gc::kMotionCandidates] = {-1, -1, -1};
+    // ... copied by the transfer queue instead (g_cap's list, borrowed; null
+    // = in `list`), after waiting for each producer value
+    ID3D12GraphicsCommandList *motion_list = nullptr;
+    ID3D12Fence *wait_fences[gc::kMotionCandidates] = {};
+    std::uint64_t wait_values[gc::kMotionCandidates] = {};
   };
 
   // A copy recorded before the real Present, waiting for DXGI's own
@@ -1603,6 +1752,67 @@ namespace {
     return true;
   }
 
+  // The transfer queue (see capture_t): made on the capture thread outside
+  // DXGI's submission. False, and not tried again for the device, if the
+  // device refuses any of it.
+  bool ensure_transfer_queue12() {
+    if (g_cap.motion_queue) {
+      return true;
+    }
+    if (g_cap.motion_queue_failed || !g_cap.device12) {
+      return false;
+    }
+    D3D12_COMMAND_QUEUE_DESC desc {};
+    desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    desc.NodeMask = g_cap.queue->GetDesc().NodeMask;
+    const char *step = "queue";
+    HRESULT hr = g_cap.device12->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&g_cap.motion_queue));
+    if (SUCCEEDED(hr)) {
+      step = "fence";
+      hr = g_cap.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_cap.motion_fence12));
+    }
+    for (int i = 0; i < gc::kSlots && SUCCEEDED(hr); ++i) {
+      step = "allocator";
+      hr = g_cap.device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                                  reinterpret_cast<void **>(&g_cap.motion_allocators[i]));
+      if (SUCCEEDED(hr)) {
+        step = "list";
+        hr = g_cap.device12->CreateCommandList(desc.NodeMask, D3D12_COMMAND_LIST_TYPE_DIRECT, g_cap.motion_allocators[i], nullptr,
+                                               __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_cap.motion_lists[i]));
+      }
+      if (SUCCEEDED(hr)) {
+        hr = g_cap.motion_lists[i]->Close();
+      }
+    }
+    if (FAILED(hr)) {
+      log("DLSS motion vectors: the transfer queue could not be made (%s: 0x%08lx); vectors unfinished at Present stay dropped", step, hr);
+      release_transfer_queue();
+      g_cap.motion_queue_failed = true;
+      return false;
+    }
+    log("DLSS motion vectors: transfer queue %p made (vectors unfinished at Present are copied once their DLSS work completes)",
+        static_cast<void *>(g_cap.motion_queue));
+    return true;
+  }
+
+  // Whether nothing of the transfer queue still writes the slot's motion
+  // texture or uses its command storage
+  bool transfer_idle(int slot) {
+    return !g_cap.motion_list_fence[slot] || (g_cap.motion_fence12 && g_cap.motion_fence12->GetCompletedValue() >= g_cap.motion_list_fence[slot]);
+  }
+
+  void log_motion_queues(const motion_pick_t &pick) {
+    const auto type = [](D3D12_COMMAND_LIST_TYPE t) {
+      return t == D3D12_COMMAND_LIST_TYPE_DIRECT ? "direct" : t == D3D12_COMMAND_LIST_TYPE_COMPUTE ? "compute" : t == D3D12_COMMAND_LIST_TYPE_COPY ? "copy" : "other";
+    };
+    log("DLSS motion vectors: this frame's evaluation was unfinished at Present on a %s queue (priority %d, flags 0x%x); "
+        "the swapchain presents from a %s queue (priority %d); Streamline %s, DLSS-G %s",
+        type(pick.producer_desc.Type), pick.producer_desc.Priority, pick.producer_desc.Flags, type(pick.present_desc.Type), pick.present_desc.Priority,
+        GetModuleHandleW(L"sl.interposer.dll") ? "loaded" : "not loaded",
+        (GetModuleHandleW(L"sl.dlss_g.dll") || GetModuleHandleW(L"nvngx_dlssg.dll")) ? "loaded" : "not loaded");
+  }
+
   // D3D12 motion textures of a generation: shared, simultaneous-access (the
   // copy promotes them and they decay to COMMON, like the frame textures).
   // False (nothing created) if the device refuses them.
@@ -1861,6 +2071,7 @@ namespace {
     std::uint64_t no_entry = 0;  // evaluations that found no free ring entry
     std::uint64_t evaluations = 0;
     std::uint64_t logged_qpc = 0;
+    bool queues_logged = false;  // the first unfinished frame's queues were described (once)
   };
 
   SRWLOCK g_motion_lock = SRWLOCK_INIT;
@@ -2710,7 +2921,7 @@ namespace {
 
   // Motion lock held. The periodic line, when due (written by the caller
   // after unlocking); resets the counts
-  bool motion_stats_line(char (&line)[512]) {
+  bool motion_stats_line(char (&line)[768]) {
     auto &s = g_motion_stats;
     const auto now = qpc_now();
     if (!s.logged_qpc) {
@@ -2727,8 +2938,21 @@ namespace {
                   static_cast<unsigned long long>(s.pending[1]), static_cast<unsigned long long>(s.pending[2]), static_cast<unsigned long long>(s.pending[3]),
                   static_cast<unsigned long long>(s.pending[4]), static_cast<unsigned long long>(s.picked), static_cast<unsigned long long>(s.alternatives), static_cast<unsigned long long>(s.dropped),
                   static_cast<unsigned long long>(s.unfinished));
+    const auto take = [](std::atomic<std::uint64_t> &a) {
+      return static_cast<unsigned long long>(a.exchange(0, std::memory_order_relaxed));
+    };
+    const auto frames = take(g_transfer_frames);
+    if (frames) {
+      const auto used = std::strlen(line);
+      const auto lag0 = take(g_transfer_lag[0]), lag1 = take(g_transfer_lag[1]), lag2 = take(g_transfer_lag[2]), lag3 = take(g_transfer_lag[3]);
+      std::snprintf(line + used, sizeof(line) - used,
+                    "; via the transfer queue %llu (done before the pixels/<0.5/<1/<3 ms after %llu/%llu/%llu/%llu, late %llu)", frames, lag0, lag1, lag2,
+                    lag3, take(g_transfer_late));
+    }
+    const bool queues_logged = s.queues_logged;
     s = motion_stats_t {};
     s.logged_qpc = now;
+    s.queues_logged = queues_logged;
     return true;
   }
 
@@ -2742,7 +2966,7 @@ namespace {
     if (auto *captured = g_captured_swapchain.load(std::memory_order_acquire); captured && captured != swapchain) {
       return;  // (another swapchain's Present)
     }
-    char line[512];
+    char line[768];
     bool log_now = false;
     {
       motion_lock_t lock;
@@ -2801,7 +3025,11 @@ namespace {
   // reserved for the copy until motion_consumed or motion_unread). False if
   // there are none; `want` then still names the ring's shape, so the
   // generation keeps (or gets) motion textures.
-  bool motion_pick(gc::api_e api, IUnknown *device, ID3D12CommandQueue *present_queue, motion_pick_t &pick, motion_want_t &want) {
+  // `transfer_fence` (D3D12, the transfer queue's; null = none): a frame
+  // whose own vectors are unfinished on another queue has them copied by the
+  // transfer queue once they are done, instead of going without.
+  bool motion_pick(gc::api_e api, IUnknown *device, ID3D12CommandQueue *present_queue, motion_pick_t &pick, motion_want_t &want,
+                   ID3D12Fence *transfer_fence = nullptr) {
     pick = motion_pick_t {};
     want = motion_want_t {};
     if (!motion_wanted()) {
@@ -2820,9 +3048,29 @@ namespace {
     if (!current) {
       return false;
     }
+    // D3D12: the frame's own set unfinished on another queue goes through
+    // the transfer queue (all its sets then do): the capture copy on the
+    // presenting queue must not read it, and that queue must never wait
+    if (api == gc::api_e::d3d12) {
+      const auto &e0 = g_motion_evals[ids[0] % kMotionEvals];
+      if (e0.id == ids[0] && e0.ring == ring.serial) {
+        const auto &en = ring.entries[e0.entry];
+        if (en.writer == e0.id && en.queue >= 0 && g_motion_queues[en.queue].queue != present_queue && !motion_produced(ring, en)) {
+          pick.transfer = transfer_fence != nullptr;
+          pick.wants_transfer = !transfer_fence;
+          if (!g_motion_stats.queues_logged) {
+            g_motion_stats.queues_logged = true;
+            pick.log_queues = true;
+            pick.producer_desc = g_motion_queues[en.queue].queue->GetDesc();
+            pick.present_desc = present_queue->GetDesc();
+          }
+        }
+      }
+    }
+    ID3D12Fence *const reader = pick.transfer ? transfer_fence : g_cap.fence12;
     // Whether evaluation `e` can be read now: its entry still holds it and,
     // for D3D12, it is readable on the presenting queue without waiting for
-    // another queue
+    // another queue, or (transfer) on the transfer queue after waiting
     auto readable = [&](const motion_eval_t &e, bool count) {
       const auto &en = ring.entries[e.entry];
       if (en.writer != e.id) {
@@ -2834,12 +3082,12 @@ namespace {
       if (en.queue < 0) {
         return false;
       }
-      // Read by an earlier capture on another fence that has not finished:
+      // Read by an earlier copy on another fence that has not finished:
       // one entry follows one consumer timeline at a time
-      if (en.consumer && en.consumer != g_cap.fence12 && en.consumer->GetCompletedValue() < en.consumed) {
+      if (en.consumer && en.consumer != reader && en.consumer->GetCompletedValue() < en.consumed) {
         return false;
       }
-      if (g_motion_queues[en.queue].queue != present_queue && !motion_produced(ring, en)) {
+      if (!pick.transfer && g_motion_queues[en.queue].queue != present_queue && !motion_produced(ring, en)) {
         if (count) {
           ++g_motion_stats.unfinished;
         }
@@ -2883,6 +3131,10 @@ namespace {
       c.height = e.height;
       c.scale_x = e.scale_x;
       c.scale_y = e.scale_y;
+      if (pick.transfer && !motion_produced(ring, ring.entries[e.entry])) {
+        c.wait_fence = g_motion_queues[ring.entries[e.entry].queue].fence;
+        c.wait_value = ring.entries[e.entry].produced;
+      }
       if (api == gc::api_e::d3d12) {
         c.src12 = ring.tex12[e.entry];
         c.src12->AddRef();
@@ -3146,7 +3398,7 @@ namespace {
     // submitted before this Present (see the motion section)
     motion_pick_t pick;
     motion_want_t want;
-    motion_pick(gc::api_e::d3d12, device, g_cap.queue, pick, want);
+    motion_pick(gc::api_e::d3d12, device, g_cap.queue, pick, want, g_cap.motion_queue_failed ? nullptr : g_cap.motion_fence12);
     struct release_pick_t {
       motion_pick_t &p;
 
@@ -3154,6 +3406,12 @@ namespace {
         p.release();
       }
     } release_pick {pick};
+    if (pick.log_queues) {
+      log_motion_queues(pick);
+    }
+    if (pick.wants_transfer) {
+      ensure_transfer_queue12();  // (from the next frame on)
+    }
     if (!ensure_textures12(back_desc, hwnd, want)) {
       return;
     }
@@ -3183,10 +3441,11 @@ namespace {
     list->ResourceBarrier(1, &to_copy);
     list->CopyResource(target, back);  // target: promoted to COPY_DEST, decays to COMMON
     list->ResourceBarrier(1, &to_present);
-    const bool motion = motion_fits(pick) && g_cap.motion12[slot];
-    if (motion) {
-      // The ring entry rests in COPY_SOURCE; the motion texture is promoted
-      // and decays like the frame texture
+    // (not while a late transfer may still write the slot's motion texture)
+    bool motion = motion_fits(pick) && g_cap.motion12[slot] && transfer_idle(slot);
+    // The ring entry rests in COPY_SOURCE; the motion texture is promoted
+    // and decays like the frame texture (on either queue)
+    const auto record_motion = [&](ID3D12GraphicsCommandList *into) {
       D3D12_TEXTURE_COPY_LOCATION dst {};
       dst.pResource = g_cap.motion12[slot];
       dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3198,14 +3457,33 @@ namespace {
         }
         src.pResource = pick.cands[i].src12;
         const D3D12_BOX box {0, 0, 0, pick.cands[i].width, pick.cands[i].height, 1};
-        list->CopyTextureRegion(&dst, 0, i * pick.rows, 0, &src, &box);
+        into->CopyTextureRegion(&dst, 0, i * pick.rows, 0, &src, &box);
       }
+    };
+    if (motion && !pick.transfer) {
+      record_motion(list);
     }
     if (const HRESULT closed = list->Close(); FAILED(closed)) {
       log("Closing the command list of slot %d failed: 0x%08lx", slot, closed);
       recreate_list(slot);
       give_back();
       return;
+    }
+    // Vectors unfinished on their producer's queue: copied by the transfer
+    // queue after it waited for them (its storage is idle: transfer_idle)
+    ID3D12GraphicsCommandList *motion_list = nullptr;
+    if (motion && pick.transfer) {
+      auto *ml = g_cap.motion_lists[slot];
+      if (ml && SUCCEEDED(g_cap.motion_allocators[slot]->Reset()) && SUCCEEDED(ml->Reset(g_cap.motion_allocators[slot], nullptr))) {
+        record_motion(ml);
+        if (SUCCEEDED(ml->Close())) {
+          motion_list = ml;
+        }
+      }
+      if (!motion_list) {
+        log("Recording the motion transfer of slot %d failed: the frame goes without vectors", slot);
+        motion = false;
+      }
     }
 
     prepared12_t p;
@@ -3220,9 +3498,12 @@ namespace {
     if (motion) {
       // The entry's reservation goes with the recorded copy
       p.motion_ring = pick.ring;
+      p.motion_list = motion_list;
       for (int i = 0; i < pick.count; ++i) {
         if (pick.cands[i].reading) {
           p.motion_entries[i] = pick.cands[i].entry;
+          p.wait_fences[i] = pick.cands[i].wait_fence;
+          p.wait_values[i] = pick.cands[i].wait_value;
           pick.cands[i].reading = false;
         }
       }
@@ -3232,6 +3513,59 @@ namespace {
       return;
     }
     submit12(p, swapchain, hwnd);
+  }
+
+  // Submits a recorded motion transfer (capture lock held; its slot's
+  // pixels already submitted): the transfer queue waits for each set's
+  // producer value, copies, and signals its fence. Returns that value, 0 if
+  // nothing was submitted (the record then says the frame has no vectors).
+  std::uint64_t submit_transfer(const prepared12_t &p) {
+    bool waited = true;
+    for (int i = 0; i < gc::kMotionCandidates && waited; ++i) {
+      if (p.motion_entries[i] >= 0 && p.wait_fences[i]) {
+        waited = SUCCEEDED(g_cap.motion_queue->Wait(p.wait_fences[i], p.wait_values[i]));
+      }
+    }
+    std::uint64_t value = 0;
+    if (waited) {
+      execute_on(g_cap.motion_queue, p.motion_list);
+      value = ++g_cap.motion_fence_value;
+      if (FAILED(g_cap.motion_queue->Signal(g_cap.motion_fence12, value))) {
+        // Executed, but nothing will say when it finished: its storage, the
+        // slot's motion texture and the entries read stay taken for good
+        g_cap.motion_list_fence[p.slot] = UINT64_MAX;
+        for (int entry : p.motion_entries) {
+          if (entry >= 0) {
+            motion_consumed(p.motion_ring, entry, g_cap.motion_fence12, UINT64_MAX);
+          }
+        }
+        g_cap.motion_queue_failed = true;
+        log("Signal on the transfer queue failed: no more motion transfers on this device");
+        value = 0;
+      } else {
+        g_cap.motion_list_fence[p.slot] = value;
+        g_cap.highest_motion_value_used = value;
+        for (int entry : p.motion_entries) {
+          if (entry >= 0) {
+            motion_consumed(p.motion_ring, entry, g_cap.motion_fence12, value);
+          }
+        }
+        g_transfer_frames.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else {
+      // (the list was never executed: a Wait already queued is harmless,
+      // the queue simply idles until the game's work arrives)
+      for (int entry : p.motion_entries) {
+        if (entry >= 0) {
+          motion_unread(p.motion_ring, entry);
+        }
+      }
+      log("Wait on the transfer queue failed: the frame goes without vectors");
+    }
+    if (!value) {
+      g_block->slots[p.slot].motion_id.store(0, std::memory_order_relaxed);  // (before the slot is marked pending)
+    }
+    return value;
   }
 
   // Executes a recorded copy on its queue and signals our fence; the slot
@@ -3260,7 +3594,11 @@ namespace {
       g_cap.highest_fence_value_used = fence_value;
       for (int entry : p.motion_entries) {
         if (entry >= 0) {
-          motion_consumed(p.motion_ring, entry, g_cap.fence12, fence_value);  // (never completes: the entry stays taken)
+          if (p.motion_list) {
+            motion_unread(p.motion_ring, entry);  // (its transfer was never submitted)
+          } else {
+            motion_consumed(p.motion_ring, entry, g_cap.fence12, fence_value);  // (never completes: the entry stays taken)
+          }
         }
       }
       g_d3d12_dead.store(true, std::memory_order_release);
@@ -3274,15 +3612,24 @@ namespace {
     }
     g_cap.list_fence[slot] = fence_value;
     g_cap.highest_fence_value_used = fence_value;
-    for (int entry : p.motion_entries) {
-      if (entry >= 0) {
-        motion_consumed(p.motion_ring, entry, g_cap.fence12, fence_value);
+    std::uint64_t motion_value = 0;
+    if (p.motion_list) {
+      motion_value = submit_transfer(p);
+    } else {
+      for (int entry : p.motion_entries) {
+        if (entry >= 0) {
+          motion_consumed(p.motion_ring, entry, g_cap.fence12, fence_value);
+        }
       }
     }
-    const auto ticket = mark_pending(slot, version, generation, frame_id, fence_value);
+    const auto ticket = mark_pending(slot, version, generation, frame_id, fence_value, motion_value);
     if (FAILED(g_cap.fence12->SetEventOnCompletion(fence_value, g_slots[slot].done_event))) {
       drop_pending(slot, ticket);  // the copy still completes; only the publication is lost
       return;
+    }
+    if (motion_value && FAILED(g_cap.motion_fence12->SetEventOnCompletion(motion_value, g_slots[slot].done_event))) {
+      // (the completion thread still polls it once the pixels are done)
+      log("SetEventOnCompletion on the transfer fence failed");
     }
     note_capturing(swapchain, "D3D12");
   }
@@ -3356,6 +3703,7 @@ namespace {
     }
     const bool current = g_cap.api == gc::api_e::d3d12 && g_cap.swapchain == t_armed.swapchain && g_cap.queue == queue &&
                          g_cap.fence12 == p.fence && g_cap.lists[p.slot] == p.list &&
+                         (!p.motion_list || (g_cap.motion_queue && g_cap.motion_lists[p.slot] == p.motion_list)) &&
                          g_current_generation.load(std::memory_order_acquire) == p.generation && reserve_retirement();
     if (!current) {
       give_back_prepared(p);
