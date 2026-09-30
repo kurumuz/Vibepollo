@@ -50,7 +50,10 @@ namespace platf::dxgi::game_capture {
 
   class mvc2_encoder_t {
   public:
+    mvc2_encoder_t();  // (out of line: kernels_t is complete only there)
     ~mvc2_encoder_t();
+    mvc2_encoder_t(const mvc2_encoder_t &) = delete;
+    mvc2_encoder_t &operator=(const mvc2_encoder_t &) = delete;
 
     /**
      * @brief Queues the encode of a field on the context and returns without

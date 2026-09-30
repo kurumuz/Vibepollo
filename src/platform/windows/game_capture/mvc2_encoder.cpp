@@ -76,6 +76,8 @@ namespace platf::dxgi::game_capture {
     }
   };
 
+  mvc2_encoder_t::mvc2_encoder_t() = default;
+
   mvc2_encoder_t::~mvc2_encoder_t() {
     if (_compiler.joinable()) {
       _compiler.join();
