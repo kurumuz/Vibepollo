@@ -32,7 +32,8 @@ namespace platf::dxgi::game_capture {
       std::uint32_t vector_row;
       std::uint32_t stats_base;
       std::uint32_t field_base;
-      std::uint32_t pad[2];
+      std::uint32_t score_cap;
+      std::uint32_t pad;
     };
 
     constexpr int kSets = ::game_capture::kMotionCandidates;
@@ -260,6 +261,7 @@ namespace platf::dxgi::game_capture {
     // predict the frame from the previous one)
     const int sets = std::clamp(frame.motion_count, 1, kSets);
     const std::uint32_t per_field = p.blocks[0] * p.blocks[1];
+    p.score_cap = std::min<std::uint32_t>(25000, 0xffffffffu / per_field);  // (no 32-bit overflow for any accepted frame size)
     p.diagnose = (_diagnose_tick++ % 4) == 0 ? 1 : 0;  // (every 4th frame: the extra tests cost three more loads a pixel)
     ID3D11ShaderResourceView *block_in[4] = {nullptr, _motion_srv.get(), _luma_srv[prev].get(), _luma_srv[cur].get()};
     context->CSSetShaderResources(0, 4, block_in);
@@ -309,10 +311,12 @@ namespace platf::dxgi::game_capture {
         continue;
       }
       others = true;
-      if (score(i) < score(0) * (1.0 - kMargin) && score(i) < score(chosen)) {
-        chosen = i;
-      } else if (score(i) < score(0) && chosen == 0) {
-        ++_near_wins;  // (lower, but within the margin)
+      if (score(i) < score(0) * (1.0 - kMargin)) {
+        if (score(i) < score(chosen)) {
+          chosen = i;
+        }
+      } else if (score(i) < score(0)) {
+        ++_near_wins;  // (lower, but within the margin: each alternative counted on its own)
       }
     }
     for (int k = 0; k < kCounters; ++k) {

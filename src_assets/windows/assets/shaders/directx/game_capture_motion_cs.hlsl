@@ -21,7 +21,8 @@ cbuffer params : register(b0) {
   uint vector_row;  // this candidate set's first row in the vector texture
   uint stats_base;  // this candidate's first counter
   uint field_base;  // ... and first field entry
-  uint2 pad;
+  uint score_cap;  // the most one block adds to the score (so the frame's total fits 32 bits)
+  uint pad;
 };
 
 Texture2D<float4> color : register(t0);
@@ -43,11 +44,11 @@ void count(uint i) {
   stats.InterlockedAdd((stats_base + i) * 4, 1);
 }
 
-// (x8, and at most 25000 a block: 8K's 129600 blocks stay below 2^32 even
-// with HDR luma; a non-finite error counts as the most)
+// (x8, and at most score_cap a block, set from the block count so the
+// total stays below 2^32; a non-finite error counts as the most)
 void score(float sad) {
   const float scaled = sad * 8.0;
-  stats.InterlockedAdd((stats_base + 10) * 4, scaled >= 0.0 && scaled < 25000.0 ? (uint) scaled : 25000u);
+  stats.InterlockedAdd((stats_base + 10) * 4, scaled >= 0.0 && scaled < (float) score_cap ? (uint) scaled : score_cap);
 }
 
 static const int kNone = (int) 0x80000000;
