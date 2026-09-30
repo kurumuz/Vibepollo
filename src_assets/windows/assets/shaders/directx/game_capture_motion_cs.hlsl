@@ -26,6 +26,15 @@ Texture2D<float> prev_luma : register(t2);
 Texture2D<float> cur_luma_in : register(t3);
 RWTexture2D<float> cur_luma : register(u0);
 RWStructuredBuffer<int2> field : register(u1);
+// Counters (uints): 0 blocks, 1 without a vector (none / out of frame / not
+// checkable), 2 DLSS said no motion, 3 the vector beat zero, 4 zero beat the
+// vector; of the blocks with a vector checked: 5 the flipped vector fits
+// better than it, 6 half of it does, 7 twice it does
+RWByteAddressBuffer stats : register(u2);
+
+void count(uint i) {
+  stats.InterlockedAdd(i * 4, 1);
+}
 
 static const int kNone = (int) 0x80000000;
 
@@ -52,6 +61,7 @@ float luma_of(float3 c) {
   }
   const uint index = id.y * blocks.x + id.x;
   const int2 origin = int2(id.xy) * 16;
+  count(0);
 
   float2 s[16];
   uint n = 0;
@@ -69,6 +79,7 @@ float luma_of(float3 c) {
   }
   if (n == 0 || !verify) {
     field[index] = int2(kNone, 0);
+    count(1);
     return;
   }
 
@@ -89,13 +100,17 @@ float luma_of(float3 c) {
   const float2 reference = float2(origin) + 8.0 + v;
   if (reference.x < 0.0 || reference.y < 0.0 || reference.x >= (float) frame_size.x || reference.y >= (float) frame_size.y) {
     field[index] = int2(kNone, 0);
+    count(1);
     return;
   }
 
   const int2 d = int2(round(v));
   if (any(d != 0)) {
-    float sad_v = 0, sad_0 = 0;
+    // The vector against zero motion; for the counters also its flip, half
+    // and double (a wrong sign or scale shows up there)
+    float sad_v = 0, sad_0 = 0, sad_flip = 0, sad_half = 0, sad_double = 0;
     const int2 last = int2(frame_size) - 1;
+    const int2 half_d = int2(round(v * 0.5));
     for (int y = 0; y < 16; ++y) {
       for (int x = 0; x < 16; ++x) {
         const int2 q = origin + int2(x, y);
@@ -105,11 +120,28 @@ float luma_of(float3 c) {
         const float c = cur_luma_in.Load(int3(q, 0));
         sad_0 += abs(c - prev_luma.Load(int3(q, 0)));
         sad_v += abs(c - prev_luma.Load(int3(clamp(q + d, int2(0, 0), last), 0)));
+        sad_flip += abs(c - prev_luma.Load(int3(clamp(q - d, int2(0, 0), last), 0)));
+        sad_half += abs(c - prev_luma.Load(int3(clamp(q + half_d, int2(0, 0), last), 0)));
+        sad_double += abs(c - prev_luma.Load(int3(clamp(q + 2 * d, int2(0, 0), last), 0)));
       }
+    }
+    if (sad_flip < sad_v) {
+      count(5);
+    }
+    if (sad_half < sad_v) {
+      count(6);
+    }
+    if (sad_double < sad_v) {
+      count(7);
     }
     if (sad_0 <= sad_v) {
       v = float2(0, 0);  // (ties to zero: the cheaper vector)
+      count(4);
+    } else {
+      count(3);
     }
+  } else {
+    count(2);
   }
   field[index] = int2(round(v * 4));
 }

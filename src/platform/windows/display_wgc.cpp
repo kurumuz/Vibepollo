@@ -248,7 +248,8 @@ namespace platf::dxgi {
       if (now - _game_stats_logged >= std::chrono::seconds(10)) {
         if (_game_mode || _game_frames_delivered || _game_desktop_frames_in_game_mode) {
           BOOST_LOG(info) << "Game capture: last 10 s delivered game=" << _game_frames_delivered
-                          << " desktop-while-eligible=" << _game_desktop_frames_in_game_mode << ' ' << _game_source->hook_stats();
+                          << " desktop-while-eligible=" << _game_desktop_frames_in_game_mode << ' ' << _game_source->hook_stats()
+                          << (_game_motion ? _game_motion->stats() : std::string());
         }
         _game_stats_logged = now;
         _game_frames_delivered = 0;

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <d3d11.h>
@@ -53,6 +54,12 @@ namespace platf::dxgi::game_capture {
      */
     void reset();
 
+    /**
+     * @brief What the checks found since the last call (for the periodic
+     *        log line), and resets the counts.
+     */
+    std::string stats();
+
   private:
     bool init(ID3D11Device *device, std::uint32_t width, std::uint32_t height);
 
@@ -69,6 +76,11 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<ID3D11Buffer> _field;
     winrt::com_ptr<ID3D11UnorderedAccessView> _field_uav;
     winrt::com_ptr<ID3D11Buffer> _staging;
+    winrt::com_ptr<ID3D11Buffer> _stats;  // the shader's counters (raw buffer)
+    winrt::com_ptr<ID3D11UnorderedAccessView> _stats_uav;
+    winrt::com_ptr<ID3D11Buffer> _stats_staging;
+    std::uint64_t _counts[8] = {};  // accumulated counters (see the shader)
+    std::uint64_t _fields = 0;  // fields handed out
     int _current = 0;  // _luma[_current] takes the next frame's luma
 
     // The previous frame whose luma is in _luma[1 - _current]

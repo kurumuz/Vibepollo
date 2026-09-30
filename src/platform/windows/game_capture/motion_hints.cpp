@@ -9,6 +9,7 @@
 #include "src/platform/windows/display.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #define GAME_CAPTURE_SHADERS_DIR SUNSHINE_ASSETS_DIR "/shaders/directx"
@@ -102,6 +103,28 @@ namespace platf::dxgi::game_capture {
     if (FAILED(device->CreateBuffer(&sd, nullptr, _staging.put()))) {
       return false;
     }
+    D3D11_BUFFER_DESC cd {};
+    cd.ByteWidth = sizeof(std::uint32_t) * 8;
+    cd.Usage = D3D11_USAGE_DEFAULT;
+    cd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    cd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud {};
+    ud.Format = DXGI_FORMAT_R32_TYPELESS;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = 8;
+    ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+    D3D11_BUFFER_DESC csd = cd;
+    csd.Usage = D3D11_USAGE_STAGING;
+    csd.BindFlags = 0;
+    csd.MiscFlags = 0;
+    csd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    _stats = nullptr;
+    _stats_uav = nullptr;
+    _stats_staging = nullptr;
+    if (FAILED(device->CreateBuffer(&cd, nullptr, _stats.put())) || FAILED(device->CreateUnorderedAccessView(_stats.get(), &ud, _stats_uav.put())) ||
+        FAILED(device->CreateBuffer(&csd, nullptr, _stats_staging.put()))) {
+      return false;
+    }
     _width = width;
     _height = height;
     _ready = true;
@@ -111,6 +134,24 @@ namespace platf::dxgi::game_capture {
 
   void motion_pass_t::reset() {
     _previous_valid = false;
+  }
+
+  std::string motion_pass_t::stats() {
+    if (!_counts[0]) {
+      return {};
+    }
+    const auto pct = [](std::uint64_t n, std::uint64_t of) {
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%.1f%%", of ? 100.0 * static_cast<double>(n) / static_cast<double>(of) : 0.0);
+      return std::string(buf);
+    };
+    const auto checked = _counts[3] + _counts[4];
+    std::string s = " motion: fields=" + std::to_string(_fields) + " blocks: none " + pct(_counts[1], _counts[0]) + ", DLSS zero " + pct(_counts[2], _counts[0]) +
+                    ", vector won " + pct(_counts[3], _counts[0]) + ", zero won " + pct(_counts[4], _counts[0]) + "; of " + std::to_string(checked) +
+                    " checked: flip fits better " + pct(_counts[5], checked) + ", half " + pct(_counts[6], checked) + ", double " + pct(_counts[7], checked);
+    std::memset(_counts, 0, sizeof(_counts));
+    _fields = 0;
+    return s;
   }
 
   std::shared_ptr<const motion_field_t> motion_pass_t::run(ID3D11Device *device, ID3D11DeviceContext *context, const frame_t &frame) {
@@ -196,14 +237,17 @@ namespace platf::dxgi::game_capture {
     // The blocks
     ID3D11ShaderResourceView *block_in[4] = {nullptr, _motion_srv.get(), _luma_srv[prev].get(), _luma_srv[cur].get()};
     context->CSSetShaderResources(0, 4, block_in);
-    ID3D11UnorderedAccessView *block_out[2] = {nullptr, _field_uav.get()};
-    context->CSSetUnorderedAccessViews(0, 2, block_out, nullptr);
+    const UINT zero[4] = {0, 0, 0, 0};
+    context->ClearUnorderedAccessViewUint(_stats_uav.get(), zero);
+    ID3D11UnorderedAccessView *block_out[3] = {nullptr, _field_uav.get(), _stats_uav.get()};
+    context->CSSetUnorderedAccessViews(0, 3, block_out, nullptr);
     context->CSSetShader(_blocks_cs.get(), nullptr, 0);
     context->Dispatch((p.blocks[0] + 7) / 8, (p.blocks[1] + 7) / 8, 1);
 
     ID3D11ShaderResourceView *null_srv[4] = {};
     context->CSSetShaderResources(0, 4, null_srv);
-    context->CSSetUnorderedAccessViews(0, 2, null_uav, nullptr);
+    ID3D11UnorderedAccessView *null_uav3[3] = {};
+    context->CSSetUnorderedAccessViews(0, 3, null_uav3, nullptr);
     context->CSSetShader(nullptr, nullptr, 0);
 
     _current = prev;
@@ -217,10 +261,19 @@ namespace platf::dxgi::game_capture {
     // The field, read back now: the encoder needs it on the CPU with the
     // frame, and the frame's GPU work is what the encoder waits for anyway
     context->CopyResource(_staging.get(), _field.get());
+    context->CopyResource(_stats_staging.get(), _stats.get());
     D3D11_MAPPED_SUBRESOURCE mapped {};
+    if (SUCCEEDED(context->Map(_stats_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+      const auto *c = static_cast<const std::uint32_t *>(mapped.pData);
+      for (int i = 0; i < 8; ++i) {
+        _counts[i] += c[i];
+      }
+      context->Unmap(_stats_staging.get(), 0);
+    }
     if (FAILED(context->Map(_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
       return nullptr;
     }
+    ++_fields;
     auto field = std::make_shared<motion_field_t>();
     field->frame_id = frame.frame_id;
     field->width = frame.width;
