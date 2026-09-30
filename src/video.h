@@ -73,6 +73,10 @@ namespace video {
     // hold one frame: nvenc_vbv_increase is ignored (150% let single frames
     // run to 2.5x their target, which was most of the late frames).
     bool single_frame_vbv = false;
+
+    // The client negotiated the motion sideband (motion_sideband_wire.h) and
+    // the host has it enabled: frames carry their motion field.
+    bool motion_sideband = false;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
@@ -321,6 +325,9 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
     std::chrono::steady_clock::time_point packet_enqueue_timestamp = std::chrono::steady_clock::now();
+    // The frame's motion field (MVC2) for the motion sideband, appended to the
+    // payload on the wire (motion_sideband_wire.h); empty: none
+    std::vector<uint8_t> motion_sideband;
   };
 
   struct packet_raw_avcodec: packet_raw_t {

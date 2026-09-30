@@ -821,6 +821,10 @@ namespace video {
       return result;
     }
 
+    std::vector<uint8_t> take_motion_sideband() {
+      return device ? device->take_motion_sideband() : std::vector<uint8_t> {};
+    }
+
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
@@ -2297,6 +2301,8 @@ namespace video {
     packet->frame_timestamp = frame_timestamp;
     packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
     packet->host_processing_timestamp = host_processing_timestamp;
+    // (after the encode: the GPU has long finished the field's compression)
+    packet->motion_sideband = session.take_motion_sideband();
     if (webrtc_stream::has_active_sessions()) {
       webrtc_stream::submit_video_packet(*packet);
     }

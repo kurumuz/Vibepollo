@@ -1684,6 +1684,7 @@ namespace config {
     string_f(vars, "capture", video.capture);
     bool_f(vars, "game_capture", video.game_capture);
     bool_f(vars, "game_capture_limiter", video.game_capture_limiter);
+    bool_f(vars, "motion_sideband", video.motion_sideband);
     bool_f(vars, "wgc_pacing_smoothing", video.wgc_pacing_smoothing);
     bool_f(vars, "wire_capture_timestamps", video.wire_capture_timestamps);
     string_f(vars, "encoder", video.encoder);
@@ -2419,6 +2420,7 @@ namespace config {
         "nvenc_spatial_aq",
         "nvenc_temporal_aq",
         "nvenc_motion_hints",
+        "motion_sideband",
         "nvenc_split_encode",
         "nvenc_vbv_increase",
         "nvenc_realtime_hags",

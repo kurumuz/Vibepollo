@@ -510,10 +510,11 @@ namespace platf::dxgi {
       return capture_e::ok;
     }
     d3d_img->blank = false;
-    // Its DLSS motion vectors as encoder hints (while the frame is still held)
+    // Its DLSS motion vectors as encoder hints and for the motion sideband (while
+    // the frame is still held)
     d3d_img->game_frame_id = frame.frame_id;
     d3d_img->motion = nullptr;
-    if (config::video.nv.motion_hints) {
+    if (config::video.nv.motion_hints || config::video.motion_sideband) {
       if (!_game_motion) {
         _game_motion = std::make_unique<game_capture::motion_pass_t>();
       }

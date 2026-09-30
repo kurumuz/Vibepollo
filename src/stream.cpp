@@ -43,6 +43,7 @@ extern "C" {
 #include "network.h"
 #include "platform/common.h"
 #include "prague/prague_cc.h"
+#include "motion_sideband_wire.h"
 #include "prague/prague_wire.h"
 #include "rate/slo_bayes.h"
 #include "process.h"
@@ -2240,6 +2241,22 @@ namespace stream {
         }
       }
 
+      // The frame's motion field rides behind the bitstream, marked in every
+      // datagram's extraFlags (motion_sideband_wire.h); counted in the frame's
+      // size like the bitstream itself
+      std::vector<uint8_t> payload_with_sideband;
+      const bool has_sideband = !packet->motion_sideband.empty();
+      if (has_sideband) {
+        const auto &side = packet->motion_sideband;
+        payload_with_sideband.reserve(payload.size() + side.size() + 8);
+        payload_with_sideband.insert(payload_with_sideband.end(), payload.begin(), payload.end());
+        payload_with_sideband.insert(payload_with_sideband.end(), side.begin(), side.end());
+        const std::uint32_t tail[2] = {static_cast<std::uint32_t>(side.size()), motion_sideband::kMagic};
+        const auto *t = reinterpret_cast<const uint8_t *>(tail);
+        payload_with_sideband.insert(payload_with_sideband.end(), t, t + sizeof(tail));
+        payload = {(char *) payload_with_sideband.data(), payload_with_sideband.size()};
+      }
+
       video_short_frame_header_t frame_header = {};
       frame_header.headerType = 0x01;  // Short header type
       frame_header.frameType = packet->is_idr()                     ? 2 :
@@ -2463,6 +2480,9 @@ namespace stream {
             inspect->packet.extraFlags = 0;
             if (frame_is_dupe && config::video.wire_capture_timestamps) {
               inspect->packet.extraFlags |= VIDEO_PACKET_EXTRA_FLAG_HOST_DUPLICATE;
+            }
+            if (has_sideband) {
+              inspect->packet.extraFlags |= motion_sideband::VIDEO_PACKET_EXTRA_FLAG_MOTION_SIDEBAND;
             }
           }
 

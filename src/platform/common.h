@@ -439,6 +439,15 @@ namespace platf {
   struct nvenc_encode_device_t: encode_device_t {
     virtual bool init_encoder(const video::config_t &client_config, const video::sunshine_colorspace_t &colorspace) = 0;
 
+    /**
+     * @brief The motion sideband of the frame converted last (an MVC2 stream,
+     *        see motion_sideband_wire.h), or empty when it has none. Called once
+     *        per frame after its encode; may wait for the GPU.
+     */
+    virtual std::vector<std::uint8_t> take_motion_sideband() {
+      return {};
+    }
+
     nvenc::nvenc_base *nvenc = nullptr;
   };
 

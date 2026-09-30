@@ -38,6 +38,7 @@ extern "C" {
 #include "network.h"
 #include "nvhttp.h"
 #include "prague/prague_wire.h"
+#include "motion_sideband_wire.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -1271,6 +1272,11 @@ namespace rtsp_stream {
         feature_flags |= prague::SS_FF_FRAME_REPORTS;
       }
     }
+    if (config::video.motion_sideband && config::video.game_capture) {
+      // Frames can carry their motion field (motion_sideband_wire.h) to a
+      // client that answers with ML_FF_MOTION_SIDEBAND.
+      feature_flags |= motion_sideband::SS_FF_MOTION_SIDEBAND;
+    }
     ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
     // Always request new control stream encryption if the client supports it
@@ -1509,6 +1515,11 @@ namespace rtsp_stream {
 
       config.minRequiredFecPackets = (int) util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
       config.mlFeatureFlags = (int) util::from_view(args.at("x-ml-general.featureFlags"sv));
+      config.monitor.motion_sideband = config::video.motion_sideband && config::video.game_capture &&
+                                       (static_cast<std::uint32_t>(config.mlFeatureFlags) & motion_sideband::ML_FF_MOTION_SIDEBAND) != 0;
+      if (config.monitor.motion_sideband) {
+        BOOST_LOG(info) << "Motion sideband negotiated: frames carry their motion field"sv;
+      }
       config.frame_deadline_us = std::clamp((int) util::from_view(args.at("x-ml-video.frameDeadlineUs"sv)), 0, 1000000);
       config.audioQosType = (int) util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
       config.videoQosType = (int) util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));

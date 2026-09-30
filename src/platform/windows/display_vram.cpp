@@ -26,6 +26,7 @@ extern "C" {
 #include "display.h"
 #include "display_vram.h"
 #include "game_capture/motion_hints.h"
+#include "game_capture/mvc2_encoder.h"
 #include "misc.h"
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
   #include "nv_truehdr.h"
@@ -2089,23 +2090,40 @@ namespace platf::dxgi {
       base.apply_colorspace(colorspace, client_config.rtx_hdr_active);
       encode_width = static_cast<std::uint32_t>(client_config.width);
       encode_height = static_cast<std::uint32_t>(client_config.height);
+      motion_sideband = client_config.motion_sideband;
       return base.init_output(nvenc_d3d->get_input_texture(), client_config.width, client_config.height, colorspace) == 0;
     }
 
     int convert(platf::img_t &img_base) override {
       const int result = base.convert(img_base);
-      if (result == 0 && config::video.nv.motion_hints) {
+      if (result == 0 && (config::video.nv.motion_hints || motion_sideband)) {
         set_motion_hints(static_cast<img_d3d_t &>(img_base));
       }
       return result;
     }
 
+    std::vector<std::uint8_t> take_motion_sideband() override {
+      if (!motion_sideband) {
+        return {};
+      }
+      auto stream = mvc2.collect(base.device_ctx.get());
+      if (++sideband_log_frames >= 1200) {
+        sideband_log_frames = 0;
+        auto s = mvc2.stats();
+        if (!s.empty()) {
+          BOOST_LOG(info) << s;
+        }
+      }
+      return stream;
+    }
+
   private:
-    // The game frame's motion field as hints for the encoded picture, mapped
-    // through the conversion's viewport (the frame may be scaled and
-    // letterboxed; the bars do not move). Only for the step from the game
-    // frame converted just before: a repeat, a desktop frame or a skipped game
-    // frame in between leaves the picture without hints.
+    // The game frame's motion field for the encoded picture (as NVENC motion
+    // hints, and compressed for the motion sideband), mapped through the
+    // conversion's viewport (the frame may be scaled and letterboxed; the bars
+    // do not move). Only for the step from the game frame converted just
+    // before: a repeat, a desktop frame or a skipped game frame in between
+    // leaves the picture without hints and without a sideband.
     void set_motion_hints(const img_d3d_t &img) {
       const auto id = img.game_frame_id;
       const bool step = id != 0 && last_game_frame_id != 0 && id == last_game_frame_id + 1;
@@ -2117,7 +2135,9 @@ namespace platf::dxgi {
       const auto rotation = base.display->display_rotation;
       const bool rotated = rotation != DXGI_MODE_ROTATION_UNSPECIFIED && rotation != DXGI_MODE_ROTATION_IDENTITY;
       if (!step || rotated || !field || field->frame_id != id || !field->width || !field->height) {
-        nvenc_d3d->set_motion_hints({});
+        if (config::video.nv.motion_hints) {
+          nvenc_d3d->set_motion_hints({});
+        }
         return;
       }
       const auto &vp = base.out_Y_or_YUV_viewports[0];
@@ -2149,9 +2169,18 @@ namespace platf::dxgi {
           hints.vectors[(static_cast<std::size_t>(y) * hints.cols + x) * 2 + 1] = vy;
         }
       }
-      nvenc_d3d->set_motion_hints(std::move(hints));
+      if (motion_sideband) {
+        // Queued behind the conversion; collected after the frame's encode
+        mvc2.submit(base.device.get(), base.device_ctx.get(), hints.cols, hints.rows, hints.vectors, nvenc::nvenc_base::motion_hints_t::kNone);
+      }
+      if (config::video.nv.motion_hints) {
+        nvenc_d3d->set_motion_hints(std::move(hints));
+      }
     }
 
+    bool motion_sideband = false;
+    game_capture::mvc2_encoder_t mvc2;
+    int sideband_log_frames = 0;
     std::uint64_t last_game_frame_id = 0;
     std::uint32_t encode_width = 0;
     std::uint32_t encode_height = 0;

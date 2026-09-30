@@ -764,7 +764,7 @@ namespace platf::dxgi::game_capture {
       return false;
     }
 
-    t.block->motion_enabled.store(config::video.nv.motion_hints ? 1 : 0, std::memory_order_release);
+    t.block->motion_enabled.store(config::video.nv.motion_hints || config::video.motion_sideband ? 1 : 0, std::memory_order_release);
     t.block->capture_enabled.store(1, std::memory_order_release);
 
     const auto state = t.block->hook_state.load(std::memory_order_acquire);
