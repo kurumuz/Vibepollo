@@ -33,15 +33,22 @@ namespace platf::dxgi::game_capture {
     std::uint64_t release_qpc = 0;  ///< the limiter release that started the frame (0 = not paced)
 
     // The game's DLSS motion vectors for this frame (see protocol.h), held
-    // with the frame; null: none
+    // with the frame; null: none. Candidate set i starts at row
+    // i * motion_rows of the texture; set 0 is the one the frame's Present
+    // consumed.
     ID3D11Texture2D *motion = nullptr;
-    std::uint64_t motion_id = 0;  ///< +1 per game frame (see protocol.h: consecutive with the previous frame = its vectors are the step from it)
-    std::uint32_t motion_width = 0;  ///< the region holding them, from the texture's top-left
-    std::uint32_t motion_height = 0;
+    std::uint64_t motion_id = 0;  ///< the Present's number (see protocol.h: consecutive with the previous frame = its vectors are the step from it)
     std::uint32_t motion_out_width = 0;  ///< the DLSS output they span
     std::uint32_t motion_out_height = 0;
-    float motion_scale_x = 1;  ///< vector = stored value * scale, in pixels of the region
-    float motion_scale_y = 1;
+    std::uint32_t motion_rows = 0;
+    int motion_count = 0;
+
+    struct motion_set_t {
+      std::uint32_t width = 0;  ///< the region holding them, from the set's first row
+      std::uint32_t height = 0;
+      float scale_x = 1;  ///< vector = stored value * scale, in pixels of the region
+      float scale_y = 1;
+    } motion_sets[::game_capture::kMotionCandidates];
   };
 
   class source_t {

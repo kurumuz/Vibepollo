@@ -57,9 +57,15 @@
  * (after multiplying by motion_scale), pointing from a pixel to where it was
  * in the previous frame. A frame's vectors describe the step from the
  * previous captured frame only when both its motion id and its frame id
- * follow that frame's by one (the motion id skips one over an uncaptured
- * game frame; with several DLSS evaluations per frame it follows the main
- * view's, the one with the largest output).
+ * follow that frame's by one (the motion id advances once per Present).
+ * Which evaluation is a frame's follows from the order of evaluations and
+ * Presents (each Present consumes the oldest pending one), which can be one
+ * off (an engine that executes the next frame's evaluation before this
+ * Present, an evaluation declined or lost, a Present retried). So a slot
+ * carries up to kMotionCandidates sets: the one its Present consumed, the
+ * next pending one and the previous Present's, stacked in the motion
+ * texture, and the host keeps whichever predicts the frame from its
+ * predecessor best (ties: the consumed one).
  *
  * Everything the host reads from this block is untrusted: the game's user
  * can write it. The host bounds and validates every field.
@@ -73,8 +79,9 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 13;
+  constexpr std::uint32_t kVersion = 14;
   constexpr int kSlots = 3;
+  constexpr int kMotionCandidates = 3;  ///< vector sets a slot's motion texture holds (see the top comment)
   constexpr std::size_t kErrorLength = 320;
 
   // Limiter periods the hook accepts (1000 fps .. 10 fps)
@@ -148,8 +155,10 @@ namespace game_capture {
     std::atomic<std::uint32_t> handle_kind;  ///< handle_kind_e
     std::atomic<std::uint32_t> sync;  ///< sync_e
     std::atomic<std::uint64_t> textures[kSlots];  ///< handle values, see handle_kind (0 = none)
-    // Motion textures of this generation (same handle kind; guarded with the
-    // slot's pixels: no mutex of their own). format 0 = the generation has none.
+    // Motion textures of this generation (same handle kind; guarded like the
+    // slot's pixels), kMotionCandidates times as tall as the game's vectors:
+    // candidate i starts at row i * motion_height / kMotionCandidates.
+    // format 0 = the generation has none.
     std::atomic<std::uint32_t> motion_format;  ///< DXGI_FORMAT_R16G16_FLOAT or DXGI_FORMAT_R32G32_FLOAT
     std::atomic<std::uint32_t> motion_width;
     std::atomic<std::uint32_t> motion_height;
@@ -167,13 +176,14 @@ namespace game_capture {
     std::atomic<std::uint64_t> gpu_done_qpc;  ///< written by the completion thread just before publishing (0 = no fence)
     std::atomic<std::uint64_t> release_qpc;  ///< the limiter release that started this frame (0 = not paced)
     // The motion vectors in the slot's motion texture (see the top comment)
-    std::atomic<std::uint64_t> motion_id;  ///< 0 = none for this frame; otherwise +1 per game frame since the previous frame that carried vectors (+2: a game frame went uncaptured in between)
-    std::atomic<std::uint32_t> motion_width;  ///< the region holding them, from the texture's top-left
-    std::atomic<std::uint32_t> motion_height;
-    std::atomic<std::uint32_t> motion_out_width;  ///< the DLSS output the region spans
+    std::atomic<std::uint64_t> motion_id;  ///< 0 = none for this frame; otherwise the Present's number (+1 per Present)
+    std::atomic<std::uint32_t> motion_out_width;  ///< the DLSS output the vectors span
     std::atomic<std::uint32_t> motion_out_height;
-    std::atomic<std::uint32_t> motion_scale_x;  ///< float bits: DLSS's MV.Scale (vector = stored value * scale)
-    std::atomic<std::uint32_t> motion_scale_y;
+    std::atomic<std::uint32_t> motion_count;  ///< candidate sets (1..kMotionCandidates); candidate 0 is the one the Present consumed
+    std::atomic<std::uint32_t> motion_width[kMotionCandidates];  ///< each set's region, from its first row
+    std::atomic<std::uint32_t> motion_height[kMotionCandidates];
+    std::atomic<std::uint32_t> motion_scale_x[kMotionCandidates];  ///< float bits: DLSS's MV.Scale (vector = stored value * scale)
+    std::atomic<std::uint32_t> motion_scale_y[kMotionCandidates];
   };
 
   inline std::uint64_t make_latest(std::uint32_t slot, std::uint32_t version) {

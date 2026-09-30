@@ -29,8 +29,13 @@ namespace platf::dxgi::game_capture {
       std::uint32_t linear_light;
       std::uint32_t verify;
       std::uint32_t diagnose;
-      std::uint32_t pad;
+      std::uint32_t vector_row;
+      std::uint32_t stats_base;
+      std::uint32_t field_base;
+      std::uint32_t pad[2];
     };
+
+    constexpr int kSets = ::game_capture::kMotionCandidates;
 
     static_assert(sizeof(params_t) % 16 == 0, "constant buffer size");
 
@@ -83,7 +88,7 @@ namespace platf::dxgi::game_capture {
       }
     }
 
-    const std::uint32_t count = ((width + 15) / 16) * ((height + 15) / 16);
+    const std::uint32_t count = ((width + 15) / 16) * ((height + 15) / 16) * kSets;  // (a field per candidate set)
     D3D11_BUFFER_DESC fd {};
     fd.ByteWidth = count * 8;
     fd.Usage = D3D11_USAGE_DEFAULT;
@@ -105,14 +110,14 @@ namespace platf::dxgi::game_capture {
       return false;
     }
     D3D11_BUFFER_DESC cd {};
-    cd.ByteWidth = sizeof(std::uint32_t) * kCounters;
+    cd.ByteWidth = sizeof(std::uint32_t) * kStatsPerSet * kSets;
     cd.Usage = D3D11_USAGE_DEFAULT;
     cd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
     cd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
     D3D11_UNORDERED_ACCESS_VIEW_DESC ud {};
     ud.Format = DXGI_FORMAT_R32_TYPELESS;
     ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    ud.Buffer.NumElements = kCounters;
+    ud.Buffer.NumElements = kStatsPerSet * kSets;
     ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
     D3D11_BUFFER_DESC csd = cd;
     csd.Usage = D3D11_USAGE_STAGING;
@@ -150,10 +155,14 @@ namespace platf::dxgi::game_capture {
     std::string s = " motion: fields=" + std::to_string(_fields) + " (unchecked frames " + std::to_string(_unchecked) + ") blocks: none " + pct(_counts[1], _counts[0]) +
                     ", DLSS zero " + pct(_counts[2], _counts[0]) + ", under half a pixel " + pct(_counts[8], _counts[0]) + ", vector won " + pct(_counts[3], _counts[0]) +
                     ", zero won " + pct(_counts[4], _counts[0]) + "; of " + std::to_string(diagnosed) + " diagnosed: flip fits better " + pct(_counts[5], diagnosed) +
-                    ", half " + pct(_counts[6], diagnosed) + ", double " + pct(_counts[7], diagnosed);
+                    ", half " + pct(_counts[6], diagnosed) + ", double " + pct(_counts[7], diagnosed) + "; of " + std::to_string(_with_candidates) +
+                    " with other candidates, chosen: consumed " + std::to_string(_chosen[0]) + ", next " + std::to_string(_chosen[1]) + ", previous " +
+                    std::to_string(_chosen[2]);
     std::memset(_counts, 0, sizeof(_counts));
+    std::memset(_chosen, 0, sizeof(_chosen));
     _fields = 0;
     _unchecked = 0;
+    _with_candidates = 0;
     return s;
   }
 
@@ -212,18 +221,10 @@ namespace platf::dxgi::game_capture {
     p.frame_size[1] = frame.height;
     p.blocks[0] = (frame.width + 15) / 16;
     p.blocks[1] = (frame.height + 15) / 16;
-    p.texel_per_pixel[0] = static_cast<float>(frame.motion_width) / frame.width;
-    p.texel_per_pixel[1] = static_cast<float>(frame.motion_height) / frame.height;
-    p.pixel_per_unit[0] = static_cast<float>(frame.width) / frame.motion_width * frame.motion_scale_x;
-    p.pixel_per_unit[1] = static_cast<float>(frame.height) / frame.motion_height * frame.motion_scale_y;
     D3D11_TEXTURE2D_DESC color_desc {};
     frame.texture->GetDesc(&color_desc);
     p.linear_light = linear_format(color_desc.Format) ? 1 : 0;
     p.verify = verify ? 1 : 0;
-    p.diagnose = (_diagnose_tick++ % 4) == 0 ? 1 : 0;  // (every 4th frame: the extra tests cost three more loads a pixel)
-    if (!verify) {
-      ++_unchecked;
-    }
     context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
 
     const int cur = _current;
@@ -238,10 +239,25 @@ namespace platf::dxgi::game_capture {
     context->CSSetUnorderedAccessViews(0, 1, luma_out, nullptr);
     context->CSSetShader(_luma_cs.get(), nullptr, 0);
     context->Dispatch((frame.width + 7) / 8, (frame.height + 7) / 8, 1);
-    ID3D11UnorderedAccessView *null_uav[2] = {};
+    ID3D11UnorderedAccessView *null_uav[3] = {};
     context->CSSetUnorderedAccessViews(0, 1, null_uav, nullptr);
 
-    // The blocks
+    _current = prev;
+    _previous_valid = true;
+    _previous_frame_id = frame.frame_id;
+    _previous_motion_id = frame.motion_id;
+    if (!verify) {
+      ++_unchecked;
+      context->CSSetShader(nullptr, nullptr, 0);
+      return nullptr;  // (the luma is kept for the next frame)
+    }
+
+    // The blocks, once per candidate set: each gets its own field and
+    // counters, and a score (how well its vectors, or zero where they lose,
+    // predict the frame from the previous one)
+    const int sets = std::clamp(frame.motion_count, 1, kSets);
+    const std::uint32_t per_field = p.blocks[0] * p.blocks[1];
+    p.diagnose = (_diagnose_tick++ % 4) == 0 ? 1 : 0;  // (every 4th frame: the extra tests cost three more loads a pixel)
     ID3D11ShaderResourceView *block_in[4] = {nullptr, _motion_srv.get(), _luma_srv[prev].get(), _luma_srv[cur].get()};
     context->CSSetShaderResources(0, 4, block_in);
     const UINT zero[4] = {0, 0, 0, 0};
@@ -249,34 +265,47 @@ namespace platf::dxgi::game_capture {
     ID3D11UnorderedAccessView *block_out[3] = {nullptr, _field_uav.get(), _stats_uav.get()};
     context->CSSetUnorderedAccessViews(0, 3, block_out, nullptr);
     context->CSSetShader(_blocks_cs.get(), nullptr, 0);
-    context->Dispatch((p.blocks[0] + 7) / 8, (p.blocks[1] + 7) / 8, 1);
-
+    for (int i = 0; i < sets; ++i) {
+      const auto &set = frame.motion_sets[i];
+      p.texel_per_pixel[0] = static_cast<float>(set.width) / frame.width;
+      p.texel_per_pixel[1] = static_cast<float>(set.height) / frame.height;
+      p.pixel_per_unit[0] = static_cast<float>(frame.width) / set.width * set.scale_x;
+      p.pixel_per_unit[1] = static_cast<float>(frame.height) / set.height * set.scale_y;
+      p.vector_row = static_cast<std::uint32_t>(i) * frame.motion_rows;
+      p.stats_base = static_cast<std::uint32_t>(i) * kStatsPerSet;
+      p.field_base = static_cast<std::uint32_t>(i) * per_field;
+      context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
+      context->Dispatch((p.blocks[0] + 7) / 8, (p.blocks[1] + 7) / 8, 1);
+    }
     ID3D11ShaderResourceView *null_srv[4] = {};
     context->CSSetShaderResources(0, 4, null_srv);
-    ID3D11UnorderedAccessView *null_uav3[3] = {};
-    context->CSSetUnorderedAccessViews(0, 3, null_uav3, nullptr);
+    context->CSSetUnorderedAccessViews(0, 3, null_uav, nullptr);
     context->CSSetShader(nullptr, nullptr, 0);
 
-    _current = prev;
-    _previous_valid = true;
-    _previous_frame_id = frame.frame_id;
-    _previous_motion_id = frame.motion_id;
-    if (!verify) {
-      return nullptr;  // (the luma is kept for the next frame)
-    }
-
-    // The field, read back now: the encoder needs it on the CPU with the
-    // frame, and the frame's GPU work is what the encoder waits for anyway
+    // Read back now: the encoder needs the field on the CPU with the frame,
+    // and the frame's GPU work is what the encoder waits for anyway. The
+    // lowest score wins (ties: set 0, the one the Present consumed).
     context->CopyResource(_staging.get(), _field.get());
     context->CopyResource(_stats_staging.get(), _stats.get());
     D3D11_MAPPED_SUBRESOURCE mapped {};
-    if (SUCCEEDED(context->Map(_stats_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-      const auto *c = static_cast<const std::uint32_t *>(mapped.pData);
-      for (int i = 0; i < kCounters; ++i) {
-        _counts[i] += c[i];
-      }
-      context->Unmap(_stats_staging.get(), 0);
+    if (FAILED(context->Map(_stats_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+      return nullptr;
     }
+    const auto *c = static_cast<const std::uint32_t *>(mapped.pData);
+    int chosen = 0;
+    for (int i = 1; i < sets; ++i) {
+      if (c[i * kStatsPerSet + kScore] < c[chosen * kStatsPerSet + kScore]) {
+        chosen = i;
+      }
+    }
+    for (int k = 0; k < kCounters; ++k) {
+      _counts[k] += c[chosen * kStatsPerSet + k];
+    }
+    ++_chosen[chosen];
+    if (sets > 1) {
+      ++_with_candidates;
+    }
+    context->Unmap(_stats_staging.get(), 0);
     if (FAILED(context->Map(_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
       return nullptr;
     }
@@ -288,7 +317,8 @@ namespace platf::dxgi::game_capture {
     field->cols = p.blocks[0];
     field->rows = p.blocks[1];
     field->vectors.resize(static_cast<std::size_t>(field->cols) * field->rows * 2);
-    std::memcpy(field->vectors.data(), mapped.pData, field->vectors.size() * sizeof(std::int32_t));
+    std::memcpy(field->vectors.data(), static_cast<const std::int32_t *>(mapped.pData) + static_cast<std::size_t>(chosen) * per_field * 2,
+                field->vectors.size() * sizeof(std::int32_t));
     context->Unmap(_staging.get(), 0);
     return field;
   }

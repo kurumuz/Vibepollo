@@ -352,8 +352,9 @@ namespace platf::dxgi::game_capture {
     // A slot record's motion fields, as read (validated by the caller)
     struct slot_motion_t {
       std::uint64_t id = 0;
-      std::uint32_t width = 0, height = 0, out_width = 0, out_height = 0;
-      float scale_x = 0, scale_y = 0;
+      std::uint32_t out_width = 0, out_height = 0, count = 0;
+      std::uint32_t width[gc::kMotionCandidates] = {}, height[gc::kMotionCandidates] = {};
+      float scale_x[gc::kMotionCandidates] = {}, scale_y[gc::kMotionCandidates] = {};
     };
 
     float float_bits(std::uint32_t u) {
@@ -375,12 +376,15 @@ namespace platf::dxgi::game_capture {
         gpu_done_qpc = record.gpu_done_qpc.load(std::memory_order_relaxed);
         release_qpc = record.release_qpc.load(std::memory_order_relaxed);
         motion.id = record.motion_id.load(std::memory_order_relaxed);
-        motion.width = record.motion_width.load(std::memory_order_relaxed);
-        motion.height = record.motion_height.load(std::memory_order_relaxed);
         motion.out_width = record.motion_out_width.load(std::memory_order_relaxed);
         motion.out_height = record.motion_out_height.load(std::memory_order_relaxed);
-        motion.scale_x = float_bits(record.motion_scale_x.load(std::memory_order_relaxed));
-        motion.scale_y = float_bits(record.motion_scale_y.load(std::memory_order_relaxed));
+        motion.count = record.motion_count.load(std::memory_order_relaxed);
+        for (int i = 0; i < gc::kMotionCandidates; ++i) {
+          motion.width[i] = record.motion_width[i].load(std::memory_order_relaxed);
+          motion.height[i] = record.motion_height[i].load(std::memory_order_relaxed);
+          motion.scale_x[i] = float_bits(record.motion_scale_x[i].load(std::memory_order_relaxed));
+          motion.scale_y[i] = float_bits(record.motion_scale_y[i].load(std::memory_order_relaxed));
+        }
         std::atomic_thread_fence(std::memory_order_acquire);
         if (record.seq.load(std::memory_order_relaxed) != s1) {
           continue;
@@ -955,7 +959,8 @@ namespace platf::dxgi::game_capture {
     if (motion_setup.format != 0) {
       std::string why;
       const bool plausible = (motion_setup.format == DXGI_FORMAT_R16G16_FLOAT || motion_setup.format == DXGI_FORMAT_R32G32_FLOAT) &&
-                             motion_setup.width > 0 && motion_setup.height > 0 && motion_setup.width <= kMaxDimension && motion_setup.height <= kMaxDimension;
+                             motion_setup.width > 0 && motion_setup.height > 0 && motion_setup.width <= kMaxDimension && motion_setup.height <= kMaxDimension &&
+                             motion_setup.height % gc::kMotionCandidates == 0;
       if (!plausible) {
         why = "implausible motion textures";
       }
@@ -1150,11 +1155,16 @@ namespace platf::dxgi::game_capture {
       // describes a region inside them
       frame.motion = nullptr;
       frame.motion_id = 0;
-      bool motion_ok = motion.id != 0 && t->motion_textures[slot] && motion.width > 0 && motion.height > 0 &&
-                             motion.width <= t->motion_desc.Width && motion.height <= t->motion_desc.Height &&
-                             motion.out_width > 0 && motion.out_height > 0 && motion.out_width <= kMaxDimension && motion.out_height <= kMaxDimension &&
-                             std::isfinite(motion.scale_x) && std::isfinite(motion.scale_y) && motion.scale_x != 0 && motion.scale_y != 0 &&
-                             std::abs(motion.scale_x) < 1e6f && std::abs(motion.scale_y) < 1e6f;
+      // Its vectors, if the generation has motion textures and the record
+      // describes regions inside their candidate rows
+      const std::uint32_t rows = t->motion_desc.Height / gc::kMotionCandidates;
+      bool motion_ok = motion.id != 0 && t->motion_textures[slot] && motion.count >= 1 && motion.count <= static_cast<std::uint32_t>(gc::kMotionCandidates) &&
+                       motion.out_width > 0 && motion.out_height > 0 && motion.out_width <= kMaxDimension && motion.out_height <= kMaxDimension;
+      for (std::uint32_t i = 0; motion_ok && i < motion.count; ++i) {
+        motion_ok = motion.width[i] > 0 && motion.height[i] > 0 && motion.width[i] <= t->motion_desc.Width && motion.height[i] <= rows &&
+                    std::isfinite(motion.scale_x[i]) && std::isfinite(motion.scale_y[i]) && motion.scale_x[i] != 0 && motion.scale_y[i] != 0 &&
+                    std::abs(motion.scale_x[i]) < 1e6f && std::abs(motion.scale_y[i]) < 1e6f;
+      }
       // (keyed-mutex sync: the motion texture's own mutex, given back by the
       // hook with the slot's; busy means this frame goes without vectors)
       if (motion_ok && !owner_sync) {
@@ -1168,15 +1178,17 @@ namespace platf::dxgi::game_capture {
           motion_ok = false;
         }
       }
+      frame.motion_count = 0;
       if (motion_ok) {
         frame.motion = t->motion_textures[slot].get();
         frame.motion_id = motion.id;
-        frame.motion_width = motion.width;
-        frame.motion_height = motion.height;
         frame.motion_out_width = motion.out_width;
         frame.motion_out_height = motion.out_height;
-        frame.motion_scale_x = motion.scale_x;
-        frame.motion_scale_y = motion.scale_y;
+        frame.motion_rows = rows;
+        frame.motion_count = static_cast<int>(motion.count);
+        for (std::uint32_t i = 0; i < motion.count; ++i) {
+          frame.motion_sets[i] = {motion.width[i], motion.height[i], motion.scale_x[i], motion.scale_y[i]};
+        }
       }
       t->consumed_latest = latest;
       t->consumed_frame_id = frame_id;

@@ -79,8 +79,12 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<ID3D11Buffer> _stats;  // the shader's counters (raw buffer)
     winrt::com_ptr<ID3D11UnorderedAccessView> _stats_uav;
     winrt::com_ptr<ID3D11Buffer> _stats_staging;
-    static constexpr int kCounters = 10;
-    std::uint64_t _counts[kCounters] = {};  // accumulated counters (see the shader)
+    static constexpr int kCounters = 10;  // of the shader's per-set counters, the ones accumulated
+    static constexpr int kScore = 10;  // the set's score
+    static constexpr int kStatsPerSet = 12;
+    std::uint64_t _counts[kCounters] = {};  // accumulated counters of the chosen sets (see the shader)
+    std::uint64_t _chosen[3] = {};  // times each candidate set was chosen
+    std::uint64_t _with_candidates = 0;  // fields that had more than one set
     std::uint64_t _fields = 0;  // fields handed out
     std::uint64_t _unchecked = 0;  // frames with vectors whose predecessor was not the game's previous frame
     std::uint32_t _diagnose_tick = 0;
