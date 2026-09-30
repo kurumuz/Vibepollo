@@ -2121,6 +2121,9 @@ namespace platf::dxgi {
         } else {
           payload.insert(payload.end(), sideband_mask.begin(), sideband_mask.end());
         }
+        mask_stats.frames++;
+        mask_stats.bytes += sideband_mask.size() > 4 ? sideband_mask.size() : 0;
+        mask_stats.with_mask += sideband_mask.size() > 4 ? 1 : 0;
       }
       sideband_mask.clear();
       if (++sideband_log_frames >= 1200) {
@@ -2128,6 +2131,13 @@ namespace platf::dxgi {
         auto s = mvc2.stats();
         if (!s.empty()) {
           BOOST_LOG(info) << s;
+        }
+        if (mask_stats.frames) {
+          BOOST_LOG(info) << "motion sideband mask: " << mask_stats.with_mask << " of " << mask_stats.frames << " fields with one, "
+                          << (mask_stats.with_mask ? mask_stats.bytes / mask_stats.with_mask : 0) << " B avg, "
+                          << (mask_stats.with_mask ? 100.0 * mask_stats.set_cells / mask_stats.cells : 0.0) << "% of cells held, CPU "
+                          << (mask_stats.with_mask ? mask_stats.cpu_us / mask_stats.with_mask : 0.0) << " us avg / " << mask_stats.cpu_us_max << " max";
+          mask_stats = {};
         }
       }
       return payload;
@@ -2210,6 +2220,21 @@ namespace platf::dxgi {
       if (field.mask.empty() || !field.mask_cols || !field.mask_rows) {
         return;
       }
+      const auto t0 = std::chrono::steady_clock::now();
+      struct timed_t {
+        mask_stats_t &s;
+        std::chrono::steady_clock::time_point t0;
+        const game_capture::motion_field_t &f;
+        ~timed_t() {
+          const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+          s.cpu_us += us;
+          s.cpu_us_max = std::max(s.cpu_us_max, us);
+          s.cells += static_cast<std::uint64_t>(f.mask_cols) * f.mask_rows;
+          for (const auto w : f.mask) {
+            s.set_cells += static_cast<std::uint64_t>(__builtin_popcount(w));
+          }
+        }
+      } timed {mask_stats, t0, field};
       const std::uint32_t cols = (encode_width + 3) / 4;
       const std::uint32_t rows = (encode_height + 3) / 4;
       const bool direct = vp.TopLeftX == 0 && vp.TopLeftY == 0 && static_cast<std::uint32_t>(vp.Width) == encode_width &&
@@ -2247,6 +2272,10 @@ namespace platf::dxgi {
     bool motion_sideband = false;
     std::vector<std::uint8_t> sideband_mask;  // this frame's mask section (see motion_sideband_wire.h)
     std::vector<std::uint32_t> sideband_mask_bits;  // (scratch)
+    struct mask_stats_t {
+      std::uint64_t frames = 0, with_mask = 0, bytes = 0, cells = 0, set_cells = 0;
+      double cpu_us = 0, cpu_us_max = 0;
+    } mask_stats;
     game_capture::mvc2_encoder_t mvc2;
     std::uint32_t sideband_interval_us = 0;
     std::optional<std::chrono::steady_clock::time_point> last_game_frame_timestamp;
