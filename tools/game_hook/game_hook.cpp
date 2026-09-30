@@ -1727,6 +1727,7 @@ namespace {
   std::uint64_t g_motion_next_id = 1;
   std::uint64_t g_motion_latest = 0;  // the newest submitted evaluation
   std::uint64_t g_motion_paired = 0;  // the newest one a captured frame took
+  std::uint64_t g_motion_seq = 0;  // what captured frames report: +1 per game frame (+2 over a skipped one)
   std::atomic<int> g_motion_unsubmitted {0};  // D3D12 evaluations not yet seen submitted (the ExecuteCommandLists fast path)
 
   bool motion_wanted() {
@@ -2193,17 +2194,40 @@ namespace {
       return false;
     }
     want = g_motion_ring.desc;
-    const auto id = g_motion_latest;
-    if (!id || id <= g_motion_paired) {
+    // Of the evaluations submitted since the last captured frame, the main
+    // view's: the largest output (a game may upscale a second view too), the
+    // newest of equals
+    const motion_eval_t *best = nullptr;
+    for (const auto &e : g_motion_evals) {
+      if (!e.id || !e.submitted || e.id <= g_motion_paired || e.id > g_motion_latest) {
+        continue;
+      }
+      const auto area = static_cast<std::uint64_t>(e.out_width) * e.out_height;
+      const auto best_area = best ? static_cast<std::uint64_t>(best->out_width) * best->out_height : 0;
+      if (!best || area > best_area || (area == best_area && e.id > best->id)) {
+        best = &e;
+      }
+    }
+    if (!best) {
       return false;
     }
-    const auto &e = g_motion_evals[id % kMotionEvals];
-    if (e.id != id || !e.submitted) {
-      return false;
+    // One main-view evaluation since the last captured frame: the vectors
+    // describe the step from it. More (or more than we remember): a game
+    // frame went uncaptured in between, which the host sees as a gap.
+    int main_views = 0;
+    for (const auto &c : g_motion_evals) {
+      if (c.id && c.submitted && c.id > g_motion_paired && c.id <= g_motion_latest &&
+          static_cast<std::uint64_t>(c.out_width) * c.out_height == static_cast<std::uint64_t>(best->out_width) * best->out_height) {
+        ++main_views;
+      }
     }
-    g_motion_paired = id;
+    const bool gap = main_views != 1 || g_motion_latest - g_motion_paired > static_cast<std::uint64_t>(kMotionEvals);
+    g_motion_seq += gap ? 2 : 1;
+    const auto &e = *best;
+    const auto id = e.id;
+    g_motion_paired = g_motion_latest;  // (the others are older than this frame now)
     const int k = static_cast<int>(id % kMotionRing);
-    pick.id = id;
+    pick.id = g_motion_seq;
     pick.width = e.width;
     pick.height = e.height;
     pick.out_width = e.out_width;

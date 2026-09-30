@@ -29,6 +29,11 @@ RWStructuredBuffer<int2> field : register(u1);
 
 static const int kNone = (int) 0x80000000;
 
+// Finite, tested on the exponent bits (no float optimisation can assume it away)
+bool finite2(float2 v) {
+  return (asuint(v.x) & 0x7f800000u) != 0x7f800000u && (asuint(v.y) & 0x7f800000u) != 0x7f800000u;
+}
+
 float luma_of(float3 c) {
   float l = dot(max(c, 0), float3(0.2126, 0.7152, 0.0722));
   return linear_light ? sqrt(l) : l;
@@ -53,9 +58,12 @@ float luma_of(float3 c) {
   for (uint j = 0; j < 4; ++j) {
     for (uint i = 0; i < 4; ++i) {
       const float2 p = float2(origin) + float2(i * 4 + 2.5, j * 4 + 2.5);
-      if (p.x < frame_size.x && p.y < frame_size.y) {
+      if (p.x < (float) frame_size.x && p.y < (float) frame_size.y) {
         const int2 t = int2(p * texel_per_pixel);
-        s[n++] = vectors.Load(int3(t, 0)) * pixel_per_unit;
+        const float2 m = vectors.Load(int3(t, 0)) * pixel_per_unit;
+        if (finite2(m)) {
+          s[n++] = m;  // (a sample that is not a number would poison every cost)
+        }
       }
     }
   }
@@ -77,9 +85,9 @@ float luma_of(float3 c) {
     }
   }
 
-  // A vector that is not a number, or leads out of the frame, is no hint
+  // A vector that leads out of the frame is no hint
   const float2 reference = float2(origin) + 8.0 + v;
-  if (any(isnan(v)) || any(isinf(v)) || reference.x < 0 || reference.y < 0 || reference.x >= frame_size.x || reference.y >= frame_size.y) {
+  if (reference.x < 0.0 || reference.y < 0.0 || reference.x >= (float) frame_size.x || reference.y >= (float) frame_size.y) {
     field[index] = int2(kNone, 0);
     return;
   }

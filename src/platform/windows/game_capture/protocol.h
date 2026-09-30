@@ -55,9 +55,11 @@
  * retired and shared with its textures); a slot record whose motion_id is 0
  * carries none. The vectors are DLSS's: in pixels of the region they cover
  * (after multiplying by motion_scale), pointing from a pixel to where it was
- * in the previous frame. Consecutive evaluations have consecutive ids, so a
- * frame's vectors describe the step from the previous captured frame only
- * when both ids and frame ids are consecutive.
+ * in the previous frame. A frame's vectors describe the step from the
+ * previous captured frame only when both its motion id and its frame id
+ * follow that frame's by one (the motion id skips one over an uncaptured
+ * game frame; with several DLSS evaluations per frame it follows the main
+ * view's, the one with the largest output).
  *
  * Everything the host reads from this block is untrusted: the game's user
  * can write it. The host bounds and validates every field.
@@ -165,7 +167,7 @@ namespace game_capture {
     std::atomic<std::uint64_t> gpu_done_qpc;  ///< written by the completion thread just before publishing (0 = no fence)
     std::atomic<std::uint64_t> release_qpc;  ///< the limiter release that started this frame (0 = not paced)
     // The motion vectors in the slot's motion texture (see the top comment)
-    std::atomic<std::uint64_t> motion_id;  ///< the DLSS evaluation they come from; 0 = none for this frame
+    std::atomic<std::uint64_t> motion_id;  ///< 0 = none for this frame; otherwise +1 per game frame since the previous frame that carried vectors (+2: a game frame went uncaptured in between)
     std::atomic<std::uint32_t> motion_width;  ///< the region holding them, from the texture's top-left
     std::atomic<std::uint32_t> motion_height;
     std::atomic<std::uint32_t> motion_out_width;  ///< the DLSS output the region spans

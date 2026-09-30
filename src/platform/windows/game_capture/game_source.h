@@ -35,7 +35,7 @@ namespace platf::dxgi::game_capture {
     // The game's DLSS motion vectors for this frame (see protocol.h), held
     // with the frame; null: none
     ID3D11Texture2D *motion = nullptr;
-    std::uint64_t motion_id = 0;  ///< the DLSS evaluation (consecutive evaluations: consecutive ids)
+    std::uint64_t motion_id = 0;  ///< +1 per game frame (see protocol.h: consecutive with the previous frame = its vectors are the step from it)
     std::uint32_t motion_width = 0;  ///< the region holding them, from the texture's top-left
     std::uint32_t motion_height = 0;
     std::uint32_t motion_out_width = 0;  ///< the DLSS output they span
