@@ -83,7 +83,10 @@ namespace platf::dxgi::game_capture {
     static constexpr int kScore = 10;  // the set's score
     static constexpr int kStatsPerSet = 12;
     std::uint64_t _counts[kCounters] = {};  // accumulated counters of the chosen sets (see the shader)
-    std::uint64_t _chosen[3] = {};  // times each candidate set was chosen
+    static constexpr double kMargin = 0.01;  // an alternative set must lower the frame's total error by this much to win
+    std::uint64_t _chosen[3] = {};  // times each candidate set was chosen (of frames with alternatives)
+    std::uint64_t _near_wins = 0;  // alternatives lower than the consumed set, but within the margin
+    double _win_margin_sum = 0;  // summed relative improvement of the alternative wins
     std::uint64_t _with_candidates = 0;  // fields that had more than one set
     std::uint64_t _fields = 0;  // fields handed out
     std::uint64_t _unchecked = 0;  // frames with vectors whose predecessor was not the game's previous frame

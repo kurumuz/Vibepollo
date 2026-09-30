@@ -1085,7 +1085,7 @@ namespace {
     record.motion_out_height.store(motion ? motion->out_height : 0, std::memory_order_relaxed);
     record.motion_count.store(motion ? static_cast<std::uint32_t>(motion->count) : 0, std::memory_order_relaxed);
     for (int i = 0; i < gc::kMotionCandidates; ++i) {
-      const bool have = motion && i < motion->count;
+      const bool have = motion && i < motion->count && motion->cands[i].entry >= 0;  // (an absent role: width 0)
       record.motion_width[i].store(have ? motion->cands[i].width : 0, std::memory_order_relaxed);
       record.motion_height[i].store(have ? motion->cands[i].height : 0, std::memory_order_relaxed);
       record.motion_scale_x[i].store(have ? bits(motion->cands[i].scale_x) : 0, std::memory_order_relaxed);
@@ -2147,7 +2147,7 @@ namespace {
   bool motion_entry_free(const motion_ring_t &ring, int i) {
     const auto &e = ring.entries[i];
     if (ring.api != gc::api_e::d3d12) {
-      return true;
+      return e.readers == 0;  // (D3D11: a candidate waits for its copy; the context orders the rest)
     }
     if (e.readers || (e.writer && !motion_produced(ring, e))) {
       return false;
@@ -2324,20 +2324,19 @@ namespace {
     auto &ring = g_motion_ring;
     const bool d3d12 = ring.api == gc::api_e::d3d12;
     const auto id = g_motion_next_id;
-    int entry = static_cast<int>(id % kMotionRing);
     ++g_motion_stats.evaluations;
-    if (d3d12) {
-      entry = -1;
-      for (int i = 0; i < kMotionRing && entry < 0; ++i) {
-        const int k = static_cast<int>((id + i) % kMotionRing);
-        if (motion_entry_free(ring, k)) {
-          entry = k;
-        }
+    int entry = -1;
+    for (int i = 0; i < kMotionRing && entry < 0; ++i) {
+      const int k = static_cast<int>((id + i) % kMotionRing);
+      if (motion_entry_free(ring, k)) {
+        entry = k;
       }
-      if (entry < 0) {
-        ++g_motion_stats.no_entry;
-        return nullptr;
-      }
+    }
+    if (entry < 0) {
+      ++g_motion_stats.no_entry;
+      return nullptr;
+    }
+    {
       auto &en = ring.entries[entry];
       safe_release(en.consumer);
       en = motion_entry_t {};
@@ -2825,11 +2824,19 @@ namespace {
     // for D3D12, it is readable on the presenting queue without waiting for
     // another queue
     auto readable = [&](const motion_eval_t &e, bool count) {
+      const auto &en = ring.entries[e.entry];
+      if (en.writer != e.id) {
+        return false;
+      }
       if (api != gc::api_e::d3d12) {
         return true;
       }
-      const auto &en = ring.entries[e.entry];
-      if (en.writer != e.id || en.queue < 0) {
+      if (en.queue < 0) {
+        return false;
+      }
+      // Read by an earlier capture on another fence that has not finished:
+      // one entry follows one consumer timeline at a time
+      if (en.consumer && en.consumer != g_cap.fence12 && en.consumer->GetCompletedValue() < en.consumed) {
         return false;
       }
       if (g_motion_queues[en.queue].queue != present_queue && !motion_produced(ring, en)) {
@@ -2840,6 +2847,8 @@ namespace {
       }
       return true;
     };
+    // Each candidate keeps its role's place (0 the consumed set, 1 the next
+    // pending one, 2 the previous Present's); an absent one has entry -1
     for (int i = 0; i < gc::kMotionCandidates; ++i) {
       const auto id = ids[i];
       if (!id) {
@@ -2850,22 +2859,25 @@ namespace {
       }
       const auto &e = g_motion_evals[id % kMotionEvals];
       bool usable = e.id == id && e.ring == ring.serial && readable(e, i == 0);
-      for (int j = 0; j < pick.count && usable; ++j) {
+      for (int j = 0; j < i && usable; ++j) {
         usable = pick.cands[j].entry != e.entry;
+      }
+      if (i > 0 && usable) {
+        usable = e.out_width == pick.out_width && e.out_height == pick.out_height;  // (the same view's output, not just its size)
       }
       if (!usable) {
         if (i == 0) {
+          pick.release();
           return false;  // (the frame's own set is required; the others only check it)
         }
         continue;
       }
-      if (pick.count == 0) {
+      if (i == 0) {
         pick.out_width = e.out_width;
         pick.out_height = e.out_height;
-      } else if (static_cast<std::uint64_t>(e.out_width) * e.out_height != static_cast<std::uint64_t>(pick.out_width) * pick.out_height) {
-        continue;  // (another view's)
       }
-      auto &c = pick.cands[pick.count++];
+      pick.count = i + 1;
+      auto &c = pick.cands[i];
       c.entry = e.entry;
       c.width = e.width;
       c.height = e.height;
@@ -2874,12 +2886,12 @@ namespace {
       if (api == gc::api_e::d3d12) {
         c.src12 = ring.tex12[e.entry];
         c.src12->AddRef();
-        ++ring.entries[e.entry].readers;
-        c.reading = true;
       } else {
         c.src11 = ring.tex11[e.entry];
         c.src11->AddRef();
       }
+      ++ring.entries[e.entry].readers;
+      c.reading = true;
     }
     ++g_motion_stats.picked;
     g_motion_stats.alternatives += pick.count > 1 ? 1 : 0;
@@ -2896,12 +2908,16 @@ namespace {
     motion_lock_t lock;
     if (auto *ring = motion_ring(ring_serial); ring && entry >= 0) {
       auto &en = ring->entries[entry];
+      // (a pick never offers an entry another fence still reads: the old
+      // one is complete here, and its value means nothing on the new one)
       if (en.consumer != fence) {
         safe_release(en.consumer);
         fence->AddRef();
         en.consumer = fence;
+        en.consumed = value;
+      } else {
+        en.consumed = std::max(en.consumed, value);
       }
-      en.consumed = std::max(en.consumed, value);
       en.readers = std::max(0, en.readers - 1);
     }
   }
@@ -3177,6 +3193,9 @@ namespace {
       D3D12_TEXTURE_COPY_LOCATION src {};
       src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
       for (int i = 0; i < pick.count; ++i) {
+        if (pick.cands[i].entry < 0) {
+          continue;  // (an absent role)
+        }
         src.pResource = pick.cands[i].src12;
         const D3D12_BOX box {0, 0, 0, pick.cands[i].width, pick.cands[i].height, 1};
         list->CopyTextureRegion(&dst, 0, i * pick.rows, 0, &src, &box);
@@ -3202,8 +3221,10 @@ namespace {
       // The entry's reservation goes with the recorded copy
       p.motion_ring = pick.ring;
       for (int i = 0; i < pick.count; ++i) {
-        p.motion_entries[i] = pick.cands[i].entry;
-        pick.cands[i].reading = false;
+        if (pick.cands[i].reading) {
+          p.motion_entries[i] = pick.cands[i].entry;
+          pick.cands[i].reading = false;
+        }
       }
     }
     if (prepare) {
@@ -3506,6 +3527,8 @@ namespace {
     IDXGIKeyedMutex *motion_mutex = nullptr;  // the motion texture's, held with the slot's (keyed-mutex sync)
     D3D11_BOX motion_boxes[gc::kMotionCandidates] {};
     UINT motion_rows = 0;  // candidate i goes to row i * motion_rows
+    std::uint32_t motion_ring = 0;  // the ring entries reserved for the copies (-1 = none), given back once enqueued
+    int motion_entries[gc::kMotionCandidates] = {-1, -1, -1};
   };
 
   struct armed11_t {
@@ -3551,6 +3574,12 @@ namespace {
       safe_release(src);
     }
     safe_release(p.motion_target);
+    for (int &entry : p.motion_entries) {
+      if (entry >= 0) {
+        motion_unread(p.motion_ring, entry);
+        entry = -1;
+      }
+    }
     p.valid = false;
   }
 
@@ -3811,6 +3840,11 @@ namespace {
       safe_release(src);
     }
     safe_release(p.motion_target);
+    for (int entry : p.motion_entries) {
+      if (entry >= 0) {
+        motion_unread(p.motion_ring, entry);  // (enqueued: the context orders any later write after it)
+      }
+    }
     note_capturing(swapchain, at_boundary ? "D3D11 (at PresentImpl, overlays included)" : "D3D11");
   }
 
@@ -3894,10 +3928,16 @@ namespace {
       p.motion_target = g_cap.motion11[slot];
       p.motion_target->AddRef();
       p.motion_rows = pick.rows;
+      p.motion_ring = pick.ring;
       for (int i = 0; i < pick.count; ++i) {
+        if (pick.cands[i].entry < 0) {
+          continue;  // (an absent role)
+        }
         p.motion_srcs[i] = pick.cands[i].src11;
         p.motion_srcs[i]->AddRef();
         p.motion_boxes[i] = {0, 0, 0, pick.cands[i].width, pick.cands[i].height, 1};
+        p.motion_entries[i] = pick.cands[i].entry;
+        pick.cands[i].reading = false;
       }
     }
     p.generation = g_current_generation.load(std::memory_order_acquire);

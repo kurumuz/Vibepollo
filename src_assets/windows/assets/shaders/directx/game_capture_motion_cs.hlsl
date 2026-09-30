@@ -36,15 +36,18 @@ RWStructuredBuffer<int2> field : register(u1);
 // not checked); on diagnosing frames, of the blocks with a vector checked:
 // 5 the flipped vector fits better than it, 6 half of it does, 7 twice it
 // does, 9 such blocks. 10: the score, the sum over blocks of the best
-// prediction error (the vector's or zero's, x16), which picks the candidate.
+// prediction error (the vector's or zero's), which picks the candidate.
 RWByteAddressBuffer stats : register(u2);
 
 void count(uint i) {
   stats.InterlockedAdd((stats_base + i) * 4, 1);
 }
 
+// (x8, and at most 25000 a block: 8K's 129600 blocks stay below 2^32 even
+// with HDR luma; a non-finite error counts as the most)
 void score(float sad) {
-  stats.InterlockedAdd((stats_base + 10) * 4, (uint) (sad * 16.0));
+  const float scaled = sad * 8.0;
+  stats.InterlockedAdd((stats_base + 10) * 4, scaled >= 0.0 && scaled < 25000.0 ? (uint) scaled : 25000u);
 }
 
 static const int kNone = (int) 0x80000000;

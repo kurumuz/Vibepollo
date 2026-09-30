@@ -1161,6 +1161,9 @@ namespace platf::dxgi::game_capture {
       bool motion_ok = motion.id != 0 && t->motion_textures[slot] && motion.count >= 1 && motion.count <= static_cast<std::uint32_t>(gc::kMotionCandidates) &&
                        motion.out_width > 0 && motion.out_height > 0 && motion.out_width <= kMaxDimension && motion.out_height <= kMaxDimension;
       for (std::uint32_t i = 0; motion_ok && i < motion.count; ++i) {
+        if (i > 0 && motion.width[i] == 0 && motion.height[i] == 0) {
+          continue;  // (an absent candidate; set 0 is always there)
+        }
         motion_ok = motion.width[i] > 0 && motion.height[i] > 0 && motion.width[i] <= t->motion_desc.Width && motion.height[i] <= rows &&
                     std::isfinite(motion.scale_x[i]) && std::isfinite(motion.scale_y[i]) && motion.scale_x[i] != 0 && motion.scale_y[i] != 0 &&
                     std::abs(motion.scale_x[i]) < 1e6f && std::abs(motion.scale_y[i]) < 1e6f;

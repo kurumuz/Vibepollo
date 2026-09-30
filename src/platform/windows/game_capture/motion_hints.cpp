@@ -103,7 +103,7 @@ namespace platf::dxgi::game_capture {
       return false;
     }
     D3D11_BUFFER_DESC sd {};
-    sd.ByteWidth = count * 8;
+    sd.ByteWidth = count / kSets * 8;  // (the chosen set's field only)
     sd.Usage = D3D11_USAGE_STAGING;
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (FAILED(device->CreateBuffer(&sd, nullptr, _staging.put()))) {
@@ -157,9 +157,12 @@ namespace platf::dxgi::game_capture {
                     ", zero won " + pct(_counts[4], _counts[0]) + "; of " + std::to_string(diagnosed) + " diagnosed: flip fits better " + pct(_counts[5], diagnosed) +
                     ", half " + pct(_counts[6], diagnosed) + ", double " + pct(_counts[7], diagnosed) + "; of " + std::to_string(_with_candidates) +
                     " with other candidates, chosen: consumed " + std::to_string(_chosen[0]) + ", next " + std::to_string(_chosen[1]) + ", previous " +
-                    std::to_string(_chosen[2]);
+                    std::to_string(_chosen[2]) + " (wins by " + pct(static_cast<std::uint64_t>(_win_margin_sum * 1000), (_chosen[1] + _chosen[2]) * 1000) +
+                    " on average; " + std::to_string(_near_wins) + " lower within the " + pct(static_cast<std::uint64_t>(kMargin * 1000), 1000) + " margin)";
     std::memset(_counts, 0, sizeof(_counts));
     std::memset(_chosen, 0, sizeof(_chosen));
+    _near_wins = 0;
+    _win_margin_sum = 0;
     _fields = 0;
     _unchecked = 0;
     _with_candidates = 0;
@@ -267,6 +270,9 @@ namespace platf::dxgi::game_capture {
     context->CSSetShader(_blocks_cs.get(), nullptr, 0);
     for (int i = 0; i < sets; ++i) {
       const auto &set = frame.motion_sets[i];
+      if (!set.width || !set.height) {
+        continue;  // (an absent candidate)
+      }
       p.texel_per_pixel[0] = static_cast<float>(set.width) / frame.width;
       p.texel_per_pixel[1] = static_cast<float>(set.height) / frame.height;
       p.pixel_per_unit[0] = static_cast<float>(frame.width) / set.width * set.scale_x;
@@ -284,28 +290,44 @@ namespace platf::dxgi::game_capture {
 
     // Read back now: the encoder needs the field on the CPU with the frame,
     // and the frame's GPU work is what the encoder waits for anyway. The
-    // lowest score wins (ties: set 0, the one the Present consumed).
-    context->CopyResource(_staging.get(), _field.get());
+    // consumed set (0) stands unless another predicts the frame clearly
+    // better: at least kMargin lower total error (a near-tie is noise, most
+    // of all in slow scenes, and would swap in another frame's vectors).
     context->CopyResource(_stats_staging.get(), _stats.get());
     D3D11_MAPPED_SUBRESOURCE mapped {};
     if (FAILED(context->Map(_stats_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
       return nullptr;
     }
     const auto *c = static_cast<const std::uint32_t *>(mapped.pData);
+    const auto score = [&](int i) {
+      return static_cast<double>(c[i * kStatsPerSet + kScore]);
+    };
     int chosen = 0;
+    bool others = false;
     for (int i = 1; i < sets; ++i) {
-      if (c[i * kStatsPerSet + kScore] < c[chosen * kStatsPerSet + kScore]) {
+      if (!frame.motion_sets[i].width) {
+        continue;
+      }
+      others = true;
+      if (score(i) < score(0) * (1.0 - kMargin) && score(i) < score(chosen)) {
         chosen = i;
+      } else if (score(i) < score(0) && chosen == 0) {
+        ++_near_wins;  // (lower, but within the margin)
       }
     }
     for (int k = 0; k < kCounters; ++k) {
       _counts[k] += c[chosen * kStatsPerSet + k];
     }
-    ++_chosen[chosen];
-    if (sets > 1) {
+    if (others) {
       ++_with_candidates;
+      ++_chosen[chosen];
+      if (chosen != 0 && score(0) > 0) {
+        _win_margin_sum += 1.0 - score(chosen) / score(0);
+      }
     }
     context->Unmap(_stats_staging.get(), 0);
+    const D3D11_BOX box {static_cast<UINT>(chosen) * per_field * 8, 0, 0, (static_cast<UINT>(chosen) + 1) * per_field * 8, 1, 1};
+    context->CopySubresourceRegion(_staging.get(), 0, 0, 0, 0, _field.get(), 0, &box);
     if (FAILED(context->Map(_staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
       return nullptr;
     }
@@ -317,8 +339,7 @@ namespace platf::dxgi::game_capture {
     field->cols = p.blocks[0];
     field->rows = p.blocks[1];
     field->vectors.resize(static_cast<std::size_t>(field->cols) * field->rows * 2);
-    std::memcpy(field->vectors.data(), static_cast<const std::int32_t *>(mapped.pData) + static_cast<std::size_t>(chosen) * per_field * 2,
-                field->vectors.size() * sizeof(std::int32_t));
+    std::memcpy(field->vectors.data(), mapped.pData, field->vectors.size() * sizeof(std::int32_t));
     context->Unmap(_staging.get(), 0);
     return field;
   }
