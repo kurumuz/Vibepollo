@@ -2248,12 +2248,9 @@ namespace stream {
       const bool has_sideband = !packet->motion_sideband.empty();
       if (has_sideband) {
         const auto &side = packet->motion_sideband;
-        payload_with_sideband.reserve(payload.size() + side.size() + 8);
+        payload_with_sideband.reserve(payload.size() + side.size() + side.size() / 64 + 16);
         payload_with_sideband.insert(payload_with_sideband.end(), payload.begin(), payload.end());
-        payload_with_sideband.insert(payload_with_sideband.end(), side.begin(), side.end());
-        const std::uint32_t tail[2] = {static_cast<std::uint32_t>(side.size()), motion_sideband::kMagic};
-        const auto *t = reinterpret_cast<const uint8_t *>(tail);
-        payload_with_sideband.insert(payload_with_sideband.end(), t, t + sizeof(tail));
+        motion_sideband::append(payload_with_sideband, side, packet->motion_sideband_interval_us);
         payload = {(char *) payload_with_sideband.data(), payload_with_sideband.size()};
       }
 

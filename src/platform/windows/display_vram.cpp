@@ -2102,11 +2102,15 @@ namespace platf::dxgi {
       return result;
     }
 
-    std::vector<std::uint8_t> take_motion_sideband() override {
+    std::vector<std::uint8_t> take_motion_sideband(std::uint32_t *interval_us) override {
+      *interval_us = 0;
       if (!motion_sideband) {
         return {};
       }
       auto stream = mvc2.collect(base.device_ctx.get());
+      if (!stream.empty()) {
+        *interval_us = sideband_interval_us;
+      }
       if (++sideband_log_frames >= 1200) {
         sideband_log_frames = 0;
         auto s = mvc2.stats();
@@ -2127,8 +2131,15 @@ namespace platf::dxgi {
     void set_motion_hints(const img_d3d_t &img) {
       const auto id = img.game_frame_id;
       const bool step = id != 0 && last_game_frame_id != 0 && id == last_game_frame_id + 1;
+      // The field spans this game frame and the previous one: their capture times
+      sideband_interval_us = 0;
+      if (step && img.frame_timestamp && last_game_frame_timestamp && *img.frame_timestamp > *last_game_frame_timestamp) {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(*img.frame_timestamp - *last_game_frame_timestamp).count();
+        sideband_interval_us = static_cast<std::uint32_t>(std::min<long long>(us, 1000000));
+      }
       if (id != last_game_frame_id) {
         last_game_frame_id = id;
+        last_game_frame_timestamp = img.frame_timestamp;
       }
       const auto *field = img.motion.get();
       // (a rotated display is converted rotated: its blocks and vectors would need the same turn)
@@ -2180,6 +2191,8 @@ namespace platf::dxgi {
 
     bool motion_sideband = false;
     game_capture::mvc2_encoder_t mvc2;
+    std::uint32_t sideband_interval_us = 0;
+    std::optional<std::chrono::steady_clock::time_point> last_game_frame_timestamp;
     int sideband_log_frames = 0;
     std::uint64_t last_game_frame_id = 0;
     std::uint32_t encode_width = 0;

@@ -328,6 +328,7 @@ namespace video {
     // The frame's motion field (MVC2) for the motion sideband, appended to the
     // payload on the wire (motion_sideband_wire.h); empty: none
     std::vector<uint8_t> motion_sideband;
+    uint32_t motion_sideband_interval_us = 0;  ///< between the field's two game frames (0: unknown)
   };
 
   struct packet_raw_avcodec: packet_raw_t {

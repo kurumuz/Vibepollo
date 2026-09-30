@@ -441,10 +441,12 @@ namespace platf {
 
     /**
      * @brief The motion sideband of the frame converted last (an MVC2 stream,
-     *        see motion_sideband_wire.h), or empty when it has none. Called once
-     *        per frame after its encode; may wait for the GPU.
+     *        see motion_sideband_wire.h; empty when it has none) and the time
+     *        between the field's two game frames in microseconds (0: unknown).
+     *        Called once per frame after its encode; may wait for the GPU.
      */
-    virtual std::vector<std::uint8_t> take_motion_sideband() {
+    virtual std::vector<std::uint8_t> take_motion_sideband(std::uint32_t *interval_us) {
+      *interval_us = 0;
       return {};
     }
 
