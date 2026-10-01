@@ -12,6 +12,7 @@ cbuffer color_matrix_cbuffer : register(b0) {
 #endif
 
 #include "include/base_vs_types.hlsl"
+#include "include/downscale_cr2x.hlsl"
 
 #ifdef PLANAR_VIEWPORTS
 uint main_ps(vertex_t input) : SV_Target
@@ -19,7 +20,7 @@ uint main_ps(vertex_t input) : SV_Target
 uint4 main_ps(vertex_t input) : SV_Target
 #endif
 {
-    float3 rgb = CONVERT_FUNCTION(image.Sample(def_sampler, input.tex_coord, 0).rgb);
+    float3 rgb = CONVERT_FUNCTION(sample_source(input.tex_coord));
 
 #ifdef PLANAR_VIEWPORTS
     // Planar R16, 10 most significant bits store the value

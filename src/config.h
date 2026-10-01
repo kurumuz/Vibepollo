@@ -260,6 +260,11 @@ namespace config {
     // clients that ask for it (ML_FF_MOTION_SIDEBAND): they warp the last frame
     // on refreshes that no new frame reaches in time. Needs game capture.
     bool motion_sideband = false;
+    /// The display (and the game on it) at this percentage of the stream's
+    /// resolution, downscaled to the stream on encode (200: render at 2x,
+    /// downscaled with Catmull-Rom). An app's own scale factor, then the
+    /// client's, take precedence. 100 = off.
+    int render_scale = 100;
   };
 
   struct audio_t {

@@ -1315,7 +1315,10 @@ namespace proc {
       scale_factor = 100;
     }
 
-    if (scale_factor != 100) {
+    // (a session from nvhttp is scaled already, before its display was made)
+    if (launch_session->render_scale_applied) {
+      scale_factor = static_cast<int>(launch_session->scale_factor);
+    } else if (scale_factor != 100) {
       render_width *= ((float) scale_factor / 100);
       render_height *= ((float) scale_factor / 100);
 

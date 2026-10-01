@@ -85,6 +85,7 @@ namespace rtsp_stream {
     bool client_requests_virtual_display;
     bool virtual_display;
     uint32_t scale_factor;
+    bool render_scale_applied = false;  ///< width/height already are the render size (make_launch_session): proc must not scale again
     bool virtual_display_failed;
     bool virtual_display_detach_with_app;
     std::optional<config::video_t::virtual_display_mode_e> virtual_display_mode_override;

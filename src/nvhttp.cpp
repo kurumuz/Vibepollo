@@ -1678,6 +1678,34 @@ namespace nvhttp {
       launch_session->virtual_display = util::from_view(get_arg(args, "virtualDisplay", "0")) || named_cert_p->always_use_virtual_display;
       launch_session->scale_factor = util::from_view(get_arg(args, "scaleFactor", "100"));
 
+      // The render scale: the display, and the game on it, at this
+      // percentage of the stream's resolution, downscaled to the stream on
+      // encode. The app's own scale factor first, then the client's, then
+      // video.render_scale. Applied now, before the virtual display and the
+      // display configuration are made from the session's size (applying it
+      // only at the app's launch left both at the stream's).
+      {
+        int scale = 100;
+        const auto app_ctx = launch_app_ctx ? launch_app_ctx : (launch_session->appid > 0 ? proc::proc.resolve_app(launch_session->appid) : std::nullopt);
+        if (app_ctx && app_ctx->scale_factor > 0 && app_ctx->scale_factor != 100) {
+          scale = app_ctx->scale_factor;
+        } else if (launch_session->scale_factor > 0 && launch_session->scale_factor != 100) {
+          scale = static_cast<int>(launch_session->scale_factor);
+        } else if (config::video.render_scale > 0 && config::video.render_scale != 100) {
+          scale = config::video.render_scale;
+        }
+        if (scale != 100 && launch_session->width > 0 && launch_session->height > 0) {
+          const int stream_width = launch_session->width, stream_height = launch_session->height;
+          // (even: most odd modes do not work)
+          launch_session->width = static_cast<int>(stream_width * (scale / 100.0)) & ~1;
+          launch_session->height = static_cast<int>(stream_height * (scale / 100.0)) & ~1;
+          BOOST_LOG(info) << "Render scale " << scale << "%: the display renders at " << launch_session->width << 'x' << launch_session->height
+                          << " for a " << stream_width << 'x' << stream_height << " stream";
+        }
+        launch_session->scale_factor = static_cast<uint32_t>(scale);
+        launch_session->render_scale_applied = true;
+      }
+
       launch_session->client_do_cmds = named_cert_p->do_cmds;
       launch_session->client_undo_cmds = named_cert_p->undo_cmds;
 

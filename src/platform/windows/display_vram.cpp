@@ -680,6 +680,9 @@ namespace platf::dxgi {
           return false;
         }
 
+        // (a plain tap: nothing bound reads as no downscale)
+        ID3D11Buffer *no_downscale = nullptr;
+        device_ctx->PSSetConstantBuffers(2, 1, &no_downscale);
         draw(black_texture_for_clear_srv, out_Y_or_YUV_viewports_for_clear, out_UV_viewport_for_clear, DXGI_FORMAT_B8G8R8A8_UNORM, false, false);
         rtvs_cleared = true;
         unbind_shader_resource();
@@ -911,6 +914,10 @@ namespace platf::dxgi {
         truehdr_live_readback_request.reset();
       }
 #endif
+      {
+        ID3D11Buffer *downscale = downscale_params.get();
+        device_ctx->PSSetConstantBuffers(2, 1, &downscale);
+      }
       draw(
         *encode_input_res,
         out_Y_or_YUV_viewports,
@@ -1347,6 +1354,24 @@ namespace platf::dxgi {
 
       float subsample_offset_in[16 / sizeof(float)] {1.0f / (float) out_width_f, 1.0f / (float) out_height_f};  // aligned to 16-byte
       subsample_offset = make_buffer(device.get(), subsample_offset_in);
+
+      // A source exactly twice the picture (a game rendered at 2x the stream:
+      // video.render_scale) is downscaled with Catmull-Rom instead of one
+      // bilinear tap, a 2x2 box that aliases (include/downscale_cr2x.hlsl).
+      // Unrotated only: the kernel's taps follow the texture's axes.
+      {
+        const bool unrotated = display->display_rotation == DXGI_MODE_ROTATION_UNSPECIFIED || display->display_rotation == DXGI_MODE_ROTATION_IDENTITY;
+        const bool exactly_2x = in_width == 2.0f * out_width_f && in_height == 2.0f * out_height_f;
+        struct {
+          float texel[2];
+          std::uint32_t cr2x;
+          std::uint32_t pad;
+        } downscale_in {{1.0f / in_width, 1.0f / in_height}, unrotated && exactly_2x ? 1u : 0u, 0};
+        downscale_params = make_buffer(device.get(), downscale_in);
+        if (downscale_in.cr2x) {
+          BOOST_LOG(info) << "Encoder input: " << in_width << 'x' << in_height << " downscaled 2x to " << out_width_f << 'x' << out_height_f << " (Catmull-Rom)";
+        }
+      }
 
       if (!subsample_offset) {
         BOOST_LOG(error) << "Failed to create subsample offset vertex constant buffer";
@@ -1902,6 +1927,7 @@ namespace platf::dxgi {
     shader_res_t black_texture_for_clear_srv;
 
     buf_t subsample_offset;
+    buf_t downscale_params;  // the conversion's source read (include/downscale_cr2x.hlsl)
     buf_t color_matrix;
     buf_t sdr_to_pq_params;
     float sdr_to_pq_white_nits = 100.0f;
