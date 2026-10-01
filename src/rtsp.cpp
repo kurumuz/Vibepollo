@@ -1266,6 +1266,7 @@ namespace rtsp_stream {
       // Advertise Prague CC support; a client that answers with
       // ML_FF_PRAGUE_CC gets per-datagram Prague headers on video.
       feature_flags |= prague::SS_FF_PRAGUE_CC;
+      feature_flags |= prague::SS_FF_PRAGUE_VIDEO_EPOCH;  // (stream.cpp: Prague's clock counts from the RTP epoch)
       if (config::stream.slo_bayes) {
         // Frame reports ride Prague's feedback path; a client answering with
         // ML_FF_FRAME_REPORTS gets its bitrate driven by slo-bayes.

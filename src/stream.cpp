@@ -499,8 +499,10 @@ namespace stream {
       std::chrono::steady_clock::time_point last_log {};
       count_tp last_inflight = 0;
 
-      session_ctx_t(size_tp max_packet_size, fps_tp fps, time_tp frame_budget, rate_tp init_rate, rate_tp min_rate, rate_tp max_rate):
-          cc(max_packet_size, fps, frame_budget, init_rate, PRAGUE_INITWIN, min_rate, max_rate) {
+      // start_ref: the session's video epoch, which Now() then counts from
+      // (SS_FF_PRAGUE_VIDEO_EPOCH)
+      session_ctx_t(size_tp max_packet_size, fps_tp fps, time_tp frame_budget, rate_tp init_rate, rate_tp min_rate, rate_tp max_rate, time_tp start_ref):
+          cc(max_packet_size, fps, frame_budget, init_rate, PRAGUE_INITWIN, min_rate, max_rate, start_ref) {
       }
     };
 
@@ -559,6 +561,14 @@ namespace stream {
       }
     };
 
+    // A steady-clock instant as PragueCC's start reference (its truncated
+    // microsecond count; 0 means "the first call", so it is never 0)
+    inline time_tp prague_start_ref(std::chrono::steady_clock::time_point t) {
+      const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count();
+      const auto ref = (time_tp) (std::uint32_t) us;
+      return ref != 0 ? ref : 1;
+    }
+
     inline std::int64_t steady_us() {
       return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
@@ -602,6 +612,8 @@ namespace stream {
       // Present iff Prague CC was negotiated for this session (config enabled
       // + client sent ML_FF_PRAGUE_CC). Shadow mode in stage 1.
       std::unique_ptr<prague::session_ctx_t> prague;
+      // What this session's RTP timestamps (and Prague's clock) count from
+      std::chrono::steady_clock::time_point epoch;
 
       // Present iff slo_bayes is enabled and the client negotiated frame
       // reports (only offered on top of Prague). Drives the encoder bitrate.
@@ -2168,7 +2180,6 @@ namespace stream {
   void videoBroadcastThread(udp::socket &sock) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread. The send pacer (pacing_max_bitrate_kbps)
     // relies on this thread waking on its millisecond sleep deadlines; losing the
@@ -2515,7 +2526,7 @@ namespace stream {
           // legacy grid-snapped time when that is disabled. Raw capture timing is
           // tracked separately for frame_processing_latency.
           using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
-          uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - session->video.epoch).count();
 
           // set FEC info now that we know for sure what our percentage will be for this frame
           for (auto x = 0; x < shards.size(); ++x) {
@@ -3604,6 +3615,9 @@ namespace stream {
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
 
+      // (a second before now: no frame of the session's is captured before it)
+      session->video.epoch = std::chrono::steady_clock::now() - 1s;
+
       if (config::stream.prague_cc != 0 && (config.mlFeatureFlags & (int) prague::ML_FF_PRAGUE_CC)) {
         // Shadow mode (stage 1): bounds chosen so the logged numbers stay
         // interpretable against the session bitrate rather than running off
@@ -3618,7 +3632,8 @@ namespace stream {
           (time_tp) (1000000 / fps),
           bitrate_Bps,
           std::max<rate_tp>(bitrate_Bps / 4, 125000),
-          bitrate_Bps * 3 / 2
+          bitrate_Bps * 3 / 2,
+          prague::prague_start_ref(session->video.epoch)
         );
 
         BOOST_LOG(info) << "Prague CC: shadow mode active (fps "sv << fps

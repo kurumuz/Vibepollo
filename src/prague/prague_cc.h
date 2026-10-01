@@ -91,7 +91,8 @@ public:
         rate_tp init_rate = PRAGUE_INITRATE,
         count_tp init_window = PRAGUE_INITWIN,
         rate_tp min_rate = PRAGUE_MINRATE,
-        rate_tp max_rate = PRAGUE_MAXRATE);
+        rate_tp max_rate = PRAGUE_MAXRATE,
+        time_tp start_ref = 0);                   // Vibepollo: steady-clock µs (truncated) Now() counts from; 0 = the first call
 
     virtual ~PragueCC();
 

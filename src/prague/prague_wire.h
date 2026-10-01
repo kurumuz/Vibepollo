@@ -21,6 +21,13 @@ namespace prague {
   constexpr std::uint32_t SS_FF_PRAGUE_CC = 0x40000000;
   constexpr std::uint32_t ML_FF_PRAGUE_CC = 0x40000000;
 
+  // With SS_FF_PRAGUE_CC: data_hdr_t::timestamp counts microseconds from the
+  // session's video epoch, the same instant its RTP timestamps (90 kHz) count
+  // from. A datagram's send time and its frame's capture time are then on one
+  // host timeline, and the client can map the host clock from datagram
+  // timing alone (network delay only, none of the frame's own latency).
+  constexpr std::uint32_t SS_FF_PRAGUE_VIDEO_EPOCH = 0x10000000;
+
   // Prepended to EVERY video datagram (FEC parity shards included -- Prague
   // must account for every datagram that costs bandwidth), outside the FEC
   // and encryption envelopes, via the fec_t per-shard prefix region.

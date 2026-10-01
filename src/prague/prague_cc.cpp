@@ -82,7 +82,9 @@ time_tp PragueCC::Now() // Returns number of µs since first call
         }
         return 1; // make sure we don't return less than or equal to 0
     }
-    time_tp now = time_tp(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) - m_start_ref;
+    // (modulo 2^32 in unsigned arithmetic: the difference of two truncated
+    // timestamps, which signed subtraction would overflow)
+    time_tp now = time_tp(uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) - uint32_t(m_start_ref));
     if (now == 0) {
         return 1; // make sure we don't return 0
     }
@@ -112,9 +114,10 @@ PragueCC::PragueCC(
     rate_tp init_rate,
     count_tp init_window,
     rate_tp min_rate,
-    rate_tp max_rate)
+    rate_tp max_rate,
+    time_tp start_ref)
 {
-    m_start_ref = 0;
+    m_start_ref = start_ref;
     time_tp ts_now = Now();
 // parameters
     m_init_rate = init_rate;
