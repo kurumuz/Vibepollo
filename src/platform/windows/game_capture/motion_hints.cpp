@@ -36,7 +36,7 @@ namespace platf::dxgi::game_capture {
       std::uint32_t pad;
       std::uint32_t cells[2];
       float static_luma;
-      std::uint32_t pad2;
+      float ui_contrast;
     };
 
     constexpr int kSets = ::game_capture::kMotionCandidates;
@@ -264,6 +264,7 @@ namespace platf::dxgi::game_capture {
     p.cells[0] = (frame.width + 3) / 4;
     p.cells[1] = (frame.height + 3) / 4;
     p.static_luma = kStaticLuma;
+    p.ui_contrast = kUiContrast;
     context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
 
     const int cur = _current;
@@ -320,7 +321,10 @@ namespace platf::dxgi::game_capture {
       context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
       context->Dispatch((p.blocks[0] + 7) / 8, (p.blocks[1] + 7) / 8, 1);
     }
-    // The still cells, from the same two lumas
+    // The still cells, from the same two lumas and the consumed set's field
+    // (the one sent, but for a rare clearly better candidate)
+    p.field_base = 0;
+    context->UpdateSubresource(_params.get(), 0, nullptr, &p, 0, 0);
     context->ClearUnorderedAccessViewUint(_mask_uav.get(), zero);
     ID3D11UnorderedAccessView *mask_out[1] = {_mask_uav.get()};
     context->CSSetUnorderedAccessViews(3, 1, mask_out, nullptr);

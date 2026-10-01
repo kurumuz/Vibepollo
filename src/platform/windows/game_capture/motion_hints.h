@@ -82,6 +82,7 @@ namespace platf::dxgi::game_capture {
     winrt::com_ptr<ID3D11Buffer> _mask_staging;  // ... and their readback
     std::uint32_t _mask_words = 0;
     static constexpr float kStaticLuma = 2.0f / 255.0f;  // a still pixel's largest luma change (dithering, noise)
+    static constexpr float kUiContrast = 8.0f / 255.0f;  // a still pixel is HUD if the field's motion would have changed it by more
     winrt::com_ptr<ID3D11Buffer> _params;
     winrt::com_ptr<ID3D11Texture2D> _luma[2];
     winrt::com_ptr<ID3D11ShaderResourceView> _luma_srv[2];

@@ -9,11 +9,14 @@
 // motion does (the game's vectors know nothing of what is drawn after DLSS,
 // such as the HUD). Output: quarter pixels, pointing from the block to where
 // it was in the previous frame; x = kNone for no vector.
-// mask_cs: per 4x4 cell, a bit where no pixel's luma changed from the
-// previous frame -- content that did not move whatever its block's vector
-// says (the HUD, drawn after DLSS, or anything static): what a timewarp on
-// the client must hold still. Finer than the blocks, whose check a HUD
-// element covering part of a moving block loses.
+// mask_cs: per 4x4 cell, a bit where the content did not move whatever its
+// block's vector says (the HUD, drawn after DLSS, or anything static): what a
+// timewarp on the client must hold still. Held if no pixel's luma changed from
+// the previous frame, or if a few pixels stood still where the field's motion
+// (read as the client's warp reads it) would have changed them -- the strokes
+// of HUD text or an outline over a moving world, whose cells always show some
+// of the world changing between them. Finer than the blocks, whose check a
+// HUD element covering part of a moving block loses.
 
 cbuffer params : register(b0) {
   uint2 frame_size;  // pixels
@@ -30,7 +33,7 @@ cbuffer params : register(b0) {
   uint pad;
   uint2 cells;  // 4x4 mask cells (columns, rows)
   float static_luma;  // the largest luma change a still pixel may show (noise, dithering)
-  uint pad2;
+  float ui_contrast;  // mask_cs: how much the field's motion must have changed a still pixel for it to be HUD
 };
 
 Texture2D<float4> color : register(t0);
@@ -186,21 +189,50 @@ float luma_of(float3 c) {
   field[index] = int2(round(v * 4));
 }
 
+// The field (set field_base) at a pixel, bilinear between block centres as
+// the client's warp samples it; a block without a vector reads as zero
+float2 block_vector(int2 b) {
+  const int2 e = field[field_base + b.y * blocks.x + b.x];
+  return e.x == kNone ? float2(0, 0) : float2(e) * 0.25;
+}
+
+float2 field_at(float2 p) {
+  const float2 g = clamp(p / 16.0 - 0.5, float2(0, 0), float2(blocks) - 1.0);
+  const int2 g0 = int2(floor(g));
+  const int2 g1 = min(g0 + 1, int2(blocks) - 1);
+  const float2 f = g - float2(g0);
+  return lerp(lerp(block_vector(g0), block_vector(int2(g1.x, g0.y)), f.x),
+              lerp(block_vector(int2(g0.x, g1.y)), block_vector(g1), f.x), f.y);
+}
+
+// (how many of a cell's pixels must show it: one could be a coincidence in a
+// moving texture)
+static const uint kHudPixels = 2;
+
 [numthreads(8, 8, 1)] void mask_cs(uint3 id: SV_DispatchThreadID) {
   if (any(id.xy >= cells)) {
     return;
   }
   const uint2 base = id.xy * 4;
-  const uint2 last = frame_size - 1;
+  const int2 last = int2(frame_size) - 1;
+  const int2 d = int2(round(field_at(float2(base) + 2.0)));
+  const bool moving = any(d != 0);
   float worst = 0;
+  uint hud = 0;
   [unroll] for (uint y = 0; y < 4; ++y) {
     [unroll] for (uint x = 0; x < 4; ++x) {
-      const int3 q = int3(min(base + uint2(x, y), last), 0);
-      worst = max(worst, abs(cur_luma_in.Load(q) - prev_luma.Load(q)));
+      const int2 q = min(int2(base + uint2(x, y)), last);
+      const float c = cur_luma_in.Load(int3(q, 0));
+      const float still = abs(c - prev_luma.Load(int3(q, 0)));
+      worst = max(worst, still);
+      // Zero motion predicts it, the field's does not
+      if (moving && still <= static_luma && abs(c - prev_luma.Load(int3(clamp(q + d, int2(0, 0), last), 0))) > ui_contrast) {
+        ++hud;
+      }
     }
   }
   // (a non-finite difference compares false: not held)
-  if (worst <= static_luma) {
+  if (worst <= static_luma || hud >= kHudPixels) {
     const uint bit = id.y * cells.x + id.x;
     mask.InterlockedOr((bit >> 5) * 4, 1u << (bit & 31));
   }
