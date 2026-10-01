@@ -1428,6 +1428,7 @@ namespace {
   bool motion_submissions_pending();  // (motion section)
   void motion_note_submission(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists);
   void motion_note_reset(const void *list);
+  void ensure_runtime_d3d12_hooks(IDXGISwapChain *swapchain);  // (DXGI section)
   void cancel_prepared11_for(IDXGISwapChain *swapchain);  // (PresentImpl section)
   void give_back_armed11();
 
@@ -1472,6 +1473,64 @@ namespace {
       motion_note_reset(list);
     }
     return hr;
+  }
+
+  // D3D12 behind a wrapper (ReShade, say, whose dxgi.dll in the game's
+  // folder also wraps D3D12 devices, queues and command lists): the game
+  // submits through the wrapper's objects, which hand the runtime's own to
+  // it underneath -- and DXGI submits on those directly. The detours above
+  // then sit on the runtime's functions (from the first swapchain's own
+  // queue, see ensure_runtime_d3d12_hooks) and see DXGI's submissions; these
+  // sit on the wrapper's, for the game's (a DLSS evaluation is recorded into
+  // the wrapper's command list).
+  bool g_d3d12_wrapped = false;  // (set by install_d3d12_hook)
+  execute_command_lists_fn g_real_wrapper_execute_command_lists = nullptr;
+  list_reset_fn g_real_wrapper_list_reset = nullptr;
+  std::atomic<ID3D12Device *> g_runtime_device12 {nullptr};  // the first swapchain's device, the runtime's own (a reference, kept)
+
+  void STDMETHODCALLTYPE hook_wrapper_execute_command_lists(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists) {
+    g_real_wrapper_execute_command_lists(queue, count, lists);
+    if (motion_submissions_pending()) {
+      motion_note_submission(queue, count, lists);
+    }
+  }
+
+  HRESULT STDMETHODCALLTYPE hook_wrapper_list_reset(ID3D12GraphicsCommandList *list, ID3D12CommandAllocator *allocator, ID3D12PipelineState *state) {
+    const HRESULT hr = g_real_wrapper_list_reset(list, allocator, state);
+    if (SUCCEEDED(hr) && motion_submissions_pending()) {
+      motion_note_reset(list);
+    }
+    return hr;
+  }
+
+  // Whether a function lives in the D3D12 runtime (d3d12.dll, or the
+  // D3D12Core.dll it loads: Windows' or an Agility SDK's)
+  bool in_d3d12_runtime(void *fn) {
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(fn), &module) ||
+        !GetModuleFileNameW(module, path, MAX_PATH)) {
+      return false;
+    }
+    const wchar_t *name = std::wcsrchr(path, L'\\');
+    name = name ? name + 1 : path;
+    return _wcsicmp(name, L"d3d12core.dll") == 0 || _wcsicmp(name, L"d3d12.dll") == 0;
+  }
+
+  // The device a D3D12 object of the game's names, as the runtime's own: a
+  // wrapper's device on the runtime device's adapter stands for it (a
+  // reference either way)
+  ID3D12Device *runtime_device12(ID3D12Device *device) {
+    ID3D12Device *runtime = g_runtime_device12.load(std::memory_order_acquire);
+    if (runtime && device != runtime && !in_d3d12_runtime((*reinterpret_cast<void ***>(device))[0])) {
+      const LUID a = device->GetAdapterLuid(), b = runtime->GetAdapterLuid();
+      if (a.LowPart == b.LowPart && a.HighPart == b.HighPart) {
+        runtime->AddRef();
+        return runtime;
+      }
+    }
+    device->AddRef();
+    return device;
   }
 
   std::uint64_t ms_to_qpc(std::uint64_t ms) {
@@ -2617,7 +2676,7 @@ namespace {
   }
 
   void motion_after_eval12(ID3D12GraphicsCommandList *list, const void *handle, const void *params) {
-    if (!g_real_execute_command_lists || !g_real_list_reset) {
+    if (!(g_real_execute_command_lists || g_real_wrapper_execute_command_lists) || !(g_real_list_reset || g_real_wrapper_list_reset)) {
       return;  // (submissions and resets cannot be followed)
     }
     const auto type = list->GetType();
@@ -2645,6 +2704,13 @@ namespace {
     ID3D12Device *device = nullptr;
     if (FAILED(list->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device)))) {
       return;
+    }
+    {
+      // (a wrapper's command list names the wrapper's device; the capture
+      // and the ring work with the runtime's)
+      ID3D12Device *runtime = runtime_device12(device);
+      device->Release();
+      device = runtime;
     }
     struct release_t {
       ID3D12Device *&d;
@@ -4474,6 +4540,7 @@ namespace {
         }
         return;
       }
+      ensure_runtime_d3d12_hooks(swapchain);
       IDXGISwapChain3 *swapchain3 = nullptr;
       if (submit_mode(swapchain) == submit_mode_e::at_dxgi_submit && g_real_execute_command_lists &&
           SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3)))) {
@@ -4819,7 +4886,34 @@ namespace {
       desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
       hr = device->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&queue));
     }
-    if (SUCCEEDED(hr)) {
+    if (SUCCEEDED(hr) && !in_d3d12_runtime((*reinterpret_cast<void ***>(queue))[kVtExecuteCommandLists])) {
+      // (a wrapper's objects: its functions here, the runtime's at the first swapchain)
+      g_d3d12_wrapped = true;
+      HMODULE module = nullptr;
+      wchar_t path[MAX_PATH] = L"?";
+      if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             static_cast<LPCWSTR>((*reinterpret_cast<void ***>(queue))[kVtExecuteCommandLists]), &module)) {
+        GetModuleFileNameW(module, path, MAX_PATH);
+      }
+      log("D3D12 objects come wrapped (by %ls): the runtime's detours wait for the first D3D12 swapchain", path);
+      void **vtable = *reinterpret_cast<void ***>(queue);
+      if (MH_CreateHook(vtable[kVtExecuteCommandLists], reinterpret_cast<void *>(&hook_wrapper_execute_command_lists),
+                        reinterpret_cast<void **>(&g_real_wrapper_execute_command_lists)) != MH_OK) {
+        g_real_wrapper_execute_command_lists = nullptr;
+      }
+      ID3D12CommandAllocator *allocator = nullptr;
+      ID3D12GraphicsCommandList *list = nullptr;
+      if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void **>(&allocator))) &&
+          SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&list)))) {
+        if (MH_CreateHook((*reinterpret_cast<void ***>(list))[kVtListReset], reinterpret_cast<void *>(&hook_wrapper_list_reset),
+                          reinterpret_cast<void **>(&g_real_wrapper_list_reset)) != MH_OK) {
+          g_real_wrapper_list_reset = nullptr;
+        }
+        list->Close();
+      }
+      safe_release(list);
+      safe_release(allocator);
+    } else if (SUCCEEDED(hr)) {
       void **vtable = *reinterpret_cast<void ***>(queue);
       if (MH_CreateHook(vtable[kVtExecuteCommandLists], reinterpret_cast<void *>(&hook_execute_command_lists),
                         reinterpret_cast<void **>(&g_real_execute_command_lists)) != MH_OK) {
@@ -4849,10 +4943,58 @@ namespace {
     safe_release(device);
   }
 
+  // D3D12 behind a wrapper: the runtime's ExecuteCommandLists and Reset,
+  // detoured from the first D3D12 swapchain's own queue (DXGI holds the
+  // runtime's queue, not the wrapper's). Once, from a Present.
+  void ensure_runtime_d3d12_hooks(IDXGISwapChain *swapchain) {
+    static std::atomic<bool> tried {false};
+    if (!g_d3d12_wrapped || tried.exchange(true)) {
+      return;
+    }
+    ID3D12CommandQueue *queue = nullptr;
+    ID3D12Device *device = nullptr;
+    if (FAILED(swapchain->GetDevice(__uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&queue))) ||
+        FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device)))) {
+      log("D3D12 behind a wrapper: the swapchain's queue or device could not be had; D3D12 swapchains are not captured");
+      safe_release(queue);
+      return;
+    }
+    void *execute = (*reinterpret_cast<void ***>(queue))[kVtExecuteCommandLists];
+    if (!in_d3d12_runtime(execute)) {
+      log("D3D12 behind a wrapper: the swapchain's queue is not the runtime's either; D3D12 swapchains are not captured");
+    } else if (MH_CreateHook(execute, reinterpret_cast<void *>(&hook_execute_command_lists), reinterpret_cast<void **>(&g_real_execute_command_lists)) != MH_OK ||
+               MH_EnableHook(execute) != MH_OK) {
+      g_real_execute_command_lists = nullptr;
+      log("D3D12 behind a wrapper: the runtime's ExecuteCommandLists could not be detoured; D3D12 swapchains are not captured");
+    } else {
+      log("Detoured the runtime's ID3D12CommandQueue::ExecuteCommandLists (from the swapchain's queue)");
+      ID3D12CommandAllocator *allocator = nullptr;
+      ID3D12GraphicsCommandList *list = nullptr;
+      if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void **>(&allocator))) &&
+          SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&list)))) {
+        void *reset = (*reinterpret_cast<void ***>(list))[kVtListReset];
+        if (MH_CreateHook(reset, reinterpret_cast<void *>(&hook_list_reset), reinterpret_cast<void **>(&g_real_list_reset)) != MH_OK ||
+            MH_EnableHook(reset) != MH_OK) {
+          g_real_list_reset = nullptr;
+        }
+        list->Close();
+      }
+      safe_release(list);
+      safe_release(allocator);
+      device->AddRef();
+      g_runtime_device12.store(device, std::memory_order_release);  // (kept for good)
+    }
+    safe_release(device);
+    safe_release(queue);
+  }
+
   // The entry points are found from a throwaway swapchain and inline-detoured
   // at their addresses, which every swapchain of the process shares.
   // Whether the swapchain's implementation lives in Windows' dxgi.dll (then
   // `module` is that module: the one DXGI's own submissions are checked against)
+  template<class F>
+  F system_function(const wchar_t *dll, const char *name);
+
   bool windows_dxgi(IDXGISwapChain1 *swapchain, HMODULE &module) {
     module = nullptr;
     void *present = (*reinterpret_cast<void ***>(swapchain))[kVtPresent];
@@ -4891,9 +5033,21 @@ namespace {
     IDXGIFactory2 *factory = nullptr;
     IDXGISwapChain1 *swapchain = nullptr;
     D3D_FEATURE_LEVEL level;
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, &level, &context);
+    // The probe swapchain comes from Windows' own d3d11.dll and dxgi.dll, by
+    // path: a dxgi.dll in the game's folder takes the name for every plain
+    // import (ours too) once it is loaded. A wrapper there (ReShade) draws and
+    // then calls Windows' DXGI, whose Present is the one detoured; a
+    // replacement (DXVK) never does, and its frames come through the Vulkan
+    // layer instead.
+    using create_factory_fn = HRESULT(WINAPI *)(REFIID, void **);
+    const auto create_factory = system_function<create_factory_fn>(L"dxgi.dll", "CreateDXGIFactory1");
+    const auto create_device = system_function<PFN_D3D11_CREATE_DEVICE>(L"d3d11.dll", "D3D11CreateDevice");
+    HRESULT hr = create_factory && create_device ? S_OK : E_FAIL;
     if (SUCCEEDED(hr)) {
-      hr = CreateDXGIFactory1(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory));
+      hr = create_device(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, &level, &context);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = create_factory(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory));
     }
     if (SUCCEEDED(hr)) {
       DXGI_SWAP_CHAIN_DESC1 desc {};
