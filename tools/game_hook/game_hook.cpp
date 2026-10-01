@@ -1479,8 +1479,8 @@ namespace {
   // folder also wraps D3D12 devices, queues and command lists): the game
   // submits through the wrapper's objects, which hand the runtime's own to
   // it underneath -- and DXGI submits on those directly. The detours above
-  // then sit on the runtime's functions (from the first swapchain's own
-  // queue, see ensure_runtime_d3d12_hooks) and see DXGI's submissions; these
+  // then sit on the runtime's functions (from a queue of the first swapchain's
+  // device, see ensure_runtime_d3d12_hooks) and see DXGI's submissions; these
   // sit on the wrapper's, for the game's (a DLSS evaluation is recorded into
   // the wrapper's command list).
   bool g_d3d12_wrapped = false;  // (set by install_d3d12_hook)
@@ -4944,8 +4944,9 @@ namespace {
   }
 
   // D3D12 behind a wrapper: the runtime's ExecuteCommandLists and Reset,
-  // detoured from the first D3D12 swapchain's own queue (DXGI holds the
-  // runtime's queue, not the wrapper's). Once, from a Present.
+  // detoured from a queue of the first D3D12 swapchain's device (DXGI holds
+  // the runtime's device, not the wrapper's; a swapchain does not give out
+  // its queue). Once, from a Present.
   void ensure_runtime_d3d12_hooks(IDXGISwapChain *swapchain) {
     static std::atomic<bool> tried {false};
     if (!g_d3d12_wrapped || tried.exchange(true)) {
@@ -4953,21 +4954,26 @@ namespace {
     }
     ID3D12CommandQueue *queue = nullptr;
     ID3D12Device *device = nullptr;
-    if (FAILED(swapchain->GetDevice(__uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&queue))) ||
-        FAILED(queue->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device)))) {
-      log("D3D12 behind a wrapper: the swapchain's queue or device could not be had; D3D12 swapchains are not captured");
-      safe_release(queue);
+    HRESULT hr = swapchain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device));
+    if (SUCCEEDED(hr)) {
+      D3D12_COMMAND_QUEUE_DESC desc {};
+      desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+      hr = device->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&queue));
+    }
+    if (FAILED(hr)) {
+      log("D3D12 behind a wrapper: no queue on the swapchain's device (0x%08lx); D3D12 swapchains are not captured", hr);
+      safe_release(device);
       return;
     }
     void *execute = (*reinterpret_cast<void ***>(queue))[kVtExecuteCommandLists];
     if (!in_d3d12_runtime(execute)) {
-      log("D3D12 behind a wrapper: the swapchain's queue is not the runtime's either; D3D12 swapchains are not captured");
+      log("D3D12 behind a wrapper: the swapchain's device is not the runtime's either; D3D12 swapchains are not captured");
     } else if (MH_CreateHook(execute, reinterpret_cast<void *>(&hook_execute_command_lists), reinterpret_cast<void **>(&g_real_execute_command_lists)) != MH_OK ||
                MH_EnableHook(execute) != MH_OK) {
       g_real_execute_command_lists = nullptr;
       log("D3D12 behind a wrapper: the runtime's ExecuteCommandLists could not be detoured; D3D12 swapchains are not captured");
     } else {
-      log("Detoured the runtime's ID3D12CommandQueue::ExecuteCommandLists (from the swapchain's queue)");
+      log("Detoured the runtime's ID3D12CommandQueue::ExecuteCommandLists (from the swapchain's device)");
       ID3D12CommandAllocator *allocator = nullptr;
       ID3D12GraphicsCommandList *list = nullptr;
       if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), reinterpret_cast<void **>(&allocator))) &&
