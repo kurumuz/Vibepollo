@@ -30,7 +30,7 @@
  * and samples input, right at the release time). Each frame's record carries
  * the release that started it.
  *
- * Slot protocol (three slots: free, pending, published):
+ * Slot protocol (kSlots slots, each free, pending or published):
  *  - The hook's render thread writes only a FREE slot, taking its keyed
  *    mutex with a zero timeout; if none is free or the mutex is held, the
  *    frame is skipped. Present is never blocked and never waits.
@@ -79,8 +79,8 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 14;
-  constexpr int kSlots = 3;
+  constexpr std::uint32_t kVersion = 15;
+  constexpr int kSlots = 4;  ///< host-held, latest publication, copy in flight behind a GPU-bound frame, and one to write
   constexpr int kMotionCandidates = 3;  ///< vector sets a slot's motion texture holds (see the top comment)
   constexpr std::size_t kErrorLength = 320;
 
