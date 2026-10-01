@@ -1311,7 +1311,10 @@ namespace {
   struct skip_stats_t {
     std::atomic<std::uint64_t> armed {0}, copied {0};
     std::atomic<std::uint64_t> capture_busy {0};  // another capture held the lock
-    std::atomic<std::uint64_t> no_slot {0}, slot_pending {0}, slot_list_busy {0}, slot_host_held {0};  // (the census of each miss's slots)
+    // (the census of each miss's slots: copy in flight, the latest publication,
+    // free but its list's last copy unfinished, free but the host's owner
+    // word on it, anything else)
+    std::atomic<std::uint64_t> no_slot {0}, slot_pending {0}, slot_published {0}, slot_list_busy {0}, slot_host_held {0}, slot_other {0};
     std::atomic<std::uint64_t> no_boundary {0};  // armed, and DXGI's submission never came
     std::atomic<std::uint64_t> other_queue {0};  // DXGI submitted, on another queue than the armed copy's
     std::atomic<std::uint64_t> contaminated {0};  // another swapchain's submission inside the Present
@@ -1323,12 +1326,17 @@ namespace {
   void count_slot_census(bool (*ready)(int)) {
     g_skip.no_slot.fetch_add(1, std::memory_order_relaxed);
     for (int i = 0; i < gc::kSlots; ++i) {
-      if (word_state(g_slots[i].word.load(std::memory_order_acquire)) != st_free) {
+      const auto state = word_state(g_slots[i].word.load(std::memory_order_acquire));
+      if (state == st_pending) {
         g_skip.slot_pending.fetch_add(1, std::memory_order_relaxed);
+      } else if (state == st_published) {
+        g_skip.slot_published.fetch_add(1, std::memory_order_relaxed);
       } else if (ready && !ready(i)) {
         g_skip.slot_list_busy.fetch_add(1, std::memory_order_relaxed);
-      } else {
+      } else if (g_cap.owner_sync && g_block->owner[i].load(std::memory_order_acquire) == gc::kOwnerHost) {
         g_skip.slot_host_held.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        g_skip.slot_other.fetch_add(1, std::memory_order_relaxed);
       }
     }
   }
@@ -1348,11 +1356,12 @@ namespace {
       return static_cast<unsigned long long>(a.exchange(0, std::memory_order_relaxed));
     };
     const auto armed = take(g_skip.armed), copied = take(g_skip.copied), busy = take(g_skip.capture_busy), no_slot = take(g_skip.no_slot),
-               pending = take(g_skip.slot_pending), list_busy = take(g_skip.slot_list_busy), host = take(g_skip.slot_host_held),
+               pending = take(g_skip.slot_pending), published = take(g_skip.slot_published), list_busy = take(g_skip.slot_list_busy),
+               host = take(g_skip.slot_host_held), other_slot = take(g_skip.slot_other),
                no_boundary = take(g_skip.no_boundary), other = take(g_skip.other_queue), contaminated = take(g_skip.contaminated), stale = take(g_skip.stale);
-    log("Capture, last 10 s: armed %llu, copied %llu; skipped: capture busy %llu, no free slot %llu (slots seen pending %llu, list busy %llu, held by the host %llu), "
-        "DXGI's submission missing %llu, on another queue %llu, another swapchain's inside %llu, stale %llu",
-        armed, copied, busy, no_slot, pending, list_busy, host, no_boundary, other, contaminated, stale);
+    log("Capture, last 10 s: armed %llu, copied %llu; skipped: capture busy %llu, no free slot %llu (slots seen: copy in flight %llu, latest publication %llu, "
+        "list busy %llu, held by the host %llu, other %llu), DXGI's submission missing %llu, on another queue %llu, another swapchain's inside %llu, stale %llu",
+        armed, copied, busy, no_slot, pending, published, list_busy, host, other_slot, no_boundary, other, contaminated, stale);
   }
 
   // ---- D3D12 ---------------------------------------------------------------
@@ -2767,9 +2776,12 @@ namespace {
         mvd.Width > 16384 || mvd.Height > 16384) {
       return;
     }
-    if (mvd.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) {
-      log_once(g_logged_simultaneous, "the game's vector texture is simultaneous-access (its state is unknown to us); not used");
-      return;
+    // A simultaneous-access texture has no state of its own to transition:
+    // it is promoted on first use in a list (DLSS's read, then our copy's:
+    // read states accumulate) and decays at the end of the submission
+    const bool simultaneous = (mvd.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
+    if (simultaneous) {
+      log_once(g_logged_simultaneous, "the game's vector texture is simultaneous-access: copied without a barrier of its own");
     }
     motion_params_t p;
     read_motion_params(params, kNgxGetD3d12, p);
@@ -2815,8 +2827,9 @@ namespace {
     auto *ring = g_motion_ring.tex12[e->entry];
 
     // The vectors are in NON_PIXEL_SHADER_RESOURCE at the evaluation (DLSS
-    // requires it); the ring entry rests in COPY_SOURCE. Only subresource 0
-    // (the one DLSS reads) changes state.
+    // requires it; a simultaneous-access texture is promoted instead, above);
+    // the ring entry rests in COPY_SOURCE. Only subresource 0 (the one DLSS
+    // reads) changes state.
     D3D12_RESOURCE_BARRIER before[2] = {
       transition(ring, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
       transition(mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -2833,9 +2846,10 @@ namespace {
     src.pResource = mv;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     const D3D12_BOX box {r.x, r.y, 0, r.x + r.width, r.y + r.height, 1};
-    list->ResourceBarrier(2, before);
+    const UINT barriers = simultaneous ? 1 : 2;  // (the ring entry's first)
+    list->ResourceBarrier(barriers, before);
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-    list->ResourceBarrier(2, after);
+    list->ResourceBarrier(barriers, after);
   }
 
   void motion_after_eval11(ID3D11DeviceContext *context, const void *handle, const void *params) {
