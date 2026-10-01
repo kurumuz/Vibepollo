@@ -1306,6 +1306,55 @@ namespace {
     return -1;
   }
 
+  // Why Presents went without a frame, for the hook log's periodic line (the
+  // host sees only frames_skipped's total)
+  struct skip_stats_t {
+    std::atomic<std::uint64_t> armed {0}, copied {0};
+    std::atomic<std::uint64_t> capture_busy {0};  // another capture held the lock
+    std::atomic<std::uint64_t> no_slot {0}, slot_pending {0}, slot_list_busy {0}, slot_host_held {0};  // (the census of each miss's slots)
+    std::atomic<std::uint64_t> no_boundary {0};  // armed, and DXGI's submission never came
+    std::atomic<std::uint64_t> other_queue {0};  // DXGI submitted, on another queue than the armed copy's
+    std::atomic<std::uint64_t> contaminated {0};  // another swapchain's submission inside the Present
+    std::atomic<std::uint64_t> stale {0};  // the capture changed between recording and submission
+  };
+  skip_stats_t g_skip;
+
+  // A miss of acquire_free_slot, counted by what each slot was doing
+  void count_slot_census(bool (*ready)(int)) {
+    g_skip.no_slot.fetch_add(1, std::memory_order_relaxed);
+    for (int i = 0; i < gc::kSlots; ++i) {
+      if (word_state(g_slots[i].word.load(std::memory_order_acquire)) != st_free) {
+        g_skip.slot_pending.fetch_add(1, std::memory_order_relaxed);
+      } else if (ready && !ready(i)) {
+        g_skip.slot_list_busy.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        g_skip.slot_host_held.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+
+  void skip_stats_tick() {
+    static std::atomic<std::uint64_t> logged {0};
+    const auto now = qpc_now();
+    auto last = logged.load(std::memory_order_relaxed);
+    if (last == 0) {
+      logged.compare_exchange_strong(last, now, std::memory_order_relaxed);
+      return;
+    }
+    if (now - last < 10 * qpc_frequency() || !logged.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+      return;
+    }
+    const auto take = [](std::atomic<std::uint64_t> &a) {
+      return static_cast<unsigned long long>(a.exchange(0, std::memory_order_relaxed));
+    };
+    const auto armed = take(g_skip.armed), copied = take(g_skip.copied), busy = take(g_skip.capture_busy), no_slot = take(g_skip.no_slot),
+               pending = take(g_skip.slot_pending), list_busy = take(g_skip.slot_list_busy), host = take(g_skip.slot_host_held),
+               no_boundary = take(g_skip.no_boundary), other = take(g_skip.other_queue), contaminated = take(g_skip.contaminated), stale = take(g_skip.stale);
+    log("Capture, last 10 s: armed %llu, copied %llu; skipped: capture busy %llu, no free slot %llu (slots seen pending %llu, list busy %llu, held by the host %llu), "
+        "DXGI's submission missing %llu, on another queue %llu, another swapchain's inside %llu, stale %llu",
+        armed, copied, busy, no_slot, pending, list_busy, host, no_boundary, other, contaminated, stale);
+  }
+
   // ---- D3D12 ---------------------------------------------------------------
   //
   // A D3D12 copy must run on the queue the swapchain presents from: only that
@@ -1397,6 +1446,7 @@ namespace {
   struct armed_capture_t {
     bool armed = false;  // a copy was prepared this Present (stays set when it is cancelled: it still counts)
     bool boundary_seen = false;  // DXGI submitted on the copy's queue during this Present, uncontaminated
+    bool other_queue_seen = false;  // ... or on another queue (the skip statistics)
     IDXGISwapChain *swapchain = nullptr;  // borrowed: we are inside its Present
     HWND hwnd = nullptr;
     prepared12_t prepared;  // valid until submitted or given back
@@ -1451,6 +1501,8 @@ namespace {
       }
       if (dxgi && t_armed.armed && queue == t_armed.prepared.queue) {
         run_armed_capture(queue);  // our copy goes on the queue just ahead of DXGI's work
+      } else if (dxgi && t_armed.armed) {
+        t_armed.other_queue_seen = true;
       }
     }
     g_real_execute_command_lists(queue, count, lists);
@@ -3540,6 +3592,7 @@ namespace {
     // A free slot whose list's last copy completed; claims its owner word
     const int slot = acquire_free_slot(&list_ready);
     if (slot < 0) {
+      count_slot_census(&list_ready);
       g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -3755,6 +3808,7 @@ namespace {
       // (the completion thread still polls it once the pixels are done)
       log("SetEventOnCompletion on the transfer fence failed");
     }
+    g_skip.copied.fetch_add(1, std::memory_order_relaxed);
     note_capturing(swapchain, "D3D12");
   }
 
@@ -3803,6 +3857,9 @@ namespace {
   void run_armed_capture(ID3D12CommandQueue *queue) {
     auto &p = t_armed.prepared;
     if (t_seen_contaminated) {
+      if (p.valid) {
+        g_skip.contaminated.fetch_add(1, std::memory_order_relaxed);
+      }
       give_back_prepared(p);  // (another swapchain's submission: no boundary of ours)
       return;
     }
@@ -3822,6 +3879,7 @@ namespace {
       }
     } lock;
     if (!lock.held) {
+      g_skip.capture_busy.fetch_add(1, std::memory_order_relaxed);
       give_back_prepared(p);
       return;
     }
@@ -3830,6 +3888,7 @@ namespace {
                          (!p.motion_list || (g_cap.motion_queue && g_cap.motion_lists[p.slot] == p.motion_list)) &&
                          g_current_generation.load(std::memory_order_acquire) == p.generation && reserve_retirement();
     if (!current) {
+      g_skip.stale.fetch_add(1, std::memory_order_relaxed);
       give_back_prepared(p);
       return;
     }
@@ -3874,6 +3933,9 @@ namespace {
       return;
     }
     const bool seen = t_armed.boundary_seen;
+    if (!seen && t_armed.prepared.valid) {
+      (t_armed.other_queue_seen ? g_skip.other_queue : g_skip.no_boundary).fetch_add(1, std::memory_order_relaxed);
+    }
     disarm_capture();  // (gives back a copy that was never submitted)
     if (presented) {
       count_boundary(swapchain, submit_mode_e::at_dxgi_submit, seen, "DXGI's submission was missing");
@@ -4358,6 +4420,7 @@ namespace {
       return;
     }
     if (slot < 0) {
+      count_slot_census(nullptr);
       g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       back->Release();
       return;
@@ -4508,6 +4571,7 @@ namespace {
 
     // One capture at a time; a concurrent Present elsewhere just skips
     if (!TryAcquireSRWLockExclusive(&g_capture_lock)) {
+      g_skip.capture_busy.fetch_add(1, std::memory_order_relaxed);
       g_block->frames_skipped.fetch_add(1, std::memory_order_relaxed);
       return;
     }
@@ -4572,6 +4636,7 @@ namespace {
         capture_frame12(swapchain, device12, hwnd, present_qpc, release_qpc, &prepared);
         device12->Release();
         if (prepared.valid) {
+          g_skip.armed.fetch_add(1, std::memory_order_relaxed);
           t_armed.armed = true;
           t_armed.swapchain = swapchain;
           t_armed.hwnd = hwnd;
@@ -4720,6 +4785,7 @@ namespace {
   // What one outermost Present does around the real call
   template<class F>
   HRESULT present_with_capture(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags, bool partial, F &&real) {
+    skip_stats_tick();
     if (flags & DXGI_PRESENT_TEST) {
       const HRESULT hr = real(sync_interval);
       if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
