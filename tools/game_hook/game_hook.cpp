@@ -3610,6 +3610,18 @@ namespace {
     reflex_report_stage(line, sizeof(line), used, "gpu-active", gpu_active);
     reflex_report_stage(line, sizeof(line), used, "sim->gpu-end", sim_to_gpu_end);
     log("Reflex latency, %d of 64 frames complete (ms, p50/p90):%s", complete, used ? line : " none");
+
+    // Which clock the report's microseconds count on: QPC in microseconds
+    // puts the newest GPU end a few frames before now
+    std::uint64_t newest = 0;
+    for (const auto &f : report.frames) {
+      newest = std::max(newest, f.gpu_render_end);
+    }
+    const auto qpc = qpc_now(), freq = qpc_frequency();
+    const auto now_us = qpc / freq * 1'000'000ull + qpc % freq * 1'000'000ull / freq;
+    log("Reflex clock: newest gpu end %llu us, QPC now %llu us (now - newest %.3f ms)",
+        static_cast<unsigned long long>(newest), static_cast<unsigned long long>(now_us),
+        (static_cast<double>(now_us) - static_cast<double>(newest)) / 1000.0);
   }
 
   void reflex_stats_tick(IUnknown *device) {
