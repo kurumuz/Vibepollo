@@ -40,8 +40,12 @@ namespace nvenc {
     // Allocate more bitrate to frames with more motion, reduces block-artefact pulsing in moving scenes
     bool temporal_aq = false;
 
-    // Feed a DLSS game's own motion vectors (game capture) to the encoder as motion-estimation hints
-    bool motion_hints = false;
+    // Feed a DLSS game's own motion vectors (game capture) to the encoder as
+    // motion-estimation hints. On by default: no gain where NVENC's own search
+    // finds the motion (camera turns, perspective roads), +1.1-1.3 dB where it
+    // fails (fast top-down scrolling over repetitive texture, 128-256 px/frame
+    // at 4K) and +3-5 dB on small fast objects (tools/nvenc_hints_bench)
+    bool motion_hints = true;
 
     // A/B testing of motion_hints: when nonzero, the hints are withheld (every
     // block marked invalid, as on a picture without hints) in every other
