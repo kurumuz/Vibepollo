@@ -43,6 +43,11 @@ namespace nvenc {
     // Feed a DLSS game's own motion vectors (game capture) to the encoder as motion-estimation hints
     bool motion_hints = false;
 
+    // A/B testing of motion_hints: when nonzero, the hints are withheld (every
+    // block marked invalid, as on a picture without hints) in every other
+    // period of this many seconds. The frames' ENCODER_HINTS flag tells which.
+    int motion_hints_ab_s = 0;
+
     // Don't use QP below certain value, limits peak image quality to save bitrate
     bool enable_min_qp = false;
 

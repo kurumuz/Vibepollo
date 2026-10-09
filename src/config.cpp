@@ -1608,6 +1608,7 @@ namespace config {
     bool_f(vars, "nvenc_spatial_aq", video.nv.adaptive_quantization);
     bool_f(vars, "nvenc_temporal_aq", video.nv.temporal_aq);
     bool_f(vars, "nvenc_motion_hints", video.nv.motion_hints);
+    int_between_f(vars, "nvenc_motion_hints_ab_s", video.nv.motion_hints_ab_s, {0, 3600});
     generic_f(vars, "nvenc_split_encode", video.nv.split_encode_mode, nv::split_encode_mode_from_view);
     generic_f(vars, "nvenc_twopass", video.nv.two_pass, nv::twopass_from_view);
     bool_f(vars, "nvenc_h264_cavlc", video.nv.h264_cavlc);
@@ -2424,6 +2425,7 @@ namespace config {
         "nvenc_spatial_aq",
         "nvenc_temporal_aq",
         "nvenc_motion_hints",
+        "nvenc_motion_hints_ab_s",
         "motion_sideband",
         "render_scale",
         "nvenc_split_encode",

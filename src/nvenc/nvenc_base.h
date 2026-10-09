@@ -204,6 +204,7 @@ namespace nvenc {
     bool pack_motion_hints(bool use_pending);  ///< whether the set carries the pending hints
 
     bool motion_hints_enabled = false;  ///< the encoder accepted external motion hints
+    int motion_hints_ab_s = 0;  ///< nvenc_config::motion_hints_ab_s
     bool rfi_since_last_frame = false;  ///< a reference was invalidated: the next frame's reference is not the previous frame
     bool first_frame_after_init = true;  ///< no reference yet: no hint set
     motion_hints_t pending_motion_hints;

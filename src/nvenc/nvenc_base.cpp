@@ -8,6 +8,7 @@
 
 // standard includes
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -726,6 +727,7 @@ namespace nvenc {
     // of each 64x64 superblock (AV1), L0 only. An encoder that refuses them
     // is set up again without.
     motion_hints_enabled = false;
+    motion_hints_ab_s = config.motion_hints_ab_s;
     first_frame_after_init = true;
     if (config.motion_hints && !api::api_version_less(selected_api_version, api::make_api_version(12U, 0U))) {
       init_params.enableExternalMEHints = 1;
@@ -1062,7 +1064,13 @@ namespace nvenc {
     const bool use_hints = motion_hints_enabled && !force_idr && !first_frame_after_init;
     bool hinted = false;
     if (use_hints) {
-      hinted = pack_motion_hints(!rfi_since_last_frame);
+      bool withheld = false;
+      if (motion_hints_ab_s > 0) {
+        // (A/B: hints withheld in every other period)
+        const auto s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        withheld = (s / motion_hints_ab_s) % 2 != 0;
+      }
+      hinted = pack_motion_hints(!rfi_since_last_frame && !withheld);
     }
     pending_motion_hints = {};
     rfi_since_last_frame = false;
