@@ -3627,7 +3627,8 @@ namespace {
     IUnknown *held = nullptr;  ///< game_device, referenced while a cap is installed
     std::uint32_t applied_us = 0;  ///< the cap the driver has from us (0: the game's own parameters)
     std::uint64_t last_poll_qpc = 0;
-    bool rise_seen = false;  ///< the previous poll wanted a raise too
+    std::uint32_t gpu_recent[4] = {};  ///< the last polls' GPU times (0: none)
+    std::uint32_t gpu_recent_next = 0;
     // Read anywhere
     std::atomic<std::uint32_t> target_us {0};  ///< the cap wanted (0: none)
     std::atomic<std::uint32_t> installed_us {0};  ///< applied_us when known, for Present
@@ -3726,7 +3727,7 @@ namespace {
                          reinterpret_cast<std::uintptr_t>(device) == c.game_device;
     if (!enabled) {
       c.target_us.store(0, std::memory_order_relaxed);
-      c.rise_seen = false;
+      std::fill(std::begin(c.gpu_recent), std::end(c.gpu_recent), 0u);
     } else if (!c.last_poll_qpc || now < c.last_poll_qpc || now - c.last_poll_qpc >= freq) {
       c.last_poll_qpc = now;
       static nv_latency_result_params_t report;  // (under the lock)
@@ -3742,31 +3743,24 @@ namespace {
         if (active.size() >= 16) {
           std::sort(active.begin(), active.end());
           c.gpu_us.store(active[active.size() * 3 / 4], std::memory_order_relaxed);
+          c.gpu_recent[c.gpu_recent_next++ % std::size(c.gpu_recent)] = active[active.size() * 3 / 4];
         }
       }
       // The cap: the GPU time plus the headroom, between the stream's rate
-      // and 30 fps. A raise must show on two polls in a row and goes at most
-      // 25% a poll (a burst of heavy frames is not the game's new load); a
-      // fall follows at once when large (the game got lighter: a loading
-      // screen over) and 2% a poll when small (no hunting on noise).
-      const auto gpu = c.gpu_us.load(std::memory_order_relaxed);
+      // and 30 fps. The GPU time is the highest of the last four polls: one
+      // poll's p75 swings by ~2 ms (Witcher 3: 11 / 13 ms alternating), and
+      // a cap under the heavier half queues again. So the cap rises at once;
+      // it falls at once when the fall is large (the game got lighter: a
+      // loading screen over) and 2% a poll when small (no hunting on noise).
+      const auto gpu = *std::max_element(std::begin(c.gpu_recent), std::end(c.gpu_recent));
       const auto desired = std::clamp(gpu ? gpu + headroom_us : stream_us, stream_us, std::max(stream_us, kReflexCapMaxUs));
       auto cur = c.target_us.load(std::memory_order_relaxed);
-      if (!cur) {
+      if (!cur || desired > cur) {
         cur = desired;
-        c.rise_seen = false;
-      } else if (desired > cur) {
-        if (c.rise_seen) {
-          cur = std::min(desired, cur + cur / 4);
-        }
-        c.rise_seen = true;
-      } else {
-        c.rise_seen = false;
-        if (desired < cur - cur / 5) {
-          cur = desired;
-        } else if (desired < cur - cur * 3 / 100) {
-          cur = std::max(desired, cur - cur * 2 / 100);
-        }
+      } else if (desired < cur - cur / 5) {
+        cur = desired;
+      } else if (desired < cur - cur * 3 / 100) {
+        cur = std::max(desired, cur - cur * 2 / 100);
       }
       c.target_us.store(cur, std::memory_order_relaxed);
     }
@@ -3799,7 +3793,7 @@ namespace {
     IUnknown *drop = nullptr;
     if (const auto fresh = qpc_now(); c.applied_us && !(reflex_cap_sleeping(fresh, 1) && reflex_cap_stream_us(fresh))) {
       c.target_us.store(0, std::memory_order_relaxed);
-      c.rise_seen = false;
+      std::fill(std::begin(c.gpu_recent), std::end(c.gpu_recent), 0u);
       drop = reflex_cap_apply_locked(c.held, 0);
       if (g_block) {
         g_block->reflex_cap_us.store(c.installed_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -3822,7 +3816,7 @@ namespace {
     c.game_device = 0;
     c.applied_us = 0;
     c.target_us.store(0, std::memory_order_relaxed);
-    c.rise_seen = false;
+    std::fill(std::begin(c.gpu_recent), std::end(c.gpu_recent), 0u);
     c.installed_us.store(0, std::memory_order_relaxed);
     c.owed.store(false, std::memory_order_relaxed);
     if (g_block) {
