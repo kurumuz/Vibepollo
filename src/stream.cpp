@@ -2278,9 +2278,11 @@ namespace stream {
           return std::chrono::duration_cast<std::chrono::microseconds>(*t - ref).count();
         };
         // A cached repeat is retimed: the original frame's stages no longer
-        // relate to its timestamp
+        // relate to its timestamp. (Compared with the capture timestamp,
+        // before any snapping onto the encode grid; offsets are from the
+        // timestamp on the wire.)
         static const platf::game_frame_times_t no_game_times;
-        const auto &game = packet->game_times.timestamp == ref ? packet->game_times : no_game_times;
+        const auto &game = packet->game_times.timestamp && packet->game_times.timestamp == packet->capture_timestamp ? packet->game_times : no_game_times;
         const std::optional<std::int64_t> offsets[motion_sideband::kHostTimingValues] = {
           offset(game.present),
           offset(game.gpu_done),
