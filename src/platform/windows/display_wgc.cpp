@@ -538,8 +538,12 @@ namespace platf::dxgi {
         }
         return host_processing_timestamp - qpc_time_difference(now_qpc, static_cast<int64_t>(qpc));
       };
-      img->game_present_timestamp = at(frame.present_qpc);
-      img->game_gpu_done_timestamp = at(frame.gpu_done_qpc);
+      img->game_times.present = at(frame.present_qpc);
+      img->game_times.gpu_done = at(frame.gpu_done_qpc);
+      img->game_times.reflex_start = frame.reflex_start;
+      img->game_times.sim_end = at(frame.sim_end_qpc);
+      img->game_times.submit_start = at(frame.submit_start_qpc);
+      img->game_times.submit_end = at(frame.submit_end_qpc);
     }
     if (frame.gpu_done_qpc) {
       const auto now_qpc = qpc_counter();

@@ -2277,12 +2277,17 @@ namespace stream {
           }
           return std::chrono::duration_cast<std::chrono::microseconds>(*t - ref).count();
         };
+        const auto &game = packet->game_times;
         const std::optional<std::int64_t> offsets[motion_sideband::kHostTimingValues] = {
-          offset(packet->game_present_timestamp),
-          offset(packet->game_gpu_done_timestamp),
+          offset(game.present),
+          offset(game.gpu_done),
           offset(packet->host_processing_timestamp),
           offset(packet->packet_enqueue_timestamp),
           offset(std::chrono::steady_clock::now()),
+          offset(game.sim_end),
+          offset(game.submit_start),
+          offset(game.submit_end),
+          game.reflex_start ? motion_sideband::kHostTimingReflexStart : 0,
         };
         payload_with_timing.reserve(payload.size() + 32);
         payload_with_timing.insert(payload_with_timing.end(), payload.begin(), payload.end());

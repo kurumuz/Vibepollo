@@ -1205,6 +1205,14 @@ namespace {
     return hwnd == foreground || GetAncestor(hwnd, GA_ROOT) == foreground;
   }
 
+  // The Reflex stages of the frame whose Present is in progress on this
+  // thread (reflex_stages_for_present; empty when the game sets no markers,
+  // or they do not line up), for write_slot_record
+  struct reflex_stages_t {
+    std::uint64_t sim_start = 0, sim_end = 0, submit_start = 0, submit_end = 0;
+  };
+  thread_local reflex_stages_t t_reflex_stages;
+
   // Rewrites a slot's shared record while this thread owns the slot (its
   // keyed mutex or owner word), before the copy: a host that holds the slot
   // and reads an even record reads the metadata of exactly its pixels.
@@ -1223,6 +1231,13 @@ namespace {
     record.present_qpc.store(present_qpc, std::memory_order_relaxed);
     record.release_qpc.store(release_qpc, std::memory_order_relaxed);
     record.gpu_done_qpc.store(0, std::memory_order_relaxed);
+    // (the Present in progress on this thread: see reflex_stages_for_present)
+    const auto &reflex = t_reflex_stages;
+    const bool reflex_start = reflex.sim_start && reflex.sim_start == release_qpc;
+    record.reflex_start.store(reflex_start ? 1u : 0u, std::memory_order_relaxed);
+    record.sim_end_qpc.store(reflex_start ? reflex.sim_end : 0, std::memory_order_relaxed);
+    record.submit_start_qpc.store(reflex_start ? reflex.submit_start : 0, std::memory_order_relaxed);
+    record.submit_end_qpc.store(reflex_start ? reflex.submit_end : 0, std::memory_order_relaxed);
     const auto bits = [](float f) {
       std::uint32_t u;
       std::memcpy(&u, &f, sizeof(u));
@@ -3676,9 +3691,75 @@ namespace {
     return result;
   }
 
+  // Each Reflex frame's CPU markers, stamped on QPC as the game sets them:
+  // a frame's SIMULATION_START is when it really began (after any Reflex
+  // sleep, which our limiter release comes before), and becomes its content
+  // time. Indexed by frame ID; the Present that shows a frame is the one
+  // after its PRESENT_START.
+  constexpr int kReflexFrames = 64;
+  struct reflex_frame_t {
+    std::atomic<std::uint64_t> frame_id {0};
+    std::atomic<std::uint64_t> sim_start {0}, sim_end {0}, submit_start {0}, submit_end {0};
+  };
+  reflex_frame_t g_reflex_frames[kReflexFrames];
+  std::atomic<std::uint64_t> g_reflex_presenting {0};  ///< PRESENT_START's frame ID + 1 (0: none yet)
+  std::atomic<std::uint64_t> g_reflex_presenting_qpc {0};
+
+  void reflex_stamp(std::uint64_t frame_id, std::uint32_t marker) {
+    const auto now = qpc_now();
+    auto &f = g_reflex_frames[frame_id % kReflexFrames];
+    switch (marker) {
+      case 0:  // SIMULATION_START: a new frame takes the entry
+        f.frame_id.store(frame_id, std::memory_order_relaxed);
+        f.sim_end.store(0, std::memory_order_relaxed);
+        f.submit_start.store(0, std::memory_order_relaxed);
+        f.submit_end.store(0, std::memory_order_relaxed);
+        f.sim_start.store(now, std::memory_order_release);
+        break;
+      case 1:  // SIMULATION_END
+      case 2:  // RENDERSUBMIT_START
+      case 3:  // RENDERSUBMIT_END
+        if (f.frame_id.load(std::memory_order_acquire) == frame_id) {
+          (marker == 1 ? f.sim_end : marker == 2 ? f.submit_start : f.submit_end).store(now, std::memory_order_relaxed);
+        }
+        break;
+      case 4:  // PRESENT_START: the next Present shows this frame
+        g_reflex_presenting_qpc.store(now, std::memory_order_relaxed);
+        g_reflex_presenting.store(frame_id + 1, std::memory_order_release);
+        break;
+      default:
+        break;
+    }
+  }
+
+  // The frame a Present now in progress shows: the last PRESENT_START came
+  // just before (within a tenth of a second), and that frame's simulation
+  // started before it and not long ago
+  reflex_stages_t reflex_stages_for_present(std::uint64_t now) {
+    reflex_stages_t s;
+    const auto presenting = g_reflex_presenting.load(std::memory_order_acquire);
+    const auto presenting_qpc = g_reflex_presenting_qpc.load(std::memory_order_relaxed);
+    const auto freq = qpc_frequency();
+    if (!presenting || !presenting_qpc || presenting_qpc > now || now - presenting_qpc > freq / 10) {
+      return s;
+    }
+    const auto id = presenting - 1;
+    const auto &f = g_reflex_frames[id % kReflexFrames];
+    const auto start = f.sim_start.load(std::memory_order_acquire);
+    if (f.frame_id.load(std::memory_order_relaxed) != id || !start || start > presenting_qpc || presenting_qpc - start > freq) {
+      return s;
+    }
+    s.sim_start = start;
+    s.sim_end = f.sim_end.load(std::memory_order_relaxed);
+    s.submit_start = f.submit_start.load(std::memory_order_relaxed);
+    s.submit_end = f.submit_end.load(std::memory_order_relaxed);
+    return s;
+  }
+
   int __cdecl hook_nv_latency_marker(IUnknown *device, nv_latency_marker_params_t *params) {
     if (params && (params->version & 0xffff) >= sizeof(nv_latency_marker_params_t) && params->marker_type < kReflexMarkerTypes) {
       g_reflex.markers[params->marker_type].fetch_add(1, std::memory_order_relaxed);
+      reflex_stamp(params->frame_id, params->marker_type);
     }
     const int result = g_real_nv_latency_marker(device, params);
     // (with Reflex off a game may never call Sleep, but still sets markers;
@@ -5124,7 +5205,12 @@ namespace {
       swapchain3->Release();
     }
 
-    capture_frame(swapchain, now, release, partial);
+    // A Reflex game's frame began at its SIMULATION_START, after any Reflex
+    // sleep; our limiter release (before that sleep) is only the earliest it
+    // could have
+    t_reflex_stages = reflex_stages_for_present(now);
+    capture_frame(swapchain, now, t_reflex_stages.sim_start ? t_reflex_stages.sim_start : release, partial);
+    t_reflex_stages = {};
 
     // Paced, the game must not also wait for the host display's vblank. For
     // a D3D12 swapchain the queue DXGI submits on during this call is the

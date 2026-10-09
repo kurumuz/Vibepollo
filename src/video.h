@@ -335,9 +335,7 @@ namespace video {
     uint32_t motion_sideband_interval_us = 0;  ///< between the field's two game frames (0: unknown)
     bool game_frame = false;  ///< captured from the game's own Present (in-game capture)
     bool encoder_motion_hints = false;  ///< encoded with the game's motion vectors as hints
-    // In-game capture: the game's Present and the GPU finishing the frame
-    std::optional<std::chrono::steady_clock::time_point> game_present_timestamp;
-    std::optional<std::chrono::steady_clock::time_point> game_gpu_done_timestamp;
+    platf::game_frame_times_t game_times;  ///< in-game capture: where the frame's time went in the game
   };
 
   struct packet_raw_avcodec: packet_raw_t {

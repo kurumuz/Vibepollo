@@ -31,6 +31,9 @@ namespace platf::dxgi::game_capture {
     std::uint64_t present_qpc = 0;  ///< validated: within the last second
     std::uint64_t gpu_done_qpc = 0;  ///< 0 when the hook had no fence
     std::uint64_t release_qpc = 0;  ///< the limiter release that started the frame (0 = not paced)
+    // NVIDIA Reflex games: release_qpc is then the frame's SIMULATION_START
+    bool reflex_start = false;
+    std::uint64_t sim_end_qpc = 0, submit_start_qpc = 0, submit_end_qpc = 0;  ///< 0 = none
 
     // The game's DLSS motion vectors for this frame (see protocol.h), held
     // with the frame; null: none. Candidate set i starts at row

@@ -2124,8 +2124,7 @@ namespace platf::dxgi {
     int convert(platf::img_t &img_base) override {
       const int result = base.convert(img_base);
       last_converted_game_frame = result == 0 && static_cast<img_d3d_t &>(img_base).game_frame_id != 0;
-      last_game_present = last_converted_game_frame ? img_base.game_present_timestamp : std::nullopt;
-      last_game_gpu_done = last_converted_game_frame ? img_base.game_gpu_done_timestamp : std::nullopt;
+      last_game_times = last_converted_game_frame ? img_base.game_times : platf::game_frame_times_t {};
       if (result == 0 && (config::video.nv.motion_hints || motion_sideband)) {
         set_motion_hints(static_cast<img_d3d_t &>(img_base));
       }
@@ -2136,9 +2135,8 @@ namespace platf::dxgi {
       return last_converted_game_frame;
     }
 
-    void converted_game_times(std::optional<std::chrono::steady_clock::time_point> *present, std::optional<std::chrono::steady_clock::time_point> *gpu_done) const override {
-      *present = last_game_present;
-      *gpu_done = last_game_gpu_done;
+    platf::game_frame_times_t converted_game_times() const override {
+      return last_game_times;
     }
 
     std::vector<std::uint8_t> take_motion_sideband(std::uint32_t *interval_us) override {
@@ -2320,7 +2318,7 @@ namespace platf::dxgi {
     int sideband_log_frames = 0;
     std::uint64_t last_game_frame_id = 0;
     bool last_converted_game_frame = false;
-    std::optional<std::chrono::steady_clock::time_point> last_game_present, last_game_gpu_done;
+    platf::game_frame_times_t last_game_times;
     std::uint32_t encode_width = 0;
     std::uint32_t encode_height = 0;
     d3d_base_encode_device base;

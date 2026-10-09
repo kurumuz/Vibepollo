@@ -79,7 +79,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 15;
+  constexpr std::uint32_t kVersion = 16;
   constexpr int kSlots = 4;  ///< host-held, latest publication, copy in flight behind a GPU-bound frame, and one to write
   constexpr int kMotionCandidates = 3;  ///< vector sets a slot's motion texture holds (see the top comment)
   constexpr std::size_t kErrorLength = 320;
@@ -184,6 +184,13 @@ namespace game_capture {
     std::atomic<std::uint32_t> motion_height[kMotionCandidates];
     std::atomic<std::uint32_t> motion_scale_x[kMotionCandidates];  ///< float bits: DLSS's MV.Scale (vector = stored value * scale)
     std::atomic<std::uint32_t> motion_scale_y[kMotionCandidates];
+    // NVIDIA Reflex games: the frame's latency markers, stamped by the hook
+    // (QueryPerformanceCounter; 0 = none). release_qpc is then its
+    // simulation start.
+    std::atomic<std::uint32_t> reflex_start;  ///< 1: release_qpc is the frame's SIMULATION_START
+    std::atomic<std::uint64_t> sim_end_qpc;
+    std::atomic<std::uint64_t> submit_start_qpc;
+    std::atomic<std::uint64_t> submit_end_qpc;
   };
 
   inline std::uint64_t make_latest(std::uint32_t slot, std::uint32_t version) {

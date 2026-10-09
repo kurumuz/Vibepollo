@@ -363,7 +363,12 @@ namespace platf::dxgi::game_capture {
       return f;
     }
 
-    bool read_slot(const gc::slot_record_t &record, std::uint32_t &version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc, std::uint64_t &release_qpc, slot_motion_t &motion) {
+    struct slot_reflex_t {
+      bool start = false;  ///< release_qpc is the frame's SIMULATION_START
+      std::uint64_t sim_end_qpc = 0, submit_start_qpc = 0, submit_end_qpc = 0;
+    };
+
+    bool read_slot(const gc::slot_record_t &record, std::uint32_t &version, std::uint32_t &generation, gc::color_space_e &color_space, std::uint64_t &frame_id, std::uint64_t &present_qpc, std::uint64_t &gpu_done_qpc, std::uint64_t &release_qpc, slot_motion_t &motion, slot_reflex_t &reflex) {
       for (int attempt = 0; attempt < 8; ++attempt) {
         const auto s1 = record.seq.load(std::memory_order_acquire);
         if (s1 & 1u) {
@@ -375,6 +380,10 @@ namespace platf::dxgi::game_capture {
         present_qpc = record.present_qpc.load(std::memory_order_relaxed);
         gpu_done_qpc = record.gpu_done_qpc.load(std::memory_order_relaxed);
         release_qpc = record.release_qpc.load(std::memory_order_relaxed);
+        reflex.start = record.reflex_start.load(std::memory_order_relaxed) != 0;
+        reflex.sim_end_qpc = record.sim_end_qpc.load(std::memory_order_relaxed);
+        reflex.submit_start_qpc = record.submit_start_qpc.load(std::memory_order_relaxed);
+        reflex.submit_end_qpc = record.submit_end_qpc.load(std::memory_order_relaxed);
         motion.id = record.motion_id.load(std::memory_order_relaxed);
         motion.out_width = record.motion_out_width.load(std::memory_order_relaxed);
         motion.out_height = record.motion_out_height.load(std::memory_order_relaxed);
@@ -406,6 +415,13 @@ namespace platf::dxgi::game_capture {
         if (release_qpc != 0 && (!plausible(release_qpc) || release_qpc > present_qpc)) {
           release_qpc = 0;
         }
+        // (Reflex stages: between the frame's start and its Present)
+        for (auto *qpc : {&reflex.sim_end_qpc, &reflex.submit_start_qpc, &reflex.submit_end_qpc}) {
+          if (*qpc != 0 && (!release_qpc || *qpc < release_qpc || *qpc > present_qpc)) {
+            *qpc = 0;
+          }
+        }
+        reflex.start = reflex.start && release_qpc != 0;
         version = s1 >> 1;
         color_space = static_cast<gc::color_space_e>(cs);
         return true;
@@ -1108,7 +1124,8 @@ namespace platf::dxgi::game_capture {
       gc::color_space_e color_space;
       std::uint64_t frame_id, present_qpc, gpu_done_qpc, release_qpc;
       slot_motion_t motion;
-      const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc, release_qpc, motion);
+      slot_reflex_t reflex;
+      const bool valid = read_slot(t->block->slots[slot], record_version, generation, color_space, frame_id, present_qpc, gpu_done_qpc, release_qpc, motion, reflex);
       if (!valid || record_version != version) {
         release();
         if (!valid) {
@@ -1151,6 +1168,10 @@ namespace platf::dxgi::game_capture {
       frame.present_qpc = present_qpc;
       frame.gpu_done_qpc = gpu_done_qpc;
       frame.release_qpc = release_qpc;
+      frame.reflex_start = reflex.start;
+      frame.sim_end_qpc = reflex.sim_end_qpc;
+      frame.submit_start_qpc = reflex.submit_start_qpc;
+      frame.submit_end_qpc = reflex.submit_end_qpc;
       // Its vectors, if the generation has motion textures and the record
       // describes a region inside them
       frame.motion = nullptr;

@@ -342,6 +342,19 @@ namespace platf {
     virtual ~deinit_t() = default;
   };
 
+  /**
+   * @brief In-game capture: when a frame's stages happened in the game.
+   */
+  struct game_frame_times_t {
+    std::optional<std::chrono::steady_clock::time_point> present;  ///< the game's Present
+    std::optional<std::chrono::steady_clock::time_point> gpu_done;  ///< the GPU finished it (the hook's copy completing)
+    // NVIDIA Reflex games, from the game's latency markers
+    bool reflex_start = false;  ///< the frame timestamp is its SIMULATION_START
+    std::optional<std::chrono::steady_clock::time_point> sim_end;
+    std::optional<std::chrono::steady_clock::time_point> submit_start;
+    std::optional<std::chrono::steady_clock::time_point> submit_end;
+  };
+
   struct img_t: std::enable_shared_from_this<img_t> {
   public:
     img_t() = default;
@@ -360,9 +373,7 @@ namespace platf {
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
     std::optional<std::chrono::steady_clock::time_point> capture_pacing_timestamp;
-    // In-game capture: the game's Present and the GPU finishing the frame
-    std::optional<std::chrono::steady_clock::time_point> game_present_timestamp;
-    std::optional<std::chrono::steady_clock::time_point> game_gpu_done_timestamp;
+    game_frame_times_t game_times;  ///< in-game capture: where the frame's time went in the game
 
     virtual ~img_t() = default;
   };
@@ -462,12 +473,11 @@ namespace platf {
     }
 
     /**
-     * @brief The frame converted last: its game Present and GPU completion
+     * @brief Where the frame converted last spent its time in the game
      *        (in-game capture; empty otherwise).
      */
-    virtual void converted_game_times(std::optional<std::chrono::steady_clock::time_point> *present, std::optional<std::chrono::steady_clock::time_point> *gpu_done) const {
-      present->reset();
-      gpu_done->reset();
+    virtual game_frame_times_t converted_game_times() const {
+      return {};
     }
 
     nvenc::nvenc_base *nvenc = nullptr;

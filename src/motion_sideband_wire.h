@@ -147,17 +147,22 @@ namespace motion_sideband {
   // ML_FF_HOST_TIMING answered: old clients would hand the tail to their
   // decoder). Flagged frames end in, after any motion sideband,
   //
-  //     5 values (5 bytes each, as above) | 'H' 'T' 'S' '1'
+  //     9 values (5 bytes each, as above) | 'H' 'T' 'S' '2'
   //
   // then possibly zero padding: the game's Present, the GPU finishing the
-  // frame, the host picking it up, the encode done and the frame packetized,
-  // each in microseconds from the frame's RTP timestamp, biased by 2^31
-  // (0: unknown). No zero bytes, so no start code forms.
+  // frame, the host picking it up, the encode done, the frame packetized,
+  // and from an NVIDIA Reflex game's latency markers its simulation end,
+  // render submit start and render submit end -- each in microseconds from
+  // the frame's RTP timestamp, biased by 2^31 (0: unknown) -- then flags
+  // (biased likewise; bit 0: the RTP timestamp is the frame's Reflex
+  // SIMULATION_START rather than our limiter's release). No zero bytes, so
+  // no start code forms. ('H' 'T' 'S' '1': the first five values alone.)
   constexpr std::uint32_t SS_FF_HOST_TIMING = 0x02000000;
   constexpr std::uint32_t ML_FF_HOST_TIMING = 0x02000000;
   constexpr std::uint8_t VIDEO_PACKET_EXTRA_FLAG_HOST_TIMING = 0x20;
-  constexpr std::uint8_t kHostTimingMagic[4] = {'H', 'T', 'S', '1'};
-  constexpr int kHostTimingValues = 5;
+  constexpr std::uint8_t kHostTimingMagic[4] = {'H', 'T', 'S', '2'};
+  constexpr int kHostTimingValues = 9;
+  constexpr std::int64_t kHostTimingReflexStart = 1;  ///< flags: the timestamp is the Reflex SIMULATION_START
 
   inline std::uint32_t host_timing_value(std::optional<std::int64_t> offset_us) {
     if (!offset_us) {
