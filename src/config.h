@@ -256,6 +256,15 @@ namespace config {
     bool game_capture = false;
     bool game_capture_limiter = true;  // pace hooked games at the stream rate from inside Present (front edge), instead of RTSS
     bool game_capture_gpu_release = true;  // the limiter also waits for the GPU to finish the previous frame (at most one frame queued)
+    // The host's GPU scheduling: by default the HIGH process class and a
+    // relative +7 context priority on every device. True restores Sunshine's:
+    // the REALTIME class (HIGH under HAGS unless nvenc_realtime_hags) and an
+    // absolute hard-realtime priority (30) on the encoder device -- which, in
+    // a benchmark against a GPU-bound game on an RTX 4090 with HAGS, cost the
+    // game 2.6x as much per frame (+0.77 vs +0.29 ms for 0.44 ms of work),
+    // stalled it 15-45 ms several times a minute, and made the host's own
+    // work finish later at the tail (p99 3.3 vs 1.0 ms).
+    bool gpu_hard_realtime = false;
     // Send each game frame's motion field (the DLSS vectors per 16x16 block of
     // the encoded picture, MVC2-compressed on the GPU) with the frame, to
     // clients that ask for it (ML_FF_MOTION_SIDEBAND): they warp the last frame

@@ -1527,9 +1527,12 @@ namespace platf::dxgi {
         return -1;
       }
 
-      status = dxgi->SetGPUThreadPriority(0x4000001E);
+      // (absolute hard realtime only on request: see config::video.gpu_hard_realtime)
+      status = config::video.gpu_hard_realtime ? dxgi->SetGPUThreadPriority(0x4000001E) : E_FAIL;
       if (FAILED(status)) {
-        BOOST_LOG(info) << "Failed to request absoloute encoding GPU thread priority. Trying relative priority.";
+        if (config::video.gpu_hard_realtime) {
+          BOOST_LOG(info) << "Failed to request absoloute encoding GPU thread priority. Trying relative priority.";
+        }
         status = dxgi->SetGPUThreadPriority(7);
         if (FAILED(status)) {
           BOOST_LOG(warning) << "Failed to request relative encoding GPU thread priority. Please run application as administrator for optimal performance.";

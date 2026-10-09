@@ -1133,6 +1133,12 @@ namespace platf::dxgi {
               priority = D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH;
             }
           }
+          if (!config::video.gpu_hard_realtime) {
+            // (see config::video.gpu_hard_realtime: HIGH without an absolute
+            // context priority interferes least with the game for the same
+            // or better latency of our own work)
+            priority = D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH;
+          }
           BOOST_LOG(info) << "Active GPU has HAGS " << (hags_enabled ? "enabled" : "disabled");
           BOOST_LOG(info) << "Using " << (priority == D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH ? "high" : "realtime") << " GPU priority";
           if (FAILED(d3dkmt_set_process_priority(GetCurrentProcess(), priority))) {

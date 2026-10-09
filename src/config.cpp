@@ -1685,6 +1685,7 @@ namespace config {
     bool_f(vars, "game_capture", video.game_capture);
     bool_f(vars, "game_capture_limiter", video.game_capture_limiter);
     bool_f(vars, "game_capture_gpu_release", video.game_capture_gpu_release);
+    bool_f(vars, "gpu_hard_realtime", video.gpu_hard_realtime);
     bool_f(vars, "motion_sideband", video.motion_sideband);
     int_between_f(vars, "render_scale", video.render_scale, {100, 400});
     bool_f(vars, "wgc_pacing_smoothing", video.wgc_pacing_smoothing);
