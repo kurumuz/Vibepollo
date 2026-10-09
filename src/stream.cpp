@@ -2265,6 +2265,31 @@ namespace stream {
         payload = {(char *) payload_with_sideband.data(), payload_with_sideband.size()};
       }
 
+      // Host timing rides last (motion_sideband_wire.h): offsets from the
+      // frame's timestamp, which a duplicate does not have yet
+      std::vector<uint8_t> payload_with_timing;
+      const bool has_host_timing = session->config.monitor.host_timing && packet->frame_timestamp.has_value();
+      if (has_host_timing) {
+        const auto ref = *packet->frame_timestamp;
+        const auto offset = [&](const std::optional<std::chrono::steady_clock::time_point> &t) -> std::optional<std::int64_t> {
+          if (!t) {
+            return std::nullopt;
+          }
+          return std::chrono::duration_cast<std::chrono::microseconds>(*t - ref).count();
+        };
+        const std::optional<std::int64_t> offsets[motion_sideband::kHostTimingValues] = {
+          offset(packet->game_present_timestamp),
+          offset(packet->game_gpu_done_timestamp),
+          offset(packet->host_processing_timestamp),
+          offset(packet->packet_enqueue_timestamp),
+          offset(std::chrono::steady_clock::now()),
+        };
+        payload_with_timing.reserve(payload.size() + 32);
+        payload_with_timing.insert(payload_with_timing.end(), payload.begin(), payload.end());
+        motion_sideband::append_host_timing(payload_with_timing, offsets);
+        payload = {(char *) payload_with_timing.data(), payload_with_timing.size()};
+      }
+
       video_short_frame_header_t frame_header = {};
       frame_header.headerType = 0x01;  // Short header type
       frame_header.frameType = packet->is_idr()                     ? 2 :
@@ -2497,6 +2522,9 @@ namespace stream {
             }
             if (packet->encoder_motion_hints) {
               inspect->packet.extraFlags |= motion_sideband::VIDEO_PACKET_EXTRA_FLAG_ENCODER_HINTS;
+            }
+            if (has_host_timing) {
+              inspect->packet.extraFlags |= motion_sideband::VIDEO_PACKET_EXTRA_FLAG_HOST_TIMING;
             }
           }
 

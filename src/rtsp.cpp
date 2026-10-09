@@ -1280,6 +1280,8 @@ namespace rtsp_stream {
     }
     // Frames say whether they came from the game and fed its vectors to the encoder
     feature_flags |= motion_sideband::SS_FF_FRAME_SOURCE;
+    // ... and, to a client that answers ML_FF_HOST_TIMING, where their time went
+    feature_flags |= motion_sideband::SS_FF_HOST_TIMING;
     ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
     // Always request new control stream encryption if the client supports it
@@ -1522,6 +1524,10 @@ namespace rtsp_stream {
                                        (static_cast<std::uint32_t>(config.mlFeatureFlags) & motion_sideband::ML_FF_MOTION_SIDEBAND) != 0;
       if (config.monitor.motion_sideband) {
         BOOST_LOG(info) << "Motion sideband negotiated: frames carry their motion field"sv;
+      }
+      config.monitor.host_timing = (static_cast<std::uint32_t>(config.mlFeatureFlags) & motion_sideband::ML_FF_HOST_TIMING) != 0;
+      if (config.monitor.host_timing) {
+        BOOST_LOG(info) << "Host timing negotiated: frames carry their host stage times"sv;
       }
       config.frame_deadline_us = std::clamp((int) util::from_view(args.at("x-ml-video.frameDeadlineUs"sv)), 0, 1000000);
       config.audioQosType = (int) util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));

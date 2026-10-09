@@ -77,6 +77,10 @@ namespace video {
     // The client negotiated the motion sideband (motion_sideband_wire.h) and
     // the host has it enabled: frames carry their motion field.
     bool motion_sideband = false;
+
+    // The client negotiated host timing (motion_sideband_wire.h): frames
+    // carry where their time went on the host.
+    bool host_timing = false;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
@@ -331,6 +335,9 @@ namespace video {
     uint32_t motion_sideband_interval_us = 0;  ///< between the field's two game frames (0: unknown)
     bool game_frame = false;  ///< captured from the game's own Present (in-game capture)
     bool encoder_motion_hints = false;  ///< encoded with the game's motion vectors as hints
+    // In-game capture: the game's Present and the GPU finishing the frame
+    std::optional<std::chrono::steady_clock::time_point> game_present_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> game_gpu_done_timestamp;
   };
 
   struct packet_raw_avcodec: packet_raw_t {

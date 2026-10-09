@@ -360,6 +360,9 @@ namespace platf {
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
     std::optional<std::chrono::steady_clock::time_point> capture_pacing_timestamp;
+    // In-game capture: the game's Present and the GPU finishing the frame
+    std::optional<std::chrono::steady_clock::time_point> game_present_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> game_gpu_done_timestamp;
 
     virtual ~img_t() = default;
   };
@@ -456,6 +459,15 @@ namespace platf {
      */
     virtual bool converted_game_frame() const {
       return false;
+    }
+
+    /**
+     * @brief The frame converted last: its game Present and GPU completion
+     *        (in-game capture; empty otherwise).
+     */
+    virtual void converted_game_times(std::optional<std::chrono::steady_clock::time_point> *present, std::optional<std::chrono::steady_clock::time_point> *gpu_done) const {
+      present->reset();
+      gpu_done->reset();
     }
 
     nvenc::nvenc_base *nvenc = nullptr;

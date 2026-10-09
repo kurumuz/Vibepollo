@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace motion_sideband {
@@ -139,5 +140,37 @@ namespace motion_sideband {
     put_groups(out, static_cast<std::uint32_t>(out.size() - start));
     put_groups(out, interval_us);
     out.insert(out.end(), kMagic, kMagic + 4);
+  }
+
+  // Host timing (Vibepollo): where a frame's time went on the host, for the
+  // client's traces. Negotiated both ways (SS_FF_HOST_TIMING advertised,
+  // ML_FF_HOST_TIMING answered: old clients would hand the tail to their
+  // decoder). Flagged frames end in, after any motion sideband,
+  //
+  //     5 values (5 bytes each, as above) | 'H' 'T' 'S' '1'
+  //
+  // then possibly zero padding: the game's Present, the GPU finishing the
+  // frame, the host picking it up, the encode done and the frame packetized,
+  // each in microseconds from the frame's RTP timestamp, biased by 2^31
+  // (0: unknown). No zero bytes, so no start code forms.
+  constexpr std::uint32_t SS_FF_HOST_TIMING = 0x02000000;
+  constexpr std::uint32_t ML_FF_HOST_TIMING = 0x02000000;
+  constexpr std::uint8_t VIDEO_PACKET_EXTRA_FLAG_HOST_TIMING = 0x20;
+  constexpr std::uint8_t kHostTimingMagic[4] = {'H', 'T', 'S', '1'};
+  constexpr int kHostTimingValues = 5;
+
+  inline std::uint32_t host_timing_value(std::optional<std::int64_t> offset_us) {
+    if (!offset_us) {
+      return 0;
+    }
+    constexpr std::int64_t limit = 0x7ffffffe;
+    return static_cast<std::uint32_t>(std::clamp(*offset_us, -limit, limit) + 0x80000000ll);
+  }
+
+  inline void append_host_timing(std::vector<std::uint8_t> &out, const std::optional<std::int64_t> (&offsets_us)[kHostTimingValues]) {
+    for (const auto &offset : offsets_us) {
+      put_groups(out, host_timing_value(offset));
+    }
+    out.insert(out.end(), kHostTimingMagic, kHostTimingMagic + 4);
   }
 }  // namespace motion_sideband

@@ -530,6 +530,17 @@ namespace platf::dxgi {
     const std::uint64_t frame_qpc = frame.release_qpc ? frame.release_qpc : frame.gpu_done_qpc ? frame.gpu_done_qpc : frame.present_qpc;
     img->frame_timestamp = host_processing_timestamp - qpc_time_difference(qpc_counter(), static_cast<int64_t>(frame_qpc));
     img->host_processing_timestamp = host_processing_timestamp;
+    {
+      const auto now_qpc = qpc_counter();
+      const auto at = [&](std::uint64_t qpc) -> std::optional<std::chrono::steady_clock::time_point> {
+        if (!qpc) {
+          return std::nullopt;
+        }
+        return host_processing_timestamp - qpc_time_difference(now_qpc, static_cast<int64_t>(qpc));
+      };
+      img->game_present_timestamp = at(frame.present_qpc);
+      img->game_gpu_done_timestamp = at(frame.gpu_done_qpc);
+    }
     if (frame.gpu_done_qpc) {
       const auto now_qpc = qpc_counter();
       if (frame.release_qpc) {

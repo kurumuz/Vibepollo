@@ -830,6 +830,12 @@ namespace video {
       return device && device->converted_game_frame();
     }
 
+    void converted_game_times(std::optional<std::chrono::steady_clock::time_point> *present, std::optional<std::chrono::steady_clock::time_point> *gpu_done) const {
+      if (device) {
+        device->converted_game_times(present, gpu_done);
+      }
+    }
+
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
@@ -2304,6 +2310,7 @@ namespace video {
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
     packet->game_frame = session.converted_game_frame();
+    session.converted_game_times(&packet->game_present_timestamp, &packet->game_gpu_done_timestamp);
     packet->encoder_motion_hints = encoded_frame.motion_hints;
     packet->frame_timestamp = frame_timestamp;
     packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
