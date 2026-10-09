@@ -1072,6 +1072,7 @@ namespace nvenc {
       }
       hinted = pack_motion_hints(!rfi_since_last_frame && !withheld);
     }
+    hint_set_sent = use_hints;
     pending_motion_hints = {};
     rfi_since_last_frame = false;
     first_frame_after_init = false;
@@ -1161,6 +1162,25 @@ namespace nvenc {
       encoder_state.rfi_needs_confirmation,
       hinted,
     };
+
+    if (hint_set_sent && !encoded_frame.idr) {
+      auto &o = hint_outcomes[hinted ? 1 : 0];
+      o.frames++;
+      o.qp_sum += lock_bitstream.frameAvgQP;
+      o.bytes_sum += lock_bitstream.bitstreamSizeInBytes;
+      const auto now = std::chrono::steady_clock::now();
+      if (hint_outcomes_since == std::chrono::steady_clock::time_point {}) {
+        hint_outcomes_since = now;
+      } else if (now - hint_outcomes_since >= std::chrono::seconds(10)) {
+        auto line = [](const hint_outcomes_t &h) {
+          return h.frames ? std::format("{} frames, avg QP {:.2f}, avg {:.1f} KB", h.frames, double(h.qp_sum) / h.frames, double(h.bytes_sum) / h.frames / 1024.0) :
+                            std::string("none");
+        };
+        BOOST_LOG(info) << "NvEnc: motion hints, last 10 s: hinted " << line(hint_outcomes[1]) << "; without " << line(hint_outcomes[0]);
+        hint_outcomes[0] = hint_outcomes[1] = {};
+        hint_outcomes_since = now;
+      }
+    }
 
     if (encoder_state.rfi_needs_confirmation) {
       // Invalidation request has been fulfilled, and video network packet will be marked as such

@@ -20,6 +20,8 @@
 // local includes
 #include "nvenc_colorspace.h"
 #include "nvenc_config.h"
+
+#include <chrono>
 #include "nvenc_encoded_frame.h"
 #include "src/logging.h"
 #include "src/video.h"
@@ -205,6 +207,17 @@ namespace nvenc {
 
     bool motion_hints_enabled = false;  ///< the encoder accepted external motion hints
     int motion_hints_ab_s = 0;  ///< nvenc_config::motion_hints_ab_s
+    bool hint_set_sent = false;  ///< the picture being encoded carried a hint set (hinted or all invalid)
+
+    /// Predicted pictures by whether they carried the game's hints: their
+    /// average QP and size (at a constant bitrate, better prediction shows as
+    /// a lower QP at the same size), logged every 10 s
+    struct hint_outcomes_t {
+      uint64_t frames = 0;
+      uint64_t qp_sum = 0;
+      uint64_t bytes_sum = 0;
+    } hint_outcomes[2];
+    std::chrono::steady_clock::time_point hint_outcomes_since {};
     bool rfi_since_last_frame = false;  ///< a reference was invalidated: the next frame's reference is not the previous frame
     bool first_frame_after_init = true;  ///< no reference yet: no hint set
     motion_hints_t pending_motion_hints;
