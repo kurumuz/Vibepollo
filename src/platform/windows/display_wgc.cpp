@@ -159,9 +159,6 @@ namespace platf::dxgi {
       cached_frame->frame_timestamp = now;
       cached_frame->host_processing_timestamp = now;
       cached_frame->capture_pacing_timestamp = now;
-      // (a repeat, newly timed: the original frame's stages no longer
-      // relate to its timestamp, and it did not start at a Reflex start)
-      cached_frame->game_times = {};
       img_out = std::move(cached_frame);
       return capture_e::ok;
     }

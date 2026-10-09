@@ -3738,6 +3738,12 @@ namespace {
         g_reflex_presenting_id = frame_id;
         g_reflex_presenting_qpc = now;
         break;
+      case 5:  // PRESENT_END: the frame's Present is over; one that never
+               // reached us (or came before its marker) must not hand it on
+        if (g_reflex_presenting && g_reflex_presenting_id == frame_id) {
+          g_reflex_presenting = false;
+        }
+        break;
       default:
         break;
     }
@@ -3751,14 +3757,17 @@ namespace {
     reflex_stages_t s;
     const auto freq = qpc_frequency();
     AcquireSRWLockExclusive(&g_reflex_lock);
-    if (g_reflex_presenting && g_reflex_presenting_qpc <= now && now - g_reflex_presenting_qpc <= freq / 10) {
-      const auto &f = g_reflex_frames[g_reflex_presenting_id % kReflexFrames];
-      if (f.frame_id == g_reflex_presenting_id && f.sim_start && f.sim_start <= g_reflex_presenting_qpc &&
-          g_reflex_presenting_qpc - f.sim_start <= freq) {
-        s = {f.sim_start, f.sim_end, f.submit_start, f.submit_end};
+    // (one newer than this Present's entry is another Present's: left alone)
+    if (g_reflex_presenting && g_reflex_presenting_qpc <= now) {
+      if (now - g_reflex_presenting_qpc <= freq / 10) {
+        const auto &f = g_reflex_frames[g_reflex_presenting_id % kReflexFrames];
+        if (f.frame_id == g_reflex_presenting_id && f.sim_start && f.sim_start <= g_reflex_presenting_qpc &&
+            g_reflex_presenting_qpc - f.sim_start <= freq) {
+          s = {f.sim_start, f.sim_end, f.submit_start, f.submit_end};
+        }
       }
+      g_reflex_presenting = false;
     }
-    g_reflex_presenting = false;
     ReleaseSRWLockExclusive(&g_reflex_lock);
     return s;
   }
