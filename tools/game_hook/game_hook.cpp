@@ -3504,6 +3504,14 @@ namespace {
   constexpr std::uint32_t kNvapiSleep = 0x852CD1D2;
   constexpr std::uint32_t kNvapiSetLatencyMarker = 0xD9984C05;
   constexpr std::uint32_t kNvapiGetLatency = 0x1A587F9C;
+  constexpr std::uint32_t kNvapiGetSleepStatus = 0xAEF96CA1;
+
+  // NV_GET_SLEEP_STATUS_PARAMS_V1
+  struct nv_sleep_status_params_t {
+    std::uint32_t version;
+    std::uint8_t low_latency_mode;
+    std::uint8_t reserved[128];
+  };
 
   // NV_LATENCY_RESULT_PARAMS_V1 (timestamps in microseconds)
   struct nv_latency_frame_report_t {
@@ -3550,6 +3558,29 @@ namespace {
   using nv_latency_marker_fn = int(__cdecl *)(IUnknown *, nv_latency_marker_params_t *);
   using nv_get_latency_fn = int(__cdecl *)(IUnknown *, nv_latency_result_params_t *);
   nv_get_latency_fn g_nv_get_latency = nullptr;
+  using nv_get_sleep_status_fn = int(__cdecl *)(IUnknown *, nv_sleep_status_params_t *);
+  nv_get_sleep_status_fn g_nv_get_sleep_status = nullptr;
+  std::atomic<std::uint64_t> g_reflex_status_qpc {0};
+
+  // Whether the game runs Reflex low latency: from its SetSleepMode calls,
+  // and asked of the driver about once a second on its own NvAPI calls (a
+  // game that set it before we attached never calls again)
+  void reflex_refresh_status(IUnknown *device) {
+    if (!g_nv_get_sleep_status || !device) {
+      return;
+    }
+    const auto now = qpc_now();
+    auto last = g_reflex_status_qpc.load(std::memory_order_relaxed);
+    if ((last && now >= last && now - last < qpc_frequency()) ||
+        !g_reflex_status_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+      return;
+    }
+    nv_sleep_status_params_t status {};
+    status.version = static_cast<std::uint32_t>(sizeof(status)) | (1u << 16);
+    if (g_nv_get_sleep_status(device, &status) == 0) {
+      g_reflex_low_latency.store(status.low_latency_mode != 0, std::memory_order_relaxed);
+    }
+  }
   nv_set_sleep_mode_fn g_real_nv_set_sleep_mode = nullptr;
   nv_sleep_fn g_real_nv_sleep = nullptr;
   nv_latency_marker_fn g_real_nv_latency_marker = nullptr;
@@ -3690,6 +3721,7 @@ namespace {
   int __cdecl hook_nv_sleep(IUnknown *device) {
     const auto start = qpc_now();
     const int result = g_real_nv_sleep(device);
+    reflex_refresh_status(device);
     const auto held_us = (qpc_now() - start) * 1'000'000ull / qpc_frequency();
     g_reflex.sleeps.fetch_add(1, std::memory_order_relaxed);
     g_reflex.sleep_us.fetch_add(held_us, std::memory_order_relaxed);
@@ -3780,6 +3812,7 @@ namespace {
       reflex_stamp(params->frame_id, params->marker_type);
     }
     const int result = g_real_nv_latency_marker(device, params);
+    reflex_refresh_status(device);
     // (with Reflex off a game may never call Sleep, but still sets markers;
     // ticking after the marker keeps GetLatency off the game's marker path)
     if (params && (params->version & 0xffff) >= sizeof(nv_latency_marker_params_t) && params->marker_type == 0) {
@@ -3823,6 +3856,7 @@ namespace {
       ++detoured;
     }
     g_nv_get_latency = reinterpret_cast<nv_get_latency_fn>(query(kNvapiGetLatency));
+    g_nv_get_sleep_status = reinterpret_cast<nv_get_sleep_status_fn>(query(kNvapiGetSleepStatus));
     log("Reflex: %d of 3 NvAPI entry points detoured (diagnostics); GetLatency %s", detoured, g_nv_get_latency ? "available" : "missing");
   }
 
@@ -5174,16 +5208,25 @@ namespace {
         return;
       }
     }
-    bool wait = false;
+    // The fence and value to wait for, referenced so the wait can re-check
+    // it outside the capture lock
+    ID3D12Fence *fence12 = nullptr;
+    ID3D11Fence *fence11 = nullptr;
+    std::uint64_t target = 0;
     if (TryAcquireSRWLockExclusive(&g_capture_lock)) {
       const void *fence = g_cap.swapchain == l.swapchain ? (g_cap.fence12 ? static_cast<const void *>(g_cap.fence12) : static_cast<const void *>(g_cap.fence)) : nullptr;
       const auto latest = g_cap.fence_value;
       if (fence && fence == l.gpu_fence && l.gpu_value && latest > l.gpu_value) {
         const auto completed = g_cap.fence12 ? g_cap.fence12->GetCompletedValue() : g_cap.fence->GetCompletedValue();
         if (completed < l.gpu_value) {
-          ResetEvent(l.gpu_event);  // (a registration that outlived its wait may have set it)
-          wait = SUCCEEDED(g_cap.fence12 ? g_cap.fence12->SetEventOnCompletion(l.gpu_value, l.gpu_event)
-                                         : g_cap.fence->SetEventOnCompletion(l.gpu_value, l.gpu_event));
+          target = l.gpu_value;
+          if (g_cap.fence12) {
+            fence12 = g_cap.fence12;
+            fence12->AddRef();
+          } else {
+            fence11 = g_cap.fence;
+            fence11->AddRef();
+          }
         }
       }
       if (fence != l.gpu_fence || latest != l.gpu_value) {
@@ -5192,14 +5235,38 @@ namespace {
       }
       ReleaseSRWLockExclusive(&g_capture_lock);
     }
-    if (!wait) {
+    if (!target) {
       return;
     }
+    // Registrations are not cancelled: one left by an earlier wait that
+    // timed out can set the event for an older value, so every wake is
+    // checked against the fence, within one deadline (a lost device or a
+    // hung GPU must not hold the game)
+    const auto completed = [&] {
+      return fence12 ? fence12->GetCompletedValue() : fence11->GetCompletedValue();
+    };
+    const auto freq = qpc_frequency();
     const auto start = qpc_now();
-    const DWORD result = WaitForSingleObject(l.gpu_event, 100);  // (a lost device or a hung GPU must not hold the game)
+    const auto deadline = start + freq / 10;
+    bool done = false;
+    ResetEvent(l.gpu_event);
+    if (SUCCEEDED(fence12 ? fence12->SetEventOnCompletion(target, l.gpu_event) : fence11->SetEventOnCompletion(target, l.gpu_event))) {
+      while (!(done = completed() >= target)) {
+        const auto now = qpc_now();
+        if (now >= deadline) {
+          break;
+        }
+        WaitForSingleObject(l.gpu_event, static_cast<DWORD>((deadline - now) * 1000 / freq) + 1);
+      }
+    }
+    if (fence12) {
+      fence12->Release();
+    } else {
+      fence11->Release();
+    }
     g_block->limiter_gpu_waits.fetch_add(1, std::memory_order_relaxed);
-    g_block->limiter_gpu_wait_us.fetch_add((qpc_now() - start) * 1'000'000ull / qpc_frequency(), std::memory_order_relaxed);
-    if (result != WAIT_OBJECT_0) {
+    g_block->limiter_gpu_wait_us.fetch_add((qpc_now() - start) * 1'000'000ull / freq, std::memory_order_relaxed);
+    if (!done) {
       g_block->limiter_gpu_timeouts.fetch_add(1, std::memory_order_relaxed);
     }
   }
