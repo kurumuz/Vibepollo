@@ -45,6 +45,18 @@ namespace motion_sideband {
   constexpr std::uint32_t SS_FF_MOTION_SIDEBAND = 0x08000000;
   constexpr std::uint32_t ML_FF_MOTION_SIDEBAND = 0x08000000;
   constexpr std::uint8_t VIDEO_PACKET_EXTRA_FLAG_MOTION_SIDEBAND = 0x4;
+
+  // Frame provenance, so a client can show what produced each frame. The host
+  // advertises SS_FF_FRAME_SOURCE (no answer needed: old clients only bit-test
+  // the extraFlags bits they know) and then marks every datagram's
+  // NV_VIDEO_PACKET::extraFlags with
+  // - GAME_FRAME: captured from the game's own Present (in-game capture),
+  //   not the desktop;
+  // - ENCODER_HINTS: encoded with the game's motion vectors as motion-search
+  //   hints (nvenc_motion_hints).
+  constexpr std::uint32_t SS_FF_FRAME_SOURCE = 0x04000000;
+  constexpr std::uint8_t VIDEO_PACKET_EXTRA_FLAG_GAME_FRAME = 0x8;
+  constexpr std::uint8_t VIDEO_PACKET_EXTRA_FLAG_ENCODER_HINTS = 0x10;
   constexpr std::uint8_t kGuard = 0xff;
   constexpr std::uint8_t kMagic[4] = {'M', 'V', 'S', '2'};
   constexpr std::size_t kMaxMaskBytes = 48 * 1024;  ///< a mask too fragmented to be worth it goes as none

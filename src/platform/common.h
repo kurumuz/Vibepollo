@@ -450,6 +450,14 @@ namespace platf {
       return {};
     }
 
+    /**
+     * @brief Whether the frame converted last came from in-game capture
+     *        (the game's own Present, not the desktop).
+     */
+    virtual bool converted_game_frame() const {
+      return false;
+    }
+
     nvenc::nvenc_base *nvenc = nullptr;
   };
 

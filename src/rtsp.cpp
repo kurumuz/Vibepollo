@@ -1278,6 +1278,8 @@ namespace rtsp_stream {
       // client that answers with ML_FF_MOTION_SIDEBAND.
       feature_flags |= motion_sideband::SS_FF_MOTION_SIDEBAND;
     }
+    // Frames say whether they came from the game and fed its vectors to the encoder
+    feature_flags |= motion_sideband::SS_FF_FRAME_SOURCE;
     ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
     // Always request new control stream encryption if the client supports it

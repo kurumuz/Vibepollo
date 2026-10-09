@@ -2492,6 +2492,12 @@ namespace stream {
             if (has_sideband) {
               inspect->packet.extraFlags |= motion_sideband::VIDEO_PACKET_EXTRA_FLAG_MOTION_SIDEBAND;
             }
+            if (packet->game_frame) {
+              inspect->packet.extraFlags |= motion_sideband::VIDEO_PACKET_EXTRA_FLAG_GAME_FRAME;
+            }
+            if (packet->encoder_motion_hints) {
+              inspect->packet.extraFlags |= motion_sideband::VIDEO_PACKET_EXTRA_FLAG_ENCODER_HINTS;
+            }
           }
 
           frame_fec_latency_logger.first_point_now();

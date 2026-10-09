@@ -941,7 +941,7 @@ namespace nvenc {
   // A hint set in the codec's layout (mb_hints / sb_hints): the pending
   // hints if `use_pending` and they fit the picture, otherwise every block
   // marked invalid
-  void nvenc_base::pack_motion_hints(bool use_pending) {
+  bool nvenc_base::pack_motion_hints(bool use_pending) {
     const auto &h = pending_motion_hints;
     const uint32_t cols = (encoder_params.width + 15) / 16;
     const uint32_t rows = (encoder_params.height + 15) / 16;
@@ -991,7 +991,7 @@ namespace nvenc {
           }
         }
       }
-      return;
+      return have;
     }
 
     // H.264 / HEVC: one 16x16 candidate per macroblock, raster order,
@@ -1013,6 +1013,7 @@ namespace nvenc {
         hint.lastOfMB = -1;
       }
     }
+    return have;
   }
 
   nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
@@ -1059,8 +1060,9 @@ namespace nvenc {
     // gets a set that marks every block invalid. None for the first picture
     // after creation or a forced IDR.
     const bool use_hints = motion_hints_enabled && !force_idr && !first_frame_after_init;
+    bool hinted = false;
     if (use_hints) {
-      pack_motion_hints(!rfi_since_last_frame);
+      hinted = pack_motion_hints(!rfi_since_last_frame);
     }
     pending_motion_hints = {};
     rfi_since_last_frame = false;
@@ -1149,6 +1151,7 @@ namespace nvenc {
       lock_bitstream.outputTimeStamp,
       lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR,
       encoder_state.rfi_needs_confirmation,
+      hinted,
     };
 
     if (encoder_state.rfi_needs_confirmation) {

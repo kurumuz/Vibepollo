@@ -329,6 +329,8 @@ namespace video {
     // payload on the wire (motion_sideband_wire.h); empty: none
     std::vector<uint8_t> motion_sideband;
     uint32_t motion_sideband_interval_us = 0;  ///< between the field's two game frames (0: unknown)
+    bool game_frame = false;  ///< captured from the game's own Present (in-game capture)
+    bool encoder_motion_hints = false;  ///< encoded with the game's motion vectors as hints
   };
 
   struct packet_raw_avcodec: packet_raw_t {

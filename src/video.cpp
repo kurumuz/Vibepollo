@@ -826,6 +826,10 @@ namespace video {
       return device ? device->take_motion_sideband(interval_us) : std::vector<uint8_t> {};
     }
 
+    bool converted_game_frame() const {
+      return device && device->converted_game_frame();
+    }
+
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
@@ -2299,6 +2303,8 @@ namespace video {
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
+    packet->game_frame = session.converted_game_frame();
+    packet->encoder_motion_hints = encoded_frame.motion_hints;
     packet->frame_timestamp = frame_timestamp;
     packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
     packet->host_processing_timestamp = host_processing_timestamp;

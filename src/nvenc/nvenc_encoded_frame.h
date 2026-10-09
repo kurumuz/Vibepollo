@@ -18,6 +18,7 @@ namespace nvenc {
     uint64_t frame_index = 0;
     bool idr = false;
     bool after_ref_frame_invalidation = false;
+    bool motion_hints = false;  ///< encoded with external motion hints (a game's own vectors)
   };
 
 }  // namespace nvenc

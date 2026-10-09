@@ -2123,10 +2123,15 @@ namespace platf::dxgi {
 
     int convert(platf::img_t &img_base) override {
       const int result = base.convert(img_base);
+      last_converted_game_frame = result == 0 && static_cast<img_d3d_t &>(img_base).game_frame_id != 0;
       if (result == 0 && (config::video.nv.motion_hints || motion_sideband)) {
         set_motion_hints(static_cast<img_d3d_t &>(img_base));
       }
       return result;
+    }
+
+    bool converted_game_frame() const override {
+      return last_converted_game_frame;
     }
 
     std::vector<std::uint8_t> take_motion_sideband(std::uint32_t *interval_us) override {
@@ -2307,6 +2312,7 @@ namespace platf::dxgi {
     std::optional<std::chrono::steady_clock::time_point> last_game_frame_timestamp;
     int sideband_log_frames = 0;
     std::uint64_t last_game_frame_id = 0;
+    bool last_converted_game_frame = false;
     std::uint32_t encode_width = 0;
     std::uint32_t encode_height = 0;
     d3d_base_encode_device base;

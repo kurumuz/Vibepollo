@@ -201,7 +201,7 @@ namespace nvenc {
     bool hdr_metadata_valid = false;
     SS_HDR_METADATA hdr_metadata {};
 
-    void pack_motion_hints(bool use_pending);
+    bool pack_motion_hints(bool use_pending);  ///< whether the set carries the pending hints
 
     bool motion_hints_enabled = false;  ///< the encoder accepted external motion hints
     bool rfi_since_last_frame = false;  ///< a reference was invalidated: the next frame's reference is not the previous frame
