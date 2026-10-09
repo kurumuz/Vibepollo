@@ -3471,6 +3471,264 @@ namespace {
     return evaluations > 0;
   }
 
+  // ---- Reflex (diagnostics) -----------------------------------------------
+  //
+  // What a game asks NVIDIA Reflex for, logged: NvAPI_D3D_SetSleepMode's
+  // parameters (when they change), how often NvAPI_D3D_Sleep runs and how
+  // long it holds the game, and the latency markers it sets. Nothing is
+  // changed. The functions are resolved through nvapi_QueryInterface and
+  // detoured at their addresses, so callers that resolved them before we came
+  // (Streamline's sl.reflex, say) are seen too.
+  //
+  // Every 10 s, on the game's own call, NvAPI_D3D_GetLatency's report of the
+  // last 64 frames is summarized: where each frame's time went from
+  // simulation start to GPU render end, and in particular how long it waited
+  // between Present and the GPU starting on it -- the render-ahead queue.
+  constexpr std::uint32_t kNvapiSetSleepMode = 0xAC1CA9E0;
+  constexpr std::uint32_t kNvapiSleep = 0x852CD1D2;
+  constexpr std::uint32_t kNvapiSetLatencyMarker = 0xD9984C05;
+  constexpr std::uint32_t kNvapiGetLatency = 0x1A587F9C;
+
+  // NV_LATENCY_RESULT_PARAMS_V1 (timestamps in microseconds)
+  struct nv_latency_frame_report_t {
+    std::uint64_t frame_id;
+    std::uint64_t input_sample;
+    std::uint64_t sim_start, sim_end;
+    std::uint64_t render_submit_start, render_submit_end;
+    std::uint64_t present_start, present_end;
+    std::uint64_t driver_start, driver_end;
+    std::uint64_t os_render_queue_start, os_render_queue_end;
+    std::uint64_t gpu_render_start, gpu_render_end;
+    std::uint32_t gpu_active_render_time_us;
+    std::uint32_t gpu_frame_time_us;
+    std::uint8_t reserved[120];
+  };
+  struct nv_latency_result_params_t {
+    std::uint32_t version;
+    nv_latency_frame_report_t frames[64];
+    std::uint8_t reserved[32];
+  };
+  static_assert(sizeof(nv_latency_frame_report_t) == 240);
+  static_assert(sizeof(nv_latency_result_params_t) == 15400);
+
+  // NV_SET_SLEEP_MODE_PARAMS_V1 (version = sizeof | 1 << 16)
+  struct nv_sleep_mode_params_t {
+    std::uint32_t version;
+    std::uint8_t low_latency_mode;
+    std::uint8_t low_latency_boost;
+    std::uint32_t minimum_interval_us;
+    std::uint8_t use_markers_to_optimize;
+    std::uint8_t reserved[31];
+  };
+
+  // NV_LATENCY_MARKER_PARAMS_V1: the marker type after the 64-bit frame id
+  struct nv_latency_marker_params_t {
+    std::uint32_t version;
+    std::uint64_t frame_id;
+    std::uint32_t marker_type;
+  };
+
+  using nv_query_interface_fn = void *(__cdecl *) (std::uint32_t);
+  using nv_set_sleep_mode_fn = int(__cdecl *)(IUnknown *, nv_sleep_mode_params_t *);
+  using nv_sleep_fn = int(__cdecl *)(IUnknown *);
+  using nv_latency_marker_fn = int(__cdecl *)(IUnknown *, nv_latency_marker_params_t *);
+  using nv_get_latency_fn = int(__cdecl *)(IUnknown *, nv_latency_result_params_t *);
+  nv_get_latency_fn g_nv_get_latency = nullptr;
+  nv_set_sleep_mode_fn g_real_nv_set_sleep_mode = nullptr;
+  nv_sleep_fn g_real_nv_sleep = nullptr;
+  nv_latency_marker_fn g_real_nv_latency_marker = nullptr;
+
+  constexpr int kReflexMarkerTypes = 16;
+  struct reflex_stats_t {
+    std::atomic<std::uint64_t> sleeps {0}, sleep_us {0}, sleep_max_us {0}, set_sleep_modes {0};
+    std::atomic<std::uint64_t> markers[kReflexMarkerTypes] = {};
+    std::atomic<std::uint64_t> logged_qpc {0};
+    std::atomic<std::uint64_t> last_mode {~0ull};  // packed: mode | boost << 8 | markers << 16 | interval << 24
+  };
+  reflex_stats_t g_reflex;
+
+  // Median and 90th percentile of the frames' values, in milliseconds
+  void reflex_report_stage(char *out, std::size_t size, std::size_t &used, const char *name, std::vector<double> v) {
+    if (v.empty() || used >= size) {
+      return;
+    }
+    std::sort(v.begin(), v.end());
+    used += std::snprintf(out + used, size - used, " %s %.2f/%.2f", name, v[v.size() / 2], v[v.size() * 9 / 10]);
+  }
+
+  void reflex_latency_report(IUnknown *device) {
+    if (!g_nv_get_latency || !device) {
+      return;
+    }
+    static nv_latency_result_params_t report;  // (15 KB; only this thread, every 10 s)
+    std::memset(&report, 0, sizeof(report));
+    report.version = static_cast<std::uint32_t>(sizeof(report)) | (1u << 16);
+    if (const int status = g_nv_get_latency(device, &report); status != 0) {
+      log("Reflex: GetLatency failed (status %d)", status);
+      return;
+    }
+    // Stage durations per complete frame, in ms (signed: stages overlap).
+    // submit->gpu is the wait between the game starting to submit the
+    // frame's rendering and the GPU starting on it: the render-ahead queue
+    // (near zero, or negative, without one).
+    std::vector<double> sim, submit, present, submit_to_gpu, gpu, gpu_active, sim_to_gpu_end, frame_interval;
+    std::vector<std::uint64_t> sim_starts;
+    int complete = 0;
+    for (const auto &f : report.frames) {
+      const bool ok = f.frame_id && f.sim_start && f.sim_end >= f.sim_start && f.render_submit_start &&
+                      f.render_submit_end >= f.render_submit_start && f.present_end >= f.present_start &&
+                      f.gpu_render_start && f.gpu_render_end >= f.gpu_render_start;
+      if (!ok) {
+        continue;
+      }
+      ++complete;
+      const auto ms = [](std::uint64_t a, std::uint64_t b) {
+        return (static_cast<std::int64_t>(b) - static_cast<std::int64_t>(a)) / 1000.0;
+      };
+      sim.push_back(ms(f.sim_start, f.sim_end));
+      submit.push_back(ms(f.render_submit_start, f.render_submit_end));
+      present.push_back(ms(f.present_start, f.present_end));
+      submit_to_gpu.push_back(ms(f.render_submit_start, f.gpu_render_start));
+      gpu.push_back(ms(f.gpu_render_start, f.gpu_render_end));
+      gpu_active.push_back(f.gpu_active_render_time_us / 1000.0);
+      sim_to_gpu_end.push_back(ms(f.sim_start, f.gpu_render_end));
+      sim_starts.push_back(f.sim_start);
+    }
+    // (in whatever order the report lists the frames)
+    std::sort(sim_starts.begin(), sim_starts.end());
+    for (std::size_t i = 1; i < sim_starts.size(); ++i) {
+      frame_interval.push_back((sim_starts[i] - sim_starts[i - 1]) / 1000.0);
+    }
+    char line[512];
+    std::size_t used = 0;
+    reflex_report_stage(line, sizeof(line), used, "interval", frame_interval);
+    reflex_report_stage(line, sizeof(line), used, "sim", sim);
+    reflex_report_stage(line, sizeof(line), used, "submit", submit);
+    reflex_report_stage(line, sizeof(line), used, "present", present);
+    reflex_report_stage(line, sizeof(line), used, "submit->gpu", submit_to_gpu);
+    reflex_report_stage(line, sizeof(line), used, "gpu", gpu);
+    reflex_report_stage(line, sizeof(line), used, "gpu-active", gpu_active);
+    reflex_report_stage(line, sizeof(line), used, "sim->gpu-end", sim_to_gpu_end);
+    log("Reflex latency, %d of 64 frames complete (ms, p50/p90):%s", complete, used ? line : " none");
+  }
+
+  void reflex_stats_tick(IUnknown *device) {
+    const auto now = qpc_now();
+    auto last = g_reflex.logged_qpc.load(std::memory_order_relaxed);
+    if (last == 0) {
+      g_reflex.logged_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed);
+      return;
+    }
+    if (now - last < 10 * qpc_frequency() || !g_reflex.logged_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+      return;
+    }
+    const auto take = [](std::atomic<std::uint64_t> &a) {
+      return static_cast<unsigned long long>(a.exchange(0, std::memory_order_relaxed));
+    };
+    const auto sleeps = take(g_reflex.sleeps), sleep_us = take(g_reflex.sleep_us), sleep_max = take(g_reflex.sleep_max_us), modes = take(g_reflex.set_sleep_modes);
+    char markers[256] = "";
+    std::size_t used = 0;
+    for (int i = 0; i < kReflexMarkerTypes; ++i) {
+      if (const auto n = take(g_reflex.markers[i]); n && used < sizeof(markers)) {
+        used += std::snprintf(markers + used, sizeof(markers) - used, " %d:%llu", i, n);
+      }
+    }
+    log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s",
+        sleeps, sleeps ? sleep_us / 1000.0 / sleeps : 0.0, sleep_max / 1000.0, modes, used ? markers : " none");
+    reflex_latency_report(device);
+  }
+
+  int __cdecl hook_nv_set_sleep_mode(IUnknown *device, nv_sleep_mode_params_t *params) {
+    g_reflex.set_sleep_modes.fetch_add(1, std::memory_order_relaxed);
+    if (params && (params->version & 0xffff) >= offsetof(nv_sleep_mode_params_t, use_markers_to_optimize) + 1) {
+      const std::uint64_t packed = params->low_latency_mode | (std::uint64_t) params->low_latency_boost << 8 |
+                                   (std::uint64_t) params->use_markers_to_optimize << 16 | (std::uint64_t) params->minimum_interval_us << 24;
+      if (g_reflex.last_mode.exchange(packed, std::memory_order_relaxed) != packed) {
+        log("Reflex: SetSleepMode (version 0x%x) low latency %u, boost %u, minimum interval %u us, markers to optimize %u",
+            params->version, params->low_latency_mode, params->low_latency_boost, params->minimum_interval_us, params->use_markers_to_optimize);
+      }
+    }
+    return g_real_nv_set_sleep_mode(device, params);
+  }
+
+  int __cdecl hook_nv_sleep(IUnknown *device) {
+    const auto start = qpc_now();
+    const int result = g_real_nv_sleep(device);
+    const auto held_us = (qpc_now() - start) * 1'000'000ull / qpc_frequency();
+    g_reflex.sleeps.fetch_add(1, std::memory_order_relaxed);
+    g_reflex.sleep_us.fetch_add(held_us, std::memory_order_relaxed);
+    auto max = g_reflex.sleep_max_us.load(std::memory_order_relaxed);
+    while (held_us > max && !g_reflex.sleep_max_us.compare_exchange_weak(max, held_us, std::memory_order_relaxed)) {
+    }
+    reflex_stats_tick(device);
+    return result;
+  }
+
+  int __cdecl hook_nv_latency_marker(IUnknown *device, nv_latency_marker_params_t *params) {
+    if (params && (params->version & 0xffff) >= sizeof(nv_latency_marker_params_t) && params->marker_type < kReflexMarkerTypes) {
+      g_reflex.markers[params->marker_type].fetch_add(1, std::memory_order_relaxed);
+    }
+    const int result = g_real_nv_latency_marker(device, params);
+    // (with Reflex off a game may never call Sleep, but still sets markers;
+    // ticking after the marker keeps GetLatency off the game's marker path)
+    if (params && (params->version & 0xffff) >= sizeof(nv_latency_marker_params_t) && params->marker_type == 0) {
+      reflex_stats_tick(device);
+    }
+    return result;
+  }
+
+  void install_reflex_hooks(HMODULE nvapi) {
+    const auto query = reinterpret_cast<nv_query_interface_fn>(reinterpret_cast<void *>(GetProcAddress(nvapi, "nvapi_QueryInterface")));
+    if (!query) {
+      log("Reflex: nvapi_QueryInterface not found");
+      return;
+    }
+    const auto init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+      return;
+    }
+    struct entry_t {
+      std::uint32_t id;
+      const char *name;
+      void *detour;
+      void **real;
+    };
+    const entry_t entries[] = {
+      {kNvapiSetSleepMode, "NvAPI_D3D_SetSleepMode", reinterpret_cast<void *>(&hook_nv_set_sleep_mode), reinterpret_cast<void **>(&g_real_nv_set_sleep_mode)},
+      {kNvapiSleep, "NvAPI_D3D_Sleep", reinterpret_cast<void *>(&hook_nv_sleep), reinterpret_cast<void **>(&g_real_nv_sleep)},
+      {kNvapiSetLatencyMarker, "NvAPI_D3D_SetLatencyMarker", reinterpret_cast<void *>(&hook_nv_latency_marker), reinterpret_cast<void **>(&g_real_nv_latency_marker)},
+    };
+    int detoured = 0;
+    for (const auto &e : entries) {
+      void *target = query(e.id);
+      if (!target) {
+        continue;
+      }
+      if (MH_CreateHook(target, e.detour, e.real) != MH_OK || MH_EnableHook(target) != MH_OK) {
+        *e.real = nullptr;
+        log("Reflex: %s could not be detoured", e.name);
+        continue;
+      }
+      ++detoured;
+    }
+    g_nv_get_latency = reinterpret_cast<nv_get_latency_fn>(query(kNvapiGetLatency));
+    log("Reflex: %d of 3 NvAPI entry points detoured (diagnostics); GetLatency %s", detoured, g_nv_get_latency ? "available" : "missing");
+  }
+
+  // Waits for nvapi64.dll (games load it early, but maybe after we came),
+  // then detours its Reflex entry points and exits. The module is pinned.
+  DWORD WINAPI reflex_watch_main(void *) {
+    for (int i = 0; i < 1200; ++i) {
+      HMODULE nvapi = nullptr;
+      if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvapi64.dll", &nvapi) && nvapi) {
+        install_reflex_hooks(nvapi);
+        return 0;
+      }
+      Sleep(500);
+    }
+    return 0;
+  }
+
   // Waits for the driver's NGX to be loaded (games load it when they set up
   // DLSS, maybe long after we came) while motion vectors are wanted, then
   // detours it and exits. The module is pinned: our detours live in it.
@@ -6354,6 +6612,10 @@ namespace {
     if (dxgi) {
       // DLSS motion vectors (D3D11/D3D12): hooked once the driver's NGX is loaded
       if (HANDLE watcher = CreateThread(nullptr, 0, ngx_watch_main, nullptr, 0, nullptr)) {
+        CloseHandle(watcher);
+      }
+      // (Reflex diagnostics: what the game asks of it)
+      if (HANDLE watcher = CreateThread(nullptr, 0, reflex_watch_main, nullptr, 0, nullptr)) {
         CloseHandle(watcher);
       }
     }
