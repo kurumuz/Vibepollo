@@ -346,6 +346,9 @@ namespace platf {
    * @brief In-game capture: when a frame's stages happened in the game.
    */
   struct game_frame_times_t {
+    // The frame timestamp these stages belong to: a cached repeat is retimed
+    // (its frame_timestamp moves) and then they no longer apply
+    std::optional<std::chrono::steady_clock::time_point> timestamp;
     std::optional<std::chrono::steady_clock::time_point> present;  ///< the game's Present
     std::optional<std::chrono::steady_clock::time_point> gpu_done;  ///< the GPU finished it (the hook's copy completing)
     // NVIDIA Reflex games, from the game's latency markers

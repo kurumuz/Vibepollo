@@ -538,6 +538,7 @@ namespace platf::dxgi {
         }
         return host_processing_timestamp - qpc_time_difference(now_qpc, static_cast<int64_t>(qpc));
       };
+      img->game_times.timestamp = img->frame_timestamp;
       img->game_times.present = at(frame.present_qpc);
       img->game_times.gpu_done = at(frame.gpu_done_qpc);
       img->game_times.reflex_start = frame.reflex_start;
