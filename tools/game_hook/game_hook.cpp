@@ -3602,20 +3602,36 @@ namespace {
   // closer the GPU is to saturated the more frames wait (Witcher 3: ~0.8 ms
   // with 1.5 ms of GPU slack a frame, 3-4 ms with 0.5 ms). The cap gives the
   // GPU headroom: Reflex's own limiter (minimumIntervalUs) at the game's
-  // measured GPU time plus a margin, never faster than the stream. Reflex
-  // then paces the game just in time and our Present limiter stands aside.
-  // The GPU time is the game's own (NvAPI_D3D_GetLatency's active render
-  // time, p75 of the last frames), measured about once a second on the
-  // game's NvAPI calls; it includes whatever our streaming slows it by.
+  // measured GPU time plus a margin, never faster than the stream nor slower
+  // than 30 fps. Reflex then paces the game just in time and our Present
+  // limiter skips its wait (it still turns VSync off). The GPU time is the
+  // game's own (NvAPI_D3D_GetLatency's active render time, p75 of the last
+  // frames), measured about once a second on the game's NvAPI_D3D_Sleep; it
+  // includes whatever our streaming slows it by.
+  //
+  // Ownership: only once the game has set its sleep mode with low latency on
+  // (its complete parameters are kept: nothing is invented), and every
+  // driver call goes through one lock that records what the driver has, on
+  // success only. The game's own interval is never lowered. When the cap
+  // goes (stream over, Reflex off, the game stopped calling Sleep), the
+  // game's parameters are put back, from Present if nothing else will; the
+  // device is referenced while a cap is installed for that.
+  constexpr std::uint32_t kReflexCapMaxUs = 33'333;  ///< (30 fps: a loading screen must not cap gameplay for long)
   struct reflex_cap_t {
-    std::atomic<std::uint32_t> target_us {0};  ///< the cap applied (0: none)
+    SRWLOCK lock = SRWLOCK_INIT;
+    // Under the lock
+    bool have_game = false;  ///< game_params holds the game's last SetSleepMode, on game_device
+    nv_sleep_mode_params_t game_params {};
+    std::uintptr_t game_device = 0;  ///< (identity only)
+    IUnknown *held = nullptr;  ///< game_device, referenced while a cap is installed
+    std::uint32_t applied_us = 0;  ///< the cap the driver has from us (0: the game's own parameters)
+    std::uint64_t last_poll_qpc = 0;
+    bool rise_seen = false;  ///< the previous poll wanted a raise too
+    // Read anywhere
+    std::atomic<std::uint32_t> target_us {0};  ///< the cap wanted (0: none)
+    std::atomic<std::uint32_t> installed_us {0};  ///< applied_us, for Present
     std::atomic<std::uint32_t> gpu_us {0};  ///< the game's GPU time a frame (p75)
-    std::atomic<std::uint64_t> polled_qpc {0};
-    std::atomic<bool> polling {false};
     std::atomic<std::uint64_t> sleep_qpc {0};  ///< the game's last NvAPI_D3D_Sleep
-    std::atomic<std::uint64_t> game_set_qpc {0};  ///< ... and SetSleepMode
-    std::atomic<std::uint64_t> game_mode {0};  ///< its last parameters, packed: 1 | mode << 8 | boost << 16 | markers << 24 | interval << 32
-    std::atomic<std::uint32_t> issued_us {0};  ///< the interval last passed to the driver
   };
   reflex_cap_t g_reflex_cap;
 
@@ -3634,45 +3650,77 @@ namespace {
     return static_cast<std::uint32_t>(period_ps / 1'000'000ull);
   }
 
-  // Whether Reflex is pacing the game for us now: the cap is set and the game
-  // is calling NvAPI_D3D_Sleep (which enforces it)
-  bool reflex_cap_active(std::uint64_t now) {
+  // Whether the game called NvAPI_D3D_Sleep within `window_div`th of a second
+  bool reflex_cap_sleeping(std::uint64_t now, std::uint64_t window_div) {
     const auto sleep = g_reflex_cap.sleep_qpc.load(std::memory_order_relaxed);
-    return g_reflex_cap.target_us.load(std::memory_order_relaxed) != 0 && sleep && now >= sleep && now - sleep < qpc_frequency() / 2;
+    return sleep && now >= sleep && now - sleep < qpc_frequency() / window_div;
   }
 
-  // The game's sleep-mode parameters with our cap folded in (never a faster
-  // interval than the game's own)
-  nv_sleep_mode_params_t reflex_cap_params(std::uint64_t game_mode, std::uint32_t cap_us) {
-    nv_sleep_mode_params_t p {};
-    p.version = static_cast<std::uint32_t>(sizeof(p)) | (1u << 16);
-    p.low_latency_mode = static_cast<std::uint8_t>(game_mode >> 8);
-    p.low_latency_boost = static_cast<std::uint8_t>(game_mode >> 16);
-    p.use_markers_to_optimize = static_cast<std::uint8_t>(game_mode >> 24);
-    p.minimum_interval_us = std::max(static_cast<std::uint32_t>(game_mode >> 32), cap_us);
-    return p;
+  // Whether Reflex paces the game at our cap now: installed, and the game
+  // calls NvAPI_D3D_Sleep (which enforces it)
+  bool reflex_cap_active(std::uint64_t now) {
+    return g_reflex_cap.installed_us.load(std::memory_order_relaxed) != 0 && reflex_cap_sleeping(now, 2);
   }
 
-  // On the game's NvAPI calls (Sleep, SIMULATION_START): about once a second,
-  // measure the game's GPU time and move the cap; re-issue SetSleepMode when
-  // the game does not call it itself often enough to carry the change
+  constexpr std::uint32_t kReflexCapUnknown = ~0u;  ///< applied_us when a driver call failed: the next apply re-issues
+
+  // Lock held: after a driver call, hold the device while a cap is installed
+  // (Present may have to take it off) and publish it
+  void reflex_cap_settle_locked(IUnknown *device) {
+    auto &c = g_reflex_cap;
+    const bool capped = c.applied_us && c.applied_us != kReflexCapUnknown;
+    if (capped && !c.held && device) {
+      c.held = device;
+      device->AddRef();
+    } else if (!capped && c.held) {
+      std::exchange(c.held, nullptr)->Release();
+    }
+    c.installed_us.store(capped ? c.applied_us : 0, std::memory_order_relaxed);
+  }
+
+  // Lock held: give the driver the game's parameters with `cap_us` folded in
+  // (never below the game's own interval), unless it has them already.
+  // `device` is the game's (a live pointer: the caller's own, or `held`).
+  void reflex_cap_apply_locked(IUnknown *device, std::uint32_t cap_us) {
+    auto &c = g_reflex_cap;
+    if (!c.have_game || !device || reinterpret_cast<std::uintptr_t>(device) != c.game_device || !g_real_nv_set_sleep_mode) {
+      return;
+    }
+    const std::uint32_t want = c.game_params.low_latency_mode && cap_us > c.game_params.minimum_interval_us ? cap_us : 0;
+    if (want != c.applied_us) {
+      nv_sleep_mode_params_t p = c.game_params;
+      if (want) {
+        p.minimum_interval_us = want;
+      }
+      if (g_real_nv_set_sleep_mode(device, &p) == 0) {
+        c.applied_us = want;
+      }
+    }
+    reflex_cap_settle_locked(device);
+  }
+
+  // On the game's NvAPI_D3D_Sleep: about once a second, measure the game's
+  // GPU time and move the cap, then apply it
   void reflex_cap_update(IUnknown *device) {
     auto &c = g_reflex_cap;
     const auto now = qpc_now();
     const auto freq = qpc_frequency();
     const auto stream_us = reflex_cap_stream_us(now);
     const std::uint32_t headroom_us = g_block ? g_block->reflex_cap_headroom_us.load(std::memory_order_relaxed) : 0;
-    const bool enabled = stream_us && headroom_us && g_reflex_low_latency.load(std::memory_order_relaxed) && g_real_nv_set_sleep_mode && device;
-
-    auto last = c.polled_qpc.load(std::memory_order_relaxed);
-    bool polled = false;
-    if (enabled && (!last || now < last || now - last >= freq) && c.polled_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed) &&
-        g_nv_get_latency && !c.polling.exchange(true, std::memory_order_acquire)) {
-      polled = true;
-      static nv_latency_result_params_t report;  // (one poller at a time)
+    if (!TryAcquireSRWLockExclusive(&c.lock)) {
+      return;  // (another thread is at it: next frame)
+    }
+    const bool enabled = stream_us && headroom_us && c.have_game && c.game_params.low_latency_mode &&
+                         reinterpret_cast<std::uintptr_t>(device) == c.game_device;
+    if (!enabled) {
+      c.target_us.store(0, std::memory_order_relaxed);
+      c.rise_seen = false;
+    } else if (!c.last_poll_qpc || now < c.last_poll_qpc || now - c.last_poll_qpc >= freq) {
+      c.last_poll_qpc = now;
+      static nv_latency_result_params_t report;  // (under the lock)
       std::memset(&report, 0, sizeof(report));
       report.version = static_cast<std::uint32_t>(sizeof(report)) | (1u << 16);
-      if (g_nv_get_latency(device, &report) == 0) {
+      if (g_nv_get_latency && g_nv_get_latency(device, &report) == 0) {
         std::vector<std::uint32_t> active;
         for (const auto &f : report.frames) {
           if (f.frame_id && f.gpu_active_render_time_us) {
@@ -3684,42 +3732,56 @@ namespace {
           c.gpu_us.store(active[active.size() * 3 / 4], std::memory_order_relaxed);
         }
       }
-      c.polling.store(false, std::memory_order_release);
-    }
-
-    // The cap: the GPU time plus the headroom, never faster than the stream;
-    // up at once (the game got heavier), down slowly (at most 2% a second,
-    // and only past 3%: no hunting on noise)
-    std::uint32_t target = 0;
-    if (enabled) {
+      // The cap: the GPU time plus the headroom, between the stream's rate
+      // and 30 fps. A raise must show on two polls in a row and goes at most
+      // 25% a poll (a burst of heavy frames is not the game's new load); a
+      // fall follows at once when large (the game got lighter: a loading
+      // screen over) and 2% a poll when small (no hunting on noise).
       const auto gpu = c.gpu_us.load(std::memory_order_relaxed);
-      const auto desired = std::min<std::uint32_t>(std::max(stream_us, gpu ? gpu + headroom_us : stream_us), 100'000);
-      const auto cur = c.target_us.load(std::memory_order_relaxed);
-      if (!cur || desired > cur) {
-        target = desired;
-      } else if (polled && desired < cur - cur * 3 / 100) {
-        target = std::max(desired, cur - cur * 2 / 100);
+      const auto desired = std::clamp(gpu ? gpu + headroom_us : stream_us, stream_us, std::max(stream_us, kReflexCapMaxUs));
+      auto cur = c.target_us.load(std::memory_order_relaxed);
+      if (!cur) {
+        cur = desired;
+        c.rise_seen = false;
+      } else if (desired > cur) {
+        if (c.rise_seen) {
+          cur = std::min(desired, cur + cur / 4);
+        }
+        c.rise_seen = true;
       } else {
-        target = cur;
+        c.rise_seen = false;
+        if (desired < cur - cur / 5) {
+          cur = desired;
+        } else if (desired < cur - cur * 3 / 100) {
+          cur = std::max(desired, cur - cur * 2 / 100);
+        }
       }
+      c.target_us.store(cur, std::memory_order_relaxed);
     }
-    c.target_us.store(target, std::memory_order_relaxed);
+    reflex_cap_apply_locked(device, c.target_us.load(std::memory_order_relaxed));
     if (g_block) {
-      g_block->reflex_cap_us.store(target, std::memory_order_relaxed);
+      g_block->reflex_cap_us.store(c.applied_us, std::memory_order_relaxed);
       g_block->reflex_gpu_us.store(c.gpu_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
+    ReleaseSRWLockExclusive(&c.lock);
+  }
 
-    // A game that set its mode once (or long ago) does not carry the change:
-    // issue it ourselves, from its own last parameters
-    const auto set = c.game_set_qpc.load(std::memory_order_relaxed);
-    const bool game_carries = set && now >= set && now - set < freq;
-    const auto game_mode = c.game_mode.load(std::memory_order_relaxed);
-    const auto want = target ? target : static_cast<std::uint32_t>(game_mode >> 32);
-    if (!game_carries && device && g_real_nv_set_sleep_mode && c.issued_us.load(std::memory_order_relaxed) != want && (game_mode || target)) {
-      auto params = reflex_cap_params(game_mode ? game_mode : (1ull | 1ull << 8), target);
-      if (g_real_nv_set_sleep_mode(device, &params) == 0) {
-        c.issued_us.store(params.minimum_interval_us, std::memory_order_relaxed);
+  // From Present: a cap still installed when the game no longer calls Sleep
+  // or the stream has gone (nothing else would take it off) goes back to the
+  // game's own parameters
+  void reflex_cap_check_stale(std::uint64_t now) {
+    auto &c = g_reflex_cap;
+    if (!c.installed_us.load(std::memory_order_relaxed) || (reflex_cap_sleeping(now, 1) && reflex_cap_stream_us(now))) {
+      return;
+    }
+    if (TryAcquireSRWLockExclusive(&c.lock)) {
+      c.target_us.store(0, std::memory_order_relaxed);
+      c.rise_seen = false;
+      reflex_cap_apply_locked(c.held, 0);
+      if (g_block) {
+        g_block->reflex_cap_us.store(c.applied_us, std::memory_order_relaxed);
       }
+      ReleaseSRWLockExclusive(&c.lock);
     }
   }
 
@@ -3826,10 +3888,10 @@ namespace {
         used += std::snprintf(markers + used, sizeof(markers) - used, " %d:%llu", i, n);
       }
     }
-    log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s; cap %u us (GPU %u us, issued %u us)",
+    log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s; cap %u us (GPU %u us, installed %u us)",
         sleeps, sleeps ? sleep_us / 1000.0 / sleeps : 0.0, sleep_max / 1000.0, modes, used ? markers : " none",
         g_reflex_cap.target_us.load(std::memory_order_relaxed), g_reflex_cap.gpu_us.load(std::memory_order_relaxed),
-        g_reflex_cap.issued_us.load(std::memory_order_relaxed));
+        g_reflex_cap.installed_us.load(std::memory_order_relaxed));
     reflex_latency_report(device);
     g_reflex.reporting.store(false, std::memory_order_release);
   }
@@ -3844,20 +3906,37 @@ namespace {
         log("Reflex: SetSleepMode (version 0x%x) low latency %u, boost %u, minimum interval %u us, markers to optimize %u",
             params->version, params->low_latency_mode, params->low_latency_boost, params->minimum_interval_us, params->use_markers_to_optimize);
       }
-      // The game's own parameters, for re-issuing; ours folded into this call
-      g_reflex_cap.game_mode.store(1ull | (std::uint64_t) params->low_latency_mode << 8 | (std::uint64_t) params->low_latency_boost << 16 |
-                                     (std::uint64_t) params->use_markers_to_optimize << 24 | (std::uint64_t) params->minimum_interval_us << 32,
-                                   std::memory_order_relaxed);
-      g_reflex_cap.game_set_qpc.store(qpc_now(), std::memory_order_relaxed);
-      const auto cap = params->low_latency_mode ? g_reflex_cap.target_us.load(std::memory_order_relaxed) : 0;
-      if (cap > params->minimum_interval_us) {
-        nv_sleep_mode_params_t ours = *params;
-        ours.minimum_interval_us = cap;
-        const int result = g_real_nv_set_sleep_mode(device, &ours);
-        g_reflex_cap.issued_us.store(cap, std::memory_order_relaxed);
-        return result;
+      // The game's own parameters, complete (for re-issuing later), and this
+      // call with our cap folded in; under the cap's lock
+      auto &c = g_reflex_cap;
+      AcquireSRWLockExclusive(&c.lock);
+      if (reinterpret_cast<std::uintptr_t>(device) != c.game_device) {
+        // (a new device: whatever we had on the old one goes with it)
+        if (c.held) {
+          std::exchange(c.held, nullptr)->Release();
+        }
+        c.game_device = reinterpret_cast<std::uintptr_t>(device);
+        c.applied_us = 0;
       }
-      g_reflex_cap.issued_us.store(params->minimum_interval_us, std::memory_order_relaxed);
+      c.game_params = {};
+      std::memcpy(&c.game_params, params, std::min<std::size_t>(sizeof(c.game_params), params->version & 0xffff));
+      c.have_game = true;
+      const auto cap = reflex_cap_stream_us(qpc_now()) ? c.target_us.load(std::memory_order_relaxed) : 0;
+      int result = -1;
+      if (params->low_latency_mode && cap > params->minimum_interval_us) {
+        nv_sleep_mode_params_t ours = c.game_params;
+        ours.minimum_interval_us = cap;
+        result = g_real_nv_set_sleep_mode(device, &ours);
+        c.applied_us = result == 0 ? cap : kReflexCapUnknown;
+      }
+      if (result != 0) {
+        // (no cap, or the driver did not take it: the game's own, as asked)
+        result = g_real_nv_set_sleep_mode(device, params);
+        c.applied_us = result == 0 ? 0 : kReflexCapUnknown;
+      }
+      reflex_cap_settle_locked(device);
+      ReleaseSRWLockExclusive(&c.lock);
+      return result;
     }
     return g_real_nv_set_sleep_mode(device, params);
   }
@@ -5280,12 +5359,16 @@ namespace {
     g_limiter.owner.store(0, std::memory_order_release);
   }
 
-  void limiter_forget() {
-    g_limiter.swapchain = nullptr;
+  void limiter_forget_grid() {
     g_limiter.release_qpc = 0;
     g_limiter.logic.forget();
     g_limiter.gpu_fence = nullptr;
     g_limiter.gpu_value = 0;
+  }
+
+  void limiter_forget() {
+    g_limiter.swapchain = nullptr;
+    limiter_forget_grid();
   }
 
   // Owner only: whether this swapchain is the paced one
@@ -5453,14 +5536,22 @@ namespace {
       return hr;
     }
     const auto now = qpc_now();
-    // (while Reflex paces the game at our cap, our limiter stands aside)
-    const double period = g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) && !reflex_cap_active(now) ? limiter_period_qpc(now) : 0;
+    reflex_cap_check_stale(now);
+    const double period = g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) ? limiter_period_qpc(now) : 0;
 
     bool paced = false;
+    bool unsynced = false;  ///< the paced swapchain, presenting without VSync (whoever paces it)
     std::uint64_t release = 0;
     if (period > 0) {
       if (limiter_take()) {
         paced = limiter_select(swapchain, now);
+        unsynced = paced;
+        if (paced && reflex_cap_active(now)) {
+          // Reflex paces the game at our cap: our wait stands aside (its grid
+          // starts afresh when it is back), VSync stays off
+          limiter_forget_grid();
+          paced = false;
+        }
         if (paced) {
           release = g_limiter.release_qpc;
         } else {
@@ -5530,7 +5621,7 @@ namespace {
     HRESULT hr;
     {
       observation_t observing(swapchain);
-      hr = real(paced ? 0 : sync_interval);
+      hr = real(unsynced ? 0 : sync_interval);
       t_presenting = nullptr;
       settle_armed_capture(swapchain, SUCCEEDED(hr));
       settle_armed11(swapchain, SUCCEEDED(hr));
