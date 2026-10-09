@@ -717,6 +717,7 @@ namespace platf::dxgi::game_capture {
         // Every hooked game is paced while we stream, focused or not
         t->block->limiter_period_ps.store(limiter_period, std::memory_order_release);
         t->block->limiter_gpu_release.store(config::video.game_capture_gpu_release ? 1u : 0u, std::memory_order_release);
+        t->block->reflex_cap_headroom_us.store(static_cast<std::uint32_t>(std::clamp(config::video.game_capture_reflex_headroom_us, 0, 20000)), std::memory_order_release);
         t->block->host_heartbeat_qpc.store(heartbeat, std::memory_order_release);
         publish_dxgi_symbols(t->block);  // (a resolution that finished after injection)
       }
@@ -838,7 +839,8 @@ namespace platf::dxgi::game_capture {
            " mean wait=" + std::to_string(waits ? b->limiter_wait_us.load() / waits : 0) + "us" +
            "; gpu waits=" + std::to_string(b->limiter_gpu_waits.load()) +
            " mean=" + std::to_string(b->limiter_gpu_waits.load() ? b->limiter_gpu_wait_us.load() / b->limiter_gpu_waits.load() : 0) + "us" +
-           " timeouts=" + std::to_string(b->limiter_gpu_timeouts.load());
+           " timeouts=" + std::to_string(b->limiter_gpu_timeouts.load()) +
+           (b->reflex_cap_us.load() ? "; Reflex cap " + std::to_string(b->reflex_cap_us.load()) + "us (GPU " + std::to_string(b->reflex_gpu_us.load()) + "us)" : std::string());
   }
 
   bool source_t::still_foreground(const RECT &capture_rect) const {

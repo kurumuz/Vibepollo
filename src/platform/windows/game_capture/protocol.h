@@ -79,7 +79,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 17;
+  constexpr std::uint32_t kVersion = 18;
   constexpr int kSlots = 4;  ///< host-held, latest publication, copy in flight behind a GPU-bound frame, and one to write
   constexpr int kMotionCandidates = 3;  ///< vector sets a slot's motion texture holds (see the top comment)
   constexpr std::size_t kErrorLength = 320;
@@ -223,6 +223,12 @@ namespace game_capture {
     // instead of up to three frames ahead (Reflex's idea; skipped while the
     // game runs Reflex low latency itself)
     std::atomic<std::uint32_t> limiter_gpu_release;
+    // NVIDIA Reflex games running low latency: while non-zero (and the
+    // limiter runs), Reflex's own frame limiter caps the game at its measured
+    // GPU time plus this many microseconds, never faster than the stream, and
+    // our limiter stands aside -- headroom that keeps Reflex from queueing
+    // frames on a saturated GPU
+    std::atomic<std::uint32_t> reflex_cap_headroom_us;
 
     // Hook -> host
     std::atomic<std::uint32_t> hook_state;  ///< hook_state_e
@@ -247,6 +253,8 @@ namespace game_capture {
     std::atomic<std::uint64_t> limiter_gpu_waits;  ///< releases that waited for the GPU to finish the previous frame
     std::atomic<std::uint64_t> limiter_gpu_wait_us;  ///< ... total time spent so
     std::atomic<std::uint64_t> limiter_gpu_timeouts;  ///< ... waits given up
+    std::atomic<std::uint32_t> reflex_cap_us;  ///< the Reflex cap applied now (0: none)
+    std::atomic<std::uint32_t> reflex_gpu_us;  ///< the game's GPU time a frame it rests on (p75)
 
     char last_error[kErrorLength];  ///< the host copies at most kErrorLength bytes and terminates locally
   };

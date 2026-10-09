@@ -3595,6 +3595,134 @@ namespace {
   };
   reflex_stats_t g_reflex;
 
+  // ---- Reflex frame cap ----------------------------------------------------
+  //
+  // A GPU-bound game under Reflex still queues frames on the GPU: Reflex
+  // must never let the GPU idle, so it keeps work ahead of it, and the
+  // closer the GPU is to saturated the more frames wait (Witcher 3: ~0.8 ms
+  // with 1.5 ms of GPU slack a frame, 3-4 ms with 0.5 ms). The cap gives the
+  // GPU headroom: Reflex's own limiter (minimumIntervalUs) at the game's
+  // measured GPU time plus a margin, never faster than the stream. Reflex
+  // then paces the game just in time and our Present limiter stands aside.
+  // The GPU time is the game's own (NvAPI_D3D_GetLatency's active render
+  // time, p75 of the last frames), measured about once a second on the
+  // game's NvAPI calls; it includes whatever our streaming slows it by.
+  struct reflex_cap_t {
+    std::atomic<std::uint32_t> target_us {0};  ///< the cap applied (0: none)
+    std::atomic<std::uint32_t> gpu_us {0};  ///< the game's GPU time a frame (p75)
+    std::atomic<std::uint64_t> polled_qpc {0};
+    std::atomic<bool> polling {false};
+    std::atomic<std::uint64_t> sleep_qpc {0};  ///< the game's last NvAPI_D3D_Sleep
+    std::atomic<std::uint64_t> game_set_qpc {0};  ///< ... and SetSleepMode
+    std::atomic<std::uint64_t> game_mode {0};  ///< its last parameters, packed: 1 | mode << 8 | boost << 16 | markers << 24 | interval << 32
+    std::atomic<std::uint32_t> issued_us {0};  ///< the interval last passed to the driver
+  };
+  reflex_cap_t g_reflex_cap;
+
+  // The stream's frame interval (0: the host is not pacing us)
+  std::uint32_t reflex_cap_stream_us(std::uint64_t now) {
+    if (!g_block) {
+      return 0;
+    }
+    const auto period_ps = g_block->limiter_period_ps.load(std::memory_order_acquire);
+    const auto heartbeat = g_block->host_heartbeat_qpc.load(std::memory_order_acquire);
+    const auto timeout = gc::kHeartbeatTimeoutMs * qpc_frequency() / 1000;
+    if (period_ps < gc::kMinLimiterPeriodPs || period_ps > gc::kMaxLimiterPeriodPs || heartbeat == 0 || now > heartbeat + timeout ||
+        heartbeat > now + timeout) {
+      return 0;
+    }
+    return static_cast<std::uint32_t>(period_ps / 1'000'000ull);
+  }
+
+  // Whether Reflex is pacing the game for us now: the cap is set and the game
+  // is calling NvAPI_D3D_Sleep (which enforces it)
+  bool reflex_cap_active(std::uint64_t now) {
+    const auto sleep = g_reflex_cap.sleep_qpc.load(std::memory_order_relaxed);
+    return g_reflex_cap.target_us.load(std::memory_order_relaxed) != 0 && sleep && now >= sleep && now - sleep < qpc_frequency() / 2;
+  }
+
+  // The game's sleep-mode parameters with our cap folded in (never a faster
+  // interval than the game's own)
+  nv_sleep_mode_params_t reflex_cap_params(std::uint64_t game_mode, std::uint32_t cap_us) {
+    nv_sleep_mode_params_t p {};
+    p.version = static_cast<std::uint32_t>(sizeof(p)) | (1u << 16);
+    p.low_latency_mode = static_cast<std::uint8_t>(game_mode >> 8);
+    p.low_latency_boost = static_cast<std::uint8_t>(game_mode >> 16);
+    p.use_markers_to_optimize = static_cast<std::uint8_t>(game_mode >> 24);
+    p.minimum_interval_us = std::max(static_cast<std::uint32_t>(game_mode >> 32), cap_us);
+    return p;
+  }
+
+  // On the game's NvAPI calls (Sleep, SIMULATION_START): about once a second,
+  // measure the game's GPU time and move the cap; re-issue SetSleepMode when
+  // the game does not call it itself often enough to carry the change
+  void reflex_cap_update(IUnknown *device) {
+    auto &c = g_reflex_cap;
+    const auto now = qpc_now();
+    const auto freq = qpc_frequency();
+    const auto stream_us = reflex_cap_stream_us(now);
+    const std::uint32_t headroom_us = g_block ? g_block->reflex_cap_headroom_us.load(std::memory_order_relaxed) : 0;
+    const bool enabled = stream_us && headroom_us && g_reflex_low_latency.load(std::memory_order_relaxed) && g_real_nv_set_sleep_mode && device;
+
+    auto last = c.polled_qpc.load(std::memory_order_relaxed);
+    bool polled = false;
+    if (enabled && (!last || now < last || now - last >= freq) && c.polled_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed) &&
+        g_nv_get_latency && !c.polling.exchange(true, std::memory_order_acquire)) {
+      polled = true;
+      static nv_latency_result_params_t report;  // (one poller at a time)
+      std::memset(&report, 0, sizeof(report));
+      report.version = static_cast<std::uint32_t>(sizeof(report)) | (1u << 16);
+      if (g_nv_get_latency(device, &report) == 0) {
+        std::vector<std::uint32_t> active;
+        for (const auto &f : report.frames) {
+          if (f.frame_id && f.gpu_active_render_time_us) {
+            active.push_back(f.gpu_active_render_time_us);
+          }
+        }
+        if (active.size() >= 16) {
+          std::sort(active.begin(), active.end());
+          c.gpu_us.store(active[active.size() * 3 / 4], std::memory_order_relaxed);
+        }
+      }
+      c.polling.store(false, std::memory_order_release);
+    }
+
+    // The cap: the GPU time plus the headroom, never faster than the stream;
+    // up at once (the game got heavier), down slowly (at most 2% a second,
+    // and only past 3%: no hunting on noise)
+    std::uint32_t target = 0;
+    if (enabled) {
+      const auto gpu = c.gpu_us.load(std::memory_order_relaxed);
+      const auto desired = std::min<std::uint32_t>(std::max(stream_us, gpu ? gpu + headroom_us : stream_us), 100'000);
+      const auto cur = c.target_us.load(std::memory_order_relaxed);
+      if (!cur || desired > cur) {
+        target = desired;
+      } else if (polled && desired < cur - cur * 3 / 100) {
+        target = std::max(desired, cur - cur * 2 / 100);
+      } else {
+        target = cur;
+      }
+    }
+    c.target_us.store(target, std::memory_order_relaxed);
+    if (g_block) {
+      g_block->reflex_cap_us.store(target, std::memory_order_relaxed);
+      g_block->reflex_gpu_us.store(c.gpu_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    // A game that set its mode once (or long ago) does not carry the change:
+    // issue it ourselves, from its own last parameters
+    const auto set = c.game_set_qpc.load(std::memory_order_relaxed);
+    const bool game_carries = set && now >= set && now - set < freq;
+    const auto game_mode = c.game_mode.load(std::memory_order_relaxed);
+    const auto want = target ? target : static_cast<std::uint32_t>(game_mode >> 32);
+    if (!game_carries && device && g_real_nv_set_sleep_mode && c.issued_us.load(std::memory_order_relaxed) != want && (game_mode || target)) {
+      auto params = reflex_cap_params(game_mode ? game_mode : (1ull | 1ull << 8), target);
+      if (g_real_nv_set_sleep_mode(device, &params) == 0) {
+        c.issued_us.store(params.minimum_interval_us, std::memory_order_relaxed);
+      }
+    }
+  }
+
   // Median and 90th percentile of the frames' values, in milliseconds
   void reflex_report_stage(char *out, std::size_t size, std::size_t &used, const char *name, std::vector<double> v) {
     if (v.empty() || used >= size) {
@@ -3698,8 +3826,10 @@ namespace {
         used += std::snprintf(markers + used, sizeof(markers) - used, " %d:%llu", i, n);
       }
     }
-    log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s",
-        sleeps, sleeps ? sleep_us / 1000.0 / sleeps : 0.0, sleep_max / 1000.0, modes, used ? markers : " none");
+    log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s; cap %u us (GPU %u us, issued %u us)",
+        sleeps, sleeps ? sleep_us / 1000.0 / sleeps : 0.0, sleep_max / 1000.0, modes, used ? markers : " none",
+        g_reflex_cap.target_us.load(std::memory_order_relaxed), g_reflex_cap.gpu_us.load(std::memory_order_relaxed),
+        g_reflex_cap.issued_us.load(std::memory_order_relaxed));
     reflex_latency_report(device);
     g_reflex.reporting.store(false, std::memory_order_release);
   }
@@ -3714,6 +3844,20 @@ namespace {
         log("Reflex: SetSleepMode (version 0x%x) low latency %u, boost %u, minimum interval %u us, markers to optimize %u",
             params->version, params->low_latency_mode, params->low_latency_boost, params->minimum_interval_us, params->use_markers_to_optimize);
       }
+      // The game's own parameters, for re-issuing; ours folded into this call
+      g_reflex_cap.game_mode.store(1ull | (std::uint64_t) params->low_latency_mode << 8 | (std::uint64_t) params->low_latency_boost << 16 |
+                                     (std::uint64_t) params->use_markers_to_optimize << 24 | (std::uint64_t) params->minimum_interval_us << 32,
+                                   std::memory_order_relaxed);
+      g_reflex_cap.game_set_qpc.store(qpc_now(), std::memory_order_relaxed);
+      const auto cap = params->low_latency_mode ? g_reflex_cap.target_us.load(std::memory_order_relaxed) : 0;
+      if (cap > params->minimum_interval_us) {
+        nv_sleep_mode_params_t ours = *params;
+        ours.minimum_interval_us = cap;
+        const int result = g_real_nv_set_sleep_mode(device, &ours);
+        g_reflex_cap.issued_us.store(cap, std::memory_order_relaxed);
+        return result;
+      }
+      g_reflex_cap.issued_us.store(params->minimum_interval_us, std::memory_order_relaxed);
     }
     return g_real_nv_set_sleep_mode(device, params);
   }
@@ -3722,6 +3866,8 @@ namespace {
     const auto start = qpc_now();
     const int result = g_real_nv_sleep(device);
     reflex_refresh_status(device);
+    g_reflex_cap.sleep_qpc.store(qpc_now(), std::memory_order_relaxed);
+    reflex_cap_update(device);
     const auto held_us = (qpc_now() - start) * 1'000'000ull / qpc_frequency();
     g_reflex.sleeps.fetch_add(1, std::memory_order_relaxed);
     g_reflex.sleep_us.fetch_add(held_us, std::memory_order_relaxed);
@@ -5307,7 +5453,8 @@ namespace {
       return hr;
     }
     const auto now = qpc_now();
-    const double period = g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) ? limiter_period_qpc(now) : 0;
+    // (while Reflex paces the game at our cap, our limiter stands aside)
+    const double period = g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) && !reflex_cap_active(now) ? limiter_period_qpc(now) : 0;
 
     bool paced = false;
     std::uint64_t release = 0;

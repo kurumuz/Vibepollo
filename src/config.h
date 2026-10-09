@@ -256,6 +256,11 @@ namespace config {
     bool game_capture = false;
     bool game_capture_limiter = true;  // pace hooked games at the stream rate from inside Present (front edge), instead of RTSS
     bool game_capture_gpu_release = true;  // the limiter also waits for the GPU to finish the previous frame (at most one frame queued)
+    // Reflex games: cap the game through Reflex at its GPU time plus this
+    // headroom (microseconds; 0: off), never faster than the stream, so
+    // Reflex does not queue frames on a saturated GPU (Witcher 3: 0.5 ms of
+    // slack a frame queued 3-4 ms, 1.5 ms under 1 ms)
+    int game_capture_reflex_headroom_us = 1500;
     // The host's GPU scheduling: by default the HIGH process class and a
     // relative +7 context priority on every device. True restores Sunshine's:
     // the REALTIME class (HIGH under HAGS unless nvenc_realtime_hags) and an
