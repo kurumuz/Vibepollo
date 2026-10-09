@@ -3558,6 +3558,7 @@ namespace {
     std::atomic<std::uint64_t> sleeps {0}, sleep_us {0}, sleep_max_us {0}, set_sleep_modes {0};
     std::atomic<std::uint64_t> markers[kReflexMarkerTypes] = {};
     std::atomic<std::uint64_t> logged_qpc {0};
+    std::atomic<bool> reporting {false};
     std::atomic<std::uint64_t> last_mode {~0ull};  // packed: mode | boost << 8 | markers << 16 | interval << 24
   };
   reflex_stats_t g_reflex;
@@ -3646,7 +3647,12 @@ namespace {
       g_reflex.logged_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed);
       return;
     }
-    if (now - last < 10 * qpc_frequency() || !g_reflex.logged_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+    // (another thread may have moved it past our `now`)
+    if (now <= last || now - last < 10 * qpc_frequency() || !g_reflex.logged_qpc.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+      return;
+    }
+    // One report at a time: it fills a shared buffer
+    if (g_reflex.reporting.exchange(true, std::memory_order_acquire)) {
       return;
     }
     const auto take = [](std::atomic<std::uint64_t> &a) {
@@ -3663,6 +3669,7 @@ namespace {
     log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s",
         sleeps, sleeps ? sleep_us / 1000.0 / sleeps : 0.0, sleep_max / 1000.0, modes, used ? markers : " none");
     reflex_latency_report(device);
+    g_reflex.reporting.store(false, std::memory_order_release);
   }
 
   int __cdecl hook_nv_set_sleep_mode(IUnknown *device, nv_sleep_mode_params_t *params) {
@@ -3694,65 +3701,65 @@ namespace {
   // Each Reflex frame's CPU markers, stamped on QPC as the game sets them:
   // a frame's SIMULATION_START is when it really began (after any Reflex
   // sleep, which our limiter release comes before), and becomes its content
-  // time. Indexed by frame ID; the Present that shows a frame is the one
-  // after its PRESENT_START.
+  // time. Indexed by frame ID; the Present that shows a frame is the first
+  // one after its PRESENT_START, which it consumes: a second Present (a
+  // generated frame, or a marker that came late) has no Reflex start and
+  // keeps our limiter's release. One lock keeps every record coherent; the
+  // markers come a few times a frame, from the game's threads or
+  // Streamline's.
   constexpr int kReflexFrames = 64;
   struct reflex_frame_t {
-    std::atomic<std::uint64_t> frame_id {0};
-    std::atomic<std::uint64_t> sim_start {0}, sim_end {0}, submit_start {0}, submit_end {0};
+    std::uint64_t frame_id = 0;
+    std::uint64_t sim_start = 0, sim_end = 0, submit_start = 0, submit_end = 0;
   };
+  SRWLOCK g_reflex_lock = SRWLOCK_INIT;
   reflex_frame_t g_reflex_frames[kReflexFrames];
-  std::atomic<std::uint64_t> g_reflex_presenting {0};  ///< PRESENT_START's frame ID + 1 (0: none yet)
-  std::atomic<std::uint64_t> g_reflex_presenting_qpc {0};
+  bool g_reflex_presenting = false;  ///< a PRESENT_START not yet consumed by a Present
+  std::uint64_t g_reflex_presenting_id = 0;
+  std::uint64_t g_reflex_presenting_qpc = 0;
 
   void reflex_stamp(std::uint64_t frame_id, std::uint32_t marker) {
     const auto now = qpc_now();
+    AcquireSRWLockExclusive(&g_reflex_lock);
     auto &f = g_reflex_frames[frame_id % kReflexFrames];
     switch (marker) {
       case 0:  // SIMULATION_START: a new frame takes the entry
-        f.frame_id.store(frame_id, std::memory_order_relaxed);
-        f.sim_end.store(0, std::memory_order_relaxed);
-        f.submit_start.store(0, std::memory_order_relaxed);
-        f.submit_end.store(0, std::memory_order_relaxed);
-        f.sim_start.store(now, std::memory_order_release);
+        f = {frame_id, now, 0, 0, 0};
         break;
       case 1:  // SIMULATION_END
       case 2:  // RENDERSUBMIT_START
       case 3:  // RENDERSUBMIT_END
-        if (f.frame_id.load(std::memory_order_acquire) == frame_id) {
-          (marker == 1 ? f.sim_end : marker == 2 ? f.submit_start : f.submit_end).store(now, std::memory_order_relaxed);
+        if (f.frame_id == frame_id && f.sim_start) {
+          (marker == 1 ? f.sim_end : marker == 2 ? f.submit_start : f.submit_end) = now;
         }
         break;
       case 4:  // PRESENT_START: the next Present shows this frame
-        g_reflex_presenting_qpc.store(now, std::memory_order_relaxed);
-        g_reflex_presenting.store(frame_id + 1, std::memory_order_release);
+        g_reflex_presenting = true;
+        g_reflex_presenting_id = frame_id;
+        g_reflex_presenting_qpc = now;
         break;
       default:
         break;
     }
+    ReleaseSRWLockExclusive(&g_reflex_lock);
   }
 
-  // The frame a Present now in progress shows: the last PRESENT_START came
-  // just before (within a tenth of a second), and that frame's simulation
-  // started before it and not long ago
+  // The frame a Present now in progress shows, consuming its PRESENT_START:
+  // it came just before (within a tenth of a second), and that frame's
+  // simulation started before it and not long ago. Empty otherwise.
   reflex_stages_t reflex_stages_for_present(std::uint64_t now) {
     reflex_stages_t s;
-    const auto presenting = g_reflex_presenting.load(std::memory_order_acquire);
-    const auto presenting_qpc = g_reflex_presenting_qpc.load(std::memory_order_relaxed);
     const auto freq = qpc_frequency();
-    if (!presenting || !presenting_qpc || presenting_qpc > now || now - presenting_qpc > freq / 10) {
-      return s;
+    AcquireSRWLockExclusive(&g_reflex_lock);
+    if (g_reflex_presenting && g_reflex_presenting_qpc <= now && now - g_reflex_presenting_qpc <= freq / 10) {
+      const auto &f = g_reflex_frames[g_reflex_presenting_id % kReflexFrames];
+      if (f.frame_id == g_reflex_presenting_id && f.sim_start && f.sim_start <= g_reflex_presenting_qpc &&
+          g_reflex_presenting_qpc - f.sim_start <= freq) {
+        s = {f.sim_start, f.sim_end, f.submit_start, f.submit_end};
+      }
     }
-    const auto id = presenting - 1;
-    const auto &f = g_reflex_frames[id % kReflexFrames];
-    const auto start = f.sim_start.load(std::memory_order_acquire);
-    if (f.frame_id.load(std::memory_order_relaxed) != id || !start || start > presenting_qpc || presenting_qpc - start > freq) {
-      return s;
-    }
-    s.sim_start = start;
-    s.sim_end = f.sim_end.load(std::memory_order_relaxed);
-    s.submit_start = f.submit_start.load(std::memory_order_relaxed);
-    s.submit_end = f.submit_end.load(std::memory_order_relaxed);
+    g_reflex_presenting = false;
+    ReleaseSRWLockExclusive(&g_reflex_lock);
     return s;
   }
 
