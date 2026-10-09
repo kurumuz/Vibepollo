@@ -716,6 +716,7 @@ namespace platf::dxgi::game_capture {
         release_reads(*t, false);
         // Every hooked game is paced while we stream, focused or not
         t->block->limiter_period_ps.store(limiter_period, std::memory_order_release);
+        t->block->limiter_gpu_release.store(config::video.game_capture_gpu_release ? 1u : 0u, std::memory_order_release);
         t->block->host_heartbeat_qpc.store(heartbeat, std::memory_order_release);
         publish_dxgi_symbols(t->block);  // (a resolution that finished after injection)
       }
@@ -834,7 +835,10 @@ namespace platf::dxgi::game_capture {
     return "hook presented=" + std::to_string(b->frames_presented.load()) + " published=" + std::to_string(b->frames_published.load()) +
            " skipped=" + std::to_string(b->frames_skipped.load()) + "; limiter waits=" + std::to_string(waits) +
            " late=" + std::to_string(b->limiter_late.load()) + " resets=" + std::to_string(b->limiter_resets.load()) +
-           " mean wait=" + std::to_string(waits ? b->limiter_wait_us.load() / waits : 0) + "us";
+           " mean wait=" + std::to_string(waits ? b->limiter_wait_us.load() / waits : 0) + "us" +
+           "; gpu waits=" + std::to_string(b->limiter_gpu_waits.load()) +
+           " mean=" + std::to_string(b->limiter_gpu_waits.load() ? b->limiter_gpu_wait_us.load() / b->limiter_gpu_waits.load() : 0) + "us" +
+           " timeouts=" + std::to_string(b->limiter_gpu_timeouts.load());
   }
 
   bool source_t::still_foreground(const RECT &capture_rect) const {

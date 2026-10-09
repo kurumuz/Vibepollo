@@ -79,7 +79,7 @@
 namespace game_capture {
 
   constexpr std::uint32_t kMagic = 0x50434756;  // "VGCP"
-  constexpr std::uint32_t kVersion = 16;
+  constexpr std::uint32_t kVersion = 17;
   constexpr int kSlots = 4;  ///< host-held, latest publication, copy in flight behind a GPU-bound frame, and one to write
   constexpr int kMotionCandidates = 3;  ///< vector sets a slot's motion texture holds (see the top comment)
   constexpr std::size_t kErrorLength = 320;
@@ -216,6 +216,13 @@ namespace game_capture {
     std::atomic<std::uint32_t> dxgi_image_size;
     std::atomic<std::uint32_t> dxgi_present_impl_rva;
     std::atomic<std::uint32_t> motion_enabled;  ///< the hook captures DLSS motion vectors only while non-zero
+    // While non-zero (and the limiter runs), the limiter also releases the
+    // game only once the GPU has finished its previous frame: at most one
+    // frame waits on the GPU, so a GPU-bound game slower than the limit
+    // starts each frame (and samples input) just before the GPU can take it,
+    // instead of up to three frames ahead (Reflex's idea; skipped while the
+    // game runs Reflex low latency itself)
+    std::atomic<std::uint32_t> limiter_gpu_release;
 
     // Hook -> host
     std::atomic<std::uint32_t> hook_state;  ///< hook_state_e
@@ -237,6 +244,9 @@ namespace game_capture {
     std::atomic<std::uint64_t> limiter_late;  ///< ... that arrived after their release time (no wait)
     std::atomic<std::uint64_t> limiter_resets;  ///< ... so late the release grid restarted
     std::atomic<std::uint64_t> limiter_wait_us;  ///< total time spent waiting
+    std::atomic<std::uint64_t> limiter_gpu_waits;  ///< releases that waited for the GPU to finish the previous frame
+    std::atomic<std::uint64_t> limiter_gpu_wait_us;  ///< ... total time spent so
+    std::atomic<std::uint64_t> limiter_gpu_timeouts;  ///< ... waits given up
 
     char last_error[kErrorLength];  ///< the host copies at most kErrorLength bytes and terminates locally
   };

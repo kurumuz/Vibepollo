@@ -255,6 +255,7 @@ namespace config {
     // Appended with its default so the positional initializer is unaffected.
     bool game_capture = false;
     bool game_capture_limiter = true;  // pace hooked games at the stream rate from inside Present (front edge), instead of RTSS
+    bool game_capture_gpu_release = true;  // the limiter also waits for the GPU to finish the previous frame (at most one frame queued)
     // Send each game frame's motion field (the DLSS vectors per 16x16 block of
     // the encoded picture, MVC2-compressed on the GPU) with the frame, to
     // clients that ask for it (ML_FF_MOTION_SIDEBAND): they warp the last frame

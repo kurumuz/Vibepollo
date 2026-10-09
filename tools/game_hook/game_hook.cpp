@@ -1212,6 +1212,7 @@ namespace {
     std::uint64_t sim_start = 0, sim_end = 0, submit_start = 0, submit_end = 0;
   };
   thread_local reflex_stages_t t_reflex_stages;
+  std::atomic<bool> g_reflex_low_latency {false};  ///< the game runs Reflex low latency mode (its own just-in-time release)
 
   // Rewrites a slot's shared record while this thread owns the slot (its
   // keyed mutex or owner word), before the copy: a host that holds the slot
@@ -3677,6 +3678,7 @@ namespace {
     if (params && (params->version & 0xffff) >= offsetof(nv_sleep_mode_params_t, use_markers_to_optimize) + 1) {
       const std::uint64_t packed = params->low_latency_mode | (std::uint64_t) params->low_latency_boost << 8 |
                                    (std::uint64_t) params->use_markers_to_optimize << 16 | (std::uint64_t) params->minimum_interval_us << 24;
+      g_reflex_low_latency.store(params->low_latency_mode != 0, std::memory_order_relaxed);
       if (g_reflex.last_mode.exchange(packed, std::memory_order_relaxed) != packed) {
         log("Reflex: SetSleepMode (version 0x%x) low latency %u, boost %u, minimum interval %u us, markers to optimize %u",
             params->version, params->low_latency_mode, params->low_latency_boost, params->minimum_interval_us, params->use_markers_to_optimize);
@@ -5064,6 +5066,12 @@ namespace {
     std::uint64_t release_qpc = 0;  // the release that started the frame now being rendered on `swapchain`
     HANDLE timer = nullptr;  // one timer: only the owner waits
     gc::limiter_logic_t logic;  // the release grid (limiter_logic.h), in QPC ticks
+
+    // GPU release: the copy fence value of the previous paced frame, on that
+    // fence (identity only)
+    const void *gpu_fence = nullptr;
+    std::uint64_t gpu_value = 0;
+    HANDLE gpu_event = nullptr;
   };
 
   limiter_t g_limiter;
@@ -5096,6 +5104,8 @@ namespace {
     g_limiter.swapchain = nullptr;
     g_limiter.release_qpc = 0;
     g_limiter.logic.forget();
+    g_limiter.gpu_fence = nullptr;
+    g_limiter.gpu_value = 0;
   }
 
   // Owner only: whether this swapchain is the paced one
@@ -5142,10 +5152,64 @@ namespace {
     }
   }
 
+  // Owner only, after the real Present of frame N: with GPU release on, wait
+  // until the GPU has finished frame N-1 (our copy of it, which follows it on
+  // the game's queue), so only frame N is queued while the game works on
+  // N+1. A GPU-bound game then starts each frame just before the GPU can take
+  // it (Reflex's idea, without prediction: a frame's CPU work overlaps the
+  // previous frame's GPU work, so throughput is kept). Without a new copy
+  // since the last release (capture skipped this frame), the capture lock
+  // held elsewhere, a fence, or with the game running Reflex low latency
+  // itself, there is no wait.
+  void limiter_gpu_release() {
+    auto &l = g_limiter;
+    if (!g_block->limiter_gpu_release.load(std::memory_order_relaxed) || g_reflex_low_latency.load(std::memory_order_relaxed)) {
+      l.gpu_fence = nullptr;
+      l.gpu_value = 0;
+      return;
+    }
+    if (!l.gpu_event) {
+      l.gpu_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      if (!l.gpu_event) {
+        return;
+      }
+    }
+    bool wait = false;
+    if (TryAcquireSRWLockExclusive(&g_capture_lock)) {
+      const void *fence = g_cap.swapchain == l.swapchain ? (g_cap.fence12 ? static_cast<const void *>(g_cap.fence12) : static_cast<const void *>(g_cap.fence)) : nullptr;
+      const auto latest = g_cap.fence_value;
+      if (fence && fence == l.gpu_fence && l.gpu_value && latest > l.gpu_value) {
+        const auto completed = g_cap.fence12 ? g_cap.fence12->GetCompletedValue() : g_cap.fence->GetCompletedValue();
+        if (completed < l.gpu_value) {
+          ResetEvent(l.gpu_event);  // (a registration that outlived its wait may have set it)
+          wait = SUCCEEDED(g_cap.fence12 ? g_cap.fence12->SetEventOnCompletion(l.gpu_value, l.gpu_event)
+                                         : g_cap.fence->SetEventOnCompletion(l.gpu_value, l.gpu_event));
+        }
+      }
+      if (fence != l.gpu_fence || latest != l.gpu_value) {
+        l.gpu_fence = fence;
+        l.gpu_value = fence ? latest : 0;
+      }
+      ReleaseSRWLockExclusive(&g_capture_lock);
+    }
+    if (!wait) {
+      return;
+    }
+    const auto start = qpc_now();
+    const DWORD result = WaitForSingleObject(l.gpu_event, 100);  // (a lost device or a hung GPU must not hold the game)
+    g_block->limiter_gpu_waits.fetch_add(1, std::memory_order_relaxed);
+    g_block->limiter_gpu_wait_us.fetch_add((qpc_now() - start) * 1'000'000ull / qpc_frequency(), std::memory_order_relaxed);
+    if (result != WAIT_OBJECT_0) {
+      g_block->limiter_gpu_timeouts.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   // Owner only, after a successful real Present of the paced swapchain: wait
-  // for the next release point (limiter_logic.h decides where it is)
+  // for the GPU (limiter_gpu_release), then for the next release point
+  // (limiter_logic.h decides where it is)
   void limiter_wait(double period) {
     auto &l = g_limiter;
+    limiter_gpu_release();
     const auto now = qpc_now();
     const double nowd = static_cast<double>(now);
     const auto plan = l.logic.plan(nowd, period);
