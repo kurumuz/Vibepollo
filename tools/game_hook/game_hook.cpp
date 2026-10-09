@@ -3630,7 +3630,8 @@ namespace {
     bool rise_seen = false;  ///< the previous poll wanted a raise too
     // Read anywhere
     std::atomic<std::uint32_t> target_us {0};  ///< the cap wanted (0: none)
-    std::atomic<std::uint32_t> installed_us {0};  ///< applied_us, for Present
+    std::atomic<std::uint32_t> installed_us {0};  ///< applied_us when known, for Present
+    std::atomic<bool> owed {false};  ///< the driver may have our cap (applied_us != 0): it must be put back
     std::atomic<std::uint32_t> gpu_us {0};  ///< the game's GPU time a frame (p75)
     std::atomic<std::uint64_t> sleep_qpc {0};  ///< the game's last NvAPI_D3D_Sleep
   };
@@ -3654,7 +3655,7 @@ namespace {
   // Whether the game called NvAPI_D3D_Sleep within `window_div`th of a second
   bool reflex_cap_sleeping(std::uint64_t now, std::uint64_t window_div) {
     const auto sleep = g_reflex_cap.sleep_qpc.load(std::memory_order_relaxed);
-    return sleep && now >= sleep && now - sleep < qpc_frequency() / window_div;
+    return sleep && (now < sleep || now - sleep < qpc_frequency() / window_div);  // (newer than `now`: another thread's, just now)
   }
 
   // Whether Reflex paces the game at our cap now: installed, and the game
@@ -3665,27 +3666,37 @@ namespace {
 
   constexpr std::uint32_t kReflexCapUnknown = ~0u;  ///< applied_us when a driver call failed: the next apply re-issues
 
-  // Lock held: after a driver call, hold the device while a cap is installed
-  // (Present may have to take it off) and publish it
-  void reflex_cap_settle_locked(IUnknown *device) {
+  // Lock held: after a driver call, hold the device while our cap may be on
+  // it (Present may have to take it off) and publish the state. Returns a
+  // reference to release once the lock is dropped (or null).
+  [[nodiscard]] IUnknown *reflex_cap_settle_locked(IUnknown *device) {
     auto &c = g_reflex_cap;
-    const bool capped = c.applied_us && c.applied_us != kReflexCapUnknown;
-    if (capped && !c.held && device) {
+    const bool owed = c.applied_us != 0;
+    IUnknown *drop = nullptr;
+    if (owed && !c.held && device) {
       c.held = device;
       device->AddRef();
-    } else if (!capped && c.held) {
-      std::exchange(c.held, nullptr)->Release();
+    } else if (!owed && c.held) {
+      drop = std::exchange(c.held, nullptr);
     }
-    c.installed_us.store(capped ? c.applied_us : 0, std::memory_order_relaxed);
+    c.installed_us.store(owed && c.applied_us != kReflexCapUnknown ? c.applied_us : 0, std::memory_order_relaxed);
+    c.owed.store(owed, std::memory_order_relaxed);
+    return drop;
+  }
+
+  void reflex_cap_release(IUnknown *drop) {
+    if (drop) {
+      drop->Release();
+    }
   }
 
   // Lock held: give the driver the game's parameters with `cap_us` folded in
   // (never below the game's own interval), unless it has them already.
   // `device` is the game's (a live pointer: the caller's own, or `held`).
-  void reflex_cap_apply_locked(IUnknown *device, std::uint32_t cap_us) {
+  [[nodiscard]] IUnknown *reflex_cap_apply_locked(IUnknown *device, std::uint32_t cap_us) {
     auto &c = g_reflex_cap;
     if (!c.have_game || !device || reinterpret_cast<std::uintptr_t>(device) != c.game_device || !g_real_nv_set_sleep_mode) {
-      return;
+      return nullptr;
     }
     const std::uint32_t want = c.game_params.low_latency_mode && cap_us > c.game_params.minimum_interval_us ? cap_us : 0;
     if (want != c.applied_us) {
@@ -3697,7 +3708,7 @@ namespace {
         c.applied_us = want;
       }
     }
-    reflex_cap_settle_locked(device);
+    return reflex_cap_settle_locked(device);
   }
 
   // On the game's NvAPI_D3D_Sleep: about once a second, measure the game's
@@ -3759,31 +3770,66 @@ namespace {
       }
       c.target_us.store(cur, std::memory_order_relaxed);
     }
-    reflex_cap_apply_locked(device, c.target_us.load(std::memory_order_relaxed));
+    if (const auto cur = c.target_us.load(std::memory_order_relaxed); cur && cur < stream_us) {
+      // (never faster than the stream, whatever the smoothing: the stream's
+      // rate went down)
+      c.target_us.store(stream_us, std::memory_order_relaxed);
+    }
+    IUnknown *drop = reflex_cap_apply_locked(device, c.target_us.load(std::memory_order_relaxed));
     if (g_block) {
-      g_block->reflex_cap_us.store(c.applied_us, std::memory_order_relaxed);
+      g_block->reflex_cap_us.store(c.installed_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
       g_block->reflex_gpu_us.store(c.gpu_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     ReleaseSRWLockExclusive(&c.lock);
+    reflex_cap_release(drop);
   }
 
-  // From Present: a cap still installed when the game no longer calls Sleep
-  // or the stream has gone (nothing else would take it off) goes back to the
+  // From Present: a cap still owed when the game no longer calls Sleep or
+  // the stream has gone (nothing else would take it off) goes back to the
   // game's own parameters
   void reflex_cap_check_stale(std::uint64_t now) {
     auto &c = g_reflex_cap;
-    if (!c.installed_us.load(std::memory_order_relaxed) || (reflex_cap_sleeping(now, 1) && reflex_cap_stream_us(now))) {
+    if (!c.owed.load(std::memory_order_relaxed) || (reflex_cap_sleeping(now, 1) && reflex_cap_stream_us(now))) {
       return;
     }
-    if (TryAcquireSRWLockExclusive(&c.lock)) {
+    if (!TryAcquireSRWLockExclusive(&c.lock)) {
+      return;
+    }
+    // (again, now that Sleep's update cannot run: it may have just been)
+    IUnknown *drop = nullptr;
+    if (const auto fresh = qpc_now(); c.applied_us && !(reflex_cap_sleeping(fresh, 1) && reflex_cap_stream_us(fresh))) {
       c.target_us.store(0, std::memory_order_relaxed);
       c.rise_seen = false;
-      reflex_cap_apply_locked(c.held, 0);
+      drop = reflex_cap_apply_locked(c.held, 0);
       if (g_block) {
-        g_block->reflex_cap_us.store(c.applied_us, std::memory_order_relaxed);
+        g_block->reflex_cap_us.store(c.installed_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
       }
-      ReleaseSRWLockExclusive(&c.lock);
     }
+    ReleaseSRWLockExclusive(&c.lock);
+    reflex_cap_release(drop);
+  }
+
+  // The game's device is lost: nothing to put back, and our reference must
+  // not keep it alive (a D3D12 device is a singleton the game recreates)
+  void reflex_cap_forget_device() {
+    auto &c = g_reflex_cap;
+    if (!c.owed.load(std::memory_order_relaxed) && !c.have_game) {
+      return;
+    }
+    AcquireSRWLockExclusive(&c.lock);
+    IUnknown *drop = std::exchange(c.held, nullptr);
+    c.have_game = false;
+    c.game_device = 0;
+    c.applied_us = 0;
+    c.target_us.store(0, std::memory_order_relaxed);
+    c.rise_seen = false;
+    c.installed_us.store(0, std::memory_order_relaxed);
+    c.owed.store(false, std::memory_order_relaxed);
+    if (g_block) {
+      g_block->reflex_cap_us.store(0, std::memory_order_relaxed);
+    }
+    ReleaseSRWLockExclusive(&c.lock);
+    reflex_cap_release(drop);
   }
 
   // Median and 90th percentile of the frames' values, in milliseconds
@@ -3911,10 +3957,16 @@ namespace {
       // call with our cap folded in; under the cap's lock
       auto &c = g_reflex_cap;
       AcquireSRWLockExclusive(&c.lock);
+      IUnknown *drop_old = nullptr;
       if (reinterpret_cast<std::uintptr_t>(device) != c.game_device) {
-        // (a new device: whatever we had on the old one goes with it)
+        // A new device: the old one gets the game's own parameters back (if
+        // it is still alive, its Sleep would no longer pass our identity
+        // check to have them restored later)
         if (c.held) {
-          std::exchange(c.held, nullptr)->Release();
+          if (c.applied_us && c.have_game && g_real_nv_set_sleep_mode(c.held, &c.game_params) != 0) {
+            log("Reflex: could not restore the previous device's sleep mode");
+          }
+          drop_old = std::exchange(c.held, nullptr);
         }
         c.game_device = reinterpret_cast<std::uintptr_t>(device);
         c.applied_us = 0;
@@ -3935,8 +3987,10 @@ namespace {
         result = g_real_nv_set_sleep_mode(device, params);
         c.applied_us = result == 0 ? 0 : kReflexCapUnknown;
       }
-      reflex_cap_settle_locked(device);
+      IUnknown *drop = reflex_cap_settle_locked(device);
       ReleaseSRWLockExclusive(&c.lock);
+      reflex_cap_release(drop_old);
+      reflex_cap_release(drop);
       return result;
     }
     return g_real_nv_set_sleep_mode(device, params);
@@ -4618,6 +4672,7 @@ namespace {
   // The captured swapchain's device was lost (its Present said so): let go
   // of it now, since no further capture may come to notice
   void drop_lost_capture(IDXGISwapChain *swapchain) {
+    reflex_cap_forget_device();
     if (g_captured_swapchain.load(std::memory_order_acquire) != swapchain) {
       return;
     }
