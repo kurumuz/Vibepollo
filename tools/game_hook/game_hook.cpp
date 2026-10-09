@@ -66,6 +66,7 @@ extern "C" {
 #include <cstring>
 #include <cwchar>
 #include <string>
+#include <utility>
 #include <vector>
 
 // DXGI's private swapchain interface (see swapchain_color_space). Declared
