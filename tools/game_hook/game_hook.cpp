@@ -3629,12 +3629,16 @@ namespace {
     std::uint64_t last_poll_qpc = 0;
     std::uint32_t gpu_recent[4] = {};  ///< the last polls' GPU times (0: none)
     std::uint32_t gpu_recent_next = 0;
+    std::uint64_t poll_presents = 0, poll_sleeps = 0;  ///< the counters at the last poll
     // Read anywhere
     std::atomic<std::uint32_t> target_us {0};  ///< the cap wanted (0: none)
     std::atomic<std::uint32_t> installed_us {0};  ///< applied_us when known, for Present
     std::atomic<bool> owed {false};  ///< the driver may have our cap (applied_us != 0): it must be put back
     std::atomic<std::uint32_t> gpu_us {0};  ///< the game's GPU time a frame (p75)
     std::atomic<std::uint64_t> sleep_qpc {0};  ///< the game's last NvAPI_D3D_Sleep
+    std::atomic<std::uint64_t> sleeps {0};  ///< NvAPI_D3D_Sleep calls (one a rendered frame)
+    std::atomic<std::uint64_t> presents {0};  ///< Presents of the streamed swapchain (generated frames included)
+    std::atomic<std::uint32_t> per_render {1};  ///< Presents a rendered frame (frame generation: 2-4)
   };
   reflex_cap_t g_reflex_cap;
 
@@ -3728,6 +3732,7 @@ namespace {
     if (!enabled) {
       c.target_us.store(0, std::memory_order_relaxed);
       std::fill(std::begin(c.gpu_recent), std::end(c.gpu_recent), 0u);
+      c.poll_sleeps = 0;  // (Presents counted meanwhile without Sleeps: the next poll starts the count afresh)
     } else if (!c.last_poll_qpc || now < c.last_poll_qpc || now - c.last_poll_qpc >= freq) {
       c.last_poll_qpc = now;
       static nv_latency_result_params_t report;  // (under the lock)
@@ -3746,14 +3751,26 @@ namespace {
           c.gpu_recent[c.gpu_recent_next++ % std::size(c.gpu_recent)] = active[active.size() * 3 / 4];
         }
       }
+      // Frame generation: the driver applies the interval to every frame
+      // presented, generated ones too (DLSS-G 2x: a 13.6 ms cap held
+      // Witcher 3's rendering at 27.2 ms), so a rendered frame's time is
+      // split over the Presents it makes
+      const auto presents = c.presents.load(std::memory_order_relaxed), sleeps = c.sleeps.load(std::memory_order_relaxed);
+      if (const auto ds = sleeps - c.poll_sleeps; c.poll_sleeps && ds >= 8) {
+        const auto per = std::clamp<std::uint64_t>(((presents - c.poll_presents) * 2 + ds) / (ds * 2), 1, 4);
+        c.per_render.store(static_cast<std::uint32_t>(per), std::memory_order_relaxed);
+      }
+      c.poll_presents = presents;
+      c.poll_sleeps = sleeps;
+      const auto per = c.per_render.load(std::memory_order_relaxed);
       // The cap: the GPU time plus the headroom, between the stream's rate
-      // and 30 fps. The GPU time is the highest of the last four polls: one
-      // poll's p75 swings by ~2 ms (Witcher 3: 11 / 13 ms alternating), and
-      // a cap under the heavier half queues again. So the cap rises at once;
+      // and 30 rendered fps. The GPU time is the highest of the last four
+      // polls: one poll's p75 swings by ~2 ms (Witcher 3: 11 / 13 ms
+      // alternating), and a cap under the heavier half queues again. So the cap rises at once;
       // it falls at once when the fall is large (the game got lighter: a
       // loading screen over) and 2% a poll when small (no hunting on noise).
       const auto gpu = *std::max_element(std::begin(c.gpu_recent), std::end(c.gpu_recent));
-      const auto desired = std::clamp(gpu ? gpu + headroom_us : stream_us, stream_us, std::max(stream_us, kReflexCapMaxUs));
+      const auto desired = std::clamp(gpu ? (gpu + headroom_us) / per : stream_us, stream_us, std::max(stream_us, kReflexCapMaxUs / per));
       auto cur = c.target_us.load(std::memory_order_relaxed);
       if (!cur || desired > cur) {
         cur = desired;
@@ -3929,10 +3946,10 @@ namespace {
         used += std::snprintf(markers + used, sizeof(markers) - used, " %d:%llu", i, n);
       }
     }
-    log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s; cap %u us (GPU %u us, installed %u us)",
+    log("Reflex, last 10 s: Sleep %llu calls, %.2f ms avg / %.2f ms max held; SetSleepMode %llu calls; markers by type%s; cap %u us (GPU %u us, %u Presents a frame, installed %u us)",
         sleeps, sleeps ? sleep_us / 1000.0 / sleeps : 0.0, sleep_max / 1000.0, modes, used ? markers : " none",
         g_reflex_cap.target_us.load(std::memory_order_relaxed), g_reflex_cap.gpu_us.load(std::memory_order_relaxed),
-        g_reflex_cap.installed_us.load(std::memory_order_relaxed));
+        g_reflex_cap.per_render.load(std::memory_order_relaxed), g_reflex_cap.installed_us.load(std::memory_order_relaxed));
     reflex_latency_report(device);
     g_reflex.reporting.store(false, std::memory_order_release);
   }
@@ -3995,6 +4012,7 @@ namespace {
     const int result = g_real_nv_sleep(device);
     reflex_refresh_status(device);
     g_reflex_cap.sleep_qpc.store(qpc_now(), std::memory_order_relaxed);
+    g_reflex_cap.sleeps.fetch_add(1, std::memory_order_relaxed);
     reflex_cap_update(device);
     const auto held_us = (qpc_now() - start) * 1'000'000ull / qpc_frequency();
     g_reflex.sleeps.fetch_add(1, std::memory_order_relaxed);
@@ -5587,6 +5605,9 @@ namespace {
     }
     const auto now = qpc_now();
     reflex_cap_check_stale(now);
+    if (const auto *captured = g_captured_swapchain.load(std::memory_order_acquire); !captured || captured == swapchain) {
+      g_reflex_cap.presents.fetch_add(1, std::memory_order_relaxed);
+    }
     const double period = g_block && !(flags & DXGI_PRESENT_DO_NOT_WAIT) ? limiter_period_qpc(now) : 0;
 
     bool paced = false;
