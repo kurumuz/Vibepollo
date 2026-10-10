@@ -2256,6 +2256,16 @@ namespace {
   motion_eval_t g_motion_evals[kMotionEvals];
   motion_feature_t g_motion_features[kMotionFeatures];
   motion_stats_t g_motion_stats;
+  // Frame generation (DLSS-G, or any): fewer Presents than evaluations
+  // carry a rendered frame. Its vectors then go to no frame: they belong
+  // to the rendered frame, not the generated ones between, and under
+  // DLSS-G they finished too late anyway (Witcher 3 at 2x: 507 of 512
+  // dropped after holding their frame kMotionLateUs)
+  struct motion_framegen_t {
+    std::uint32_t presents = 0, rendered = 0;  // this window's Presents, and those that found an evaluation
+    bool on = false;
+  };
+  motion_framegen_t g_motion_framegen;
   motion_queue_t g_motion_queues[kMotionQueues];
   motion_ring_t g_motion_dead[kMotionOldRings];  // idle replaced rings, released outside the lock
   std::uint64_t g_motion_next_id = 1;
@@ -3160,6 +3170,8 @@ namespace {
     }
     char line[768];
     bool log_now = false;
+    bool fg_changed = false;
+    std::uint32_t fg_rendered = 0, fg_presents = 0;
     {
       motion_lock_t lock;
       ++g_motion_seq;
@@ -3193,6 +3205,20 @@ namespace {
         return a->order < b->order;
       });
       ++g_motion_stats.pending[std::min(n, 4)];
+      // (decided over 60 Presents with hysteresis: about every Present has
+      // an evaluation without frame generation, half at 2x)
+      auto &fg = g_motion_framegen;
+      ++fg.presents;
+      fg.rendered += n > 0;
+      if (fg.presents >= 60) {
+        if (fg.rendered >= 10 && (fg.on ? fg.rendered * 10 > fg.presents * 8 : fg.rendered * 10 < fg.presents * 7)) {
+          fg.on = !fg.on;
+          fg_changed = true;
+          fg_rendered = fg.rendered;
+          fg_presents = fg.presents;
+        }
+        fg.presents = fg.rendered = 0;
+      }
       if (n > 3) {
         g_motion_consumed = newest;  // (a backlog no frame can be matched against: dropped)
         g_motion_stats.dropped += n;
@@ -3206,6 +3232,11 @@ namespace {
       log_now = motion_stats_line(line);
     }
     motion_release_dead();
+    if (fg_changed) {
+      log(g_motion_framegen.on ? "DLSS motion vectors: frame generation (%u of %u Presents with an evaluation): no frame carries vectors"
+                               : "DLSS motion vectors: no frame generation (%u of %u Presents with an evaluation): frames carry vectors again",
+          fg_rendered, fg_presents);
+    }
     if (log_now) {
       log("%s", line);
     }
@@ -3237,7 +3268,7 @@ namespace {
     const std::uint64_t ids[gc::kMotionCandidates] = {g_motion_frame_eval, g_motion_frame_alt, g_motion_frame_prev};
     const bool current = g_motion_frame_eval && g_motion_frame_seq == g_motion_seq;
     g_motion_frame_eval = g_motion_frame_alt = g_motion_frame_prev = 0;
-    if (!current) {
+    if (!current || g_motion_framegen.on) {
       return false;
     }
     // D3D12: the frame's own set unfinished on another queue goes through
